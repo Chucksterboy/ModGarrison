@@ -6,10 +6,9 @@ const expectedAssets = new Set([
   "public/sounds/mod-install-success.wav",
   "src-tauri/icons/icon.ico",
   "src-tauri/icons/icon.png",
+  "src-tauri/icons/mod-garrison-mark.svg",
   "src-tauri/icons/tray-icon.png",
-  "src-tauri/icons/tray-icon.svg",
-  "src-tauri/icons/uniloader-blue.ico",
-  "src-tauri/icons/vault-mark.svg"
+  "src-tauri/icons/tray-icon.svg"
 ]);
 
 const mediaExtensions = new Set([

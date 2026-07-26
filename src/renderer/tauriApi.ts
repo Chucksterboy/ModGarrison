@@ -87,9 +87,9 @@ export const desktopApi: DesktopApi = {
     invoke<ProfileGameFolderUpdateResult>("update_profile_game_folder", { profileId, gamePath }),
   exportProfileBundle: async (profileId: string, profileName: string) => {
     const selected = await save({
-      title: "Export UniLoader profile",
-      defaultPath: `${safeFileName(profileName)}.uniloader-profile`,
-      filters: [{ name: "UniLoader profile bundle", extensions: ["uniloader-profile"] }]
+      title: "Export Mod Garrison profile",
+      defaultPath: `${safeFileName(profileName)}.modgarrison-profile`,
+      filters: [{ name: "Mod Garrison profile bundle", extensions: ["modgarrison-profile"] }]
     });
 
     if (!selected) {
@@ -105,7 +105,14 @@ export const desktopApi: DesktopApi = {
     const bundleSelection = await open({
       directory: false,
       multiple: false,
-      title: "Import UniLoader profile"
+      title: "Import Mod Garrison profile",
+      filters: [
+        {
+          name: "Mod Garrison and legacy profile bundles",
+          extensions: ["modgarrison-profile", "uniloader-profile"]
+        },
+        { name: "All files", extensions: ["*"] }
+      ]
     });
     const bundlePath = normalizeDialogSelection(bundleSelection);
 
@@ -260,5 +267,5 @@ function normalizeDialogSelection(selection: string | string[] | null): string |
 
 function safeFileName(name: string): string {
   const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
-  return cleaned || "UniLoader Profile";
+  return cleaned || "Mod Garrison Profile";
 }

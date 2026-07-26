@@ -42,24 +42,21 @@ jobs:
       - name: Lint backend
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
-      - name: Build UniLoader
+      - name: Build Mod Garrison
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: --features custom-protocol
           tagName: ${{ github.ref_name }}
-          releaseName: "UniLoader ${{ github.ref_name }}"
+          releaseName: "Mod Garrison ${{ github.ref_name }}"
           releaseBody: |
-            UniLoader v0.9.17 improves responsiveness and hardens profile, discovery, configuration, and update workflows.
+            Mod Garrison v0.10.0 is the complete product rebrand of UniLoader.
 
-            - Blocking profile and filesystem work now runs away from the UI thread, with serialized mutations and safer rollback behavior.
-            - Discovery requests can be cancelled, stale responses are ignored, paging is more resilient, and provider caches are bounded.
-            - Profile state, installed-mod presentation, Steam artwork, and runtime/provider caches now have clearer ownership and limits.
-            - Configuration updates preserve comments and formatting while rejecting unsafe value-type changes.
-            - Update downloads receive stronger filename, size, file-format, and SHA-256 validation before execution.
-            - Restrained view, modal, notification, and row transitions make the interface feel smoother while respecting reduced-motion settings.
-            - Compact layouts keep the Install Vault controls clear and usable at the minimum supported window size.
+            - The application, executable, installers, repository, shortcuts, tray menu, update flow, and interface now use the Mod Garrison identity.
+            - Existing UniLoader profiles, settings, Nexus credentials, and portable profile bundles migrate automatically.
+            - A new fortress-and-gate mark replaces the former shield-U artwork across the window, splash screen, taskbar, installer, and system tray.
+            - The pinned Windows upgrade identity keeps the rebrand on the existing installation path instead of creating a duplicate app.
           releaseDraft: false
           prerelease: false
 

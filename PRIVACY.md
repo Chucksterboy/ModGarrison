@@ -2,8 +2,8 @@
 
 Effective date: July 24, 2026
 
-UniLoader is a local-first desktop mod manager. It does not operate a
-UniLoader account service, advertising service, analytics service, telemetry
+Mod Garrison is a local-first desktop mod manager. It does not operate a
+Mod Garrison account service, advertising service, analytics service, telemetry
 service, or cloud synchronization service.
 
 This policy describes what the application stores locally, when it connects to
@@ -12,7 +12,7 @@ profile.
 
 ## Data Stored on Your Computer
 
-UniLoader may store the following data in its application data directory:
+Mod Garrison may store the following data in its application data directory:
 
 - Game profiles, including profile IDs, game names, Steam application IDs,
   local game installation paths, detected engines and runtimes, and profile
@@ -29,29 +29,33 @@ UniLoader may store the following data in its application data directory:
 On Windows, this data is normally stored under:
 
 ```text
-%APPDATA%\com.uniloader.desktop
+%APPDATA%\com.modgarrison.desktop
 ```
 
-UniLoader scans local Steam library folders and Steam application manifests
+When an existing UniLoader installation is upgraded, Mod Garrison migrates its
+legacy `%APPDATA%\com.uniloader.desktop` data and Windows Credential Manager
+entry locally. Newer files are never replaced by conflicting legacy files.
+
+Mod Garrison scans local Steam library folders and Steam application manifests
 when you ask it to find installed games. This information remains local except
 for the network requests described below.
 
 ## Nexus Mods API Key
 
-If you provide a Nexus Mods personal API key, UniLoader stores it in Windows
+If you provide a Nexus Mods personal API key, Mod Garrison stores it in Windows
 Credential Manager using the operating system credential store. The key is
 sent only to Nexus Mods API endpoints for authentication, account validation,
 mod discovery, dependency lookup, and supported download operations.
 
-The API key is not included in exported UniLoader profiles. You can remove it
-from UniLoader's settings at any time.
+The API key is not included in exported Mod Garrison profiles. You can remove it
+from Mod Garrison's settings at any time.
 
 ## Network Connections
 
-UniLoader connects to third-party services only to provide requested features
+Mod Garrison connects to third-party services only to provide requested features
 or a documented startup operation:
 
-- **GitHub:** checks the UniLoader repository for a newer release at startup,
+- **GitHub:** checks the Mod Garrison repository for a newer release at startup,
   downloads an update when you request it, and obtains supported runtime
   releases hosted on GitHub.
 - **Nexus Mods:** discovers mods, reads supported mod and dependency metadata,
@@ -74,12 +78,12 @@ their processing:
 - [Thunderstore Privacy Policy](https://pages.thunderstore.io/p/privacy-policy)
 - [Valve Privacy Policy](https://store.steampowered.com/privacy_agreement/)
 
-UniLoader does not sell personal data and does not send usage analytics to the
+Mod Garrison does not sell personal data and does not send usage analytics to the
 project maintainer.
 
 ## Profile Import and Export
 
-Profile export is an explicit user action. A `.uniloader-profile` bundle may
+Profile export is an explicit user action. A `.modgarrison-profile` bundle may
 contain:
 
 - Profile metadata, including a local game installation path.
@@ -91,36 +95,36 @@ Review a bundle and its contents before sharing it. A bundle can reveal local
 folder names, configuration choices, and third-party mod files. You are
 responsible for ensuring you have permission to redistribute any included mod
 files. Imported bundles are processed locally and are not uploaded by
-UniLoader.
+Mod Garrison.
 
 ## Retention and Deletion
 
-Local data remains on your computer until you remove it through UniLoader or
-delete the application data directory. Removing a profile asks UniLoader to
+Local data remains on your computer until you remove it through Mod Garrison or
+delete the application data directory. Removing a profile asks Mod Garrison to
 remove files it manages, subject to its safety checks and backups. Uninstalling
 the application may not remove application data, cached files, or files already
 deployed into game folders.
 
-To remove all locally stored UniLoader application data after closing the
+To remove all locally stored Mod Garrison application data after closing the
 application, delete:
 
 ```text
-%APPDATA%\com.uniloader.desktop
+%APPDATA%\com.modgarrison.desktop
 ```
 
-You may also remove the Nexus Mods credential through UniLoader settings or
+You may also remove the Nexus Mods credential through Mod Garrison settings or
 Windows Credential Manager.
 
 ## Security
 
-UniLoader uses operating-system credential storage for provider credentials,
+Mod Garrison uses operating-system credential storage for provider credentials,
 validates supported downloads and archives, and records managed file changes
 to support safe disable and removal operations. No software can guarantee
-absolute security. Keep UniLoader, Windows, and your game installations up to
+absolute security. Keep Mod Garrison, Windows, and your game installations up to
 date, and install mods only from sources you trust.
 
 ## Changes and Contact
 
 Material changes to this policy will be committed to the public repository.
 Questions or privacy concerns can be filed through
-[GitHub Issues](https://github.com/Chucksterboy/UniLoader/issues).
+[GitHub Issues](https://github.com/Chucksterboy/ModGarrison/issues).

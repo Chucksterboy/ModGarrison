@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "UniLoader",
-  "version": "0.9.21",
-  "identifier": "com.uniloader.desktop",
+  "productName": "Mod Garrison",
+  "mainBinaryName": "mod-garrison",
+  "version": "0.10.0",
+  "identifier": "com.modgarrison.desktop",
   "build": {
     "beforeDevCommand": "pnpm vite --host 127.0.0.1",
     "beforeBuildCommand": "pnpm run build:web",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "UniLoader",
+        "title": "Mod Garrison",
         "width": 1260,
         "height": 820,
         "minWidth": 980,
@@ -41,6 +42,9 @@
       "icons/icon.png"
     ],
     "windows": {
+      "wix": {
+        "upgradeCode": "5ba6dfb8-cc1b-520e-b9fc-4ac0cd205de7"
+      },
       "nsis": {
         "installerHooks": "installer-hooks.nsh"
       }

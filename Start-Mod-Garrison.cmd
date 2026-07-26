@@ -10,11 +10,11 @@ set "PATH=%NODE_BIN%;%PATH%"
 cd /d "%PROJECT_DIR%"
 
 if not exist "%PROJECT_DIR%\node_modules\.bin\tauri.cmd" (
-  echo Installing UniLoader dependencies...
+  echo Installing Mod Garrison dependencies...
   call "%PNPM%" install
 )
 
-set "RELEASE_EXE=%PROJECT_DIR%\src-tauri\target\release\uniloader.exe"
+set "RELEASE_EXE=%PROJECT_DIR%\src-tauri\target\release\mod-garrison.exe"
 if exist "%RELEASE_EXE%" (
   start "" "%RELEASE_EXE%"
   exit /b 0
@@ -22,7 +22,7 @@ if exist "%RELEASE_EXE%" (
 
 where.exe cargo >nul 2>nul
 if errorlevel 1 (
-  echo UniLoader has moved to Tauri and needs Rust/Cargo to run from source.
+  echo Mod Garrison uses Tauri and needs Rust/Cargo to run from source.
   echo Install Rust from https://www.rust-lang.org/tools/install.
   echo Tauri on Windows also needs Microsoft C++ Build Tools with the Windows SDK.
   echo Build Tools: https://aka.ms/vs/17/release/vs_BuildTools.exe

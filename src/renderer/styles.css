@@ -4597,8 +4597,10 @@ body {
 
 .vault-brand strong {
   color: #f2eee4;
-  font-size: 20px;
+  min-width: 0;
+  font-size: 18px;
   font-weight: 760;
+  white-space: nowrap;
 }
 
 .vault-brand-mark {

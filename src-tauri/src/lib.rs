@@ -59,7 +59,7 @@ const DISCOVERY_PROVIDER_CACHE_MINUTES: u64 = 30;
 const DISCOVERY_PROVIDER_CACHE_MAX_RECORDS: usize = 2_500;
 const DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES: usize = 64;
 const DISCOVERY_CANCELLED_ERROR: &str = "Discovery request was superseded.";
-const FORCE_REMOVAL_REQUIRED_PREFIX: &str = "UNILOADER_FORCE_REMOVAL_REQUIRED:";
+const FORCE_REMOVAL_REQUIRED_PREFIX: &str = "MOD_GARRISON_FORCE_REMOVAL_REQUIRED:";
 const THUNDERSTORE_CACHE_MAX_ENTRIES: usize = 32;
 const PROVIDER_MAPPING_CACHE_MAX_ENTRIES: usize = 128;
 const PROFILE_RUNTIME_CACHE_MAX_ENTRIES: usize = 128;
@@ -85,7 +85,7 @@ const STORE_TRANSACTION_VERSION: u32 = 1;
 const DEPLOYMENT_JOURNAL_VERSION: u32 = 1;
 const REPLACEMENT_JOURNAL_VERSION: u32 = 1;
 const GITHUB_API_BASE: &str = "https://api.github.com/repos";
-const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/UniLoader";
+const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/ModGarrison";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
 const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
@@ -94,8 +94,10 @@ const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
 const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
 const DEPENDENCY_PROVIDER_DEFINITIONS_JSON: &str =
     include_str!("dependency_provider_definitions.json");
-const NEXUS_KEYRING_SERVICE: &str = "UniLoader";
+const NEXUS_KEYRING_SERVICE: &str = "Mod Garrison";
+const LEGACY_NEXUS_KEYRING_SERVICE: &str = "UniLoader";
 const NEXUS_KEYRING_USER: &str = "nexus-api-key";
+const LEGACY_APP_IDENTIFIER: &str = "com.uniloader.desktop";
 
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1408,7 +1410,7 @@ fn check_app_update_impl() -> AppUpdateInfo {
 
     let response = match client
         .get(&request_url)
-        .header("User-Agent", "UniLoader update checker")
+        .header("User-Agent", "Mod Garrison update checker")
         .send()
     {
         Ok(response) => response,
@@ -1498,15 +1500,15 @@ fn check_app_update_impl() -> AppUpdateInfo {
         message: if update_available {
             if installer_asset.is_some() {
                 format!(
-                    "UniLoader v{latest_version} is available. Click to download the installer."
+                    "Mod Garrison v{latest_version} is available. Click to download the installer."
                 )
             } else {
                 format!(
-                    "UniLoader v{latest_version} is available, but no installer asset was found."
+                    "Mod Garrison v{latest_version} is available, but no installer asset was found."
                 )
             }
         } else {
-            format!("UniLoader v{current_version} is current.")
+            format!("Mod Garrison v{current_version} is current.")
         },
     }
 }
@@ -1612,7 +1614,7 @@ async fn create_profile(
     _app: AppHandle,
     _input: CreateProfileInput,
 ) -> Result<GameProfile, String> {
-    Err("Only installed Steam games can be added as UniLoader profiles.".to_string())
+    Err("Only installed Steam games can be added as Mod Garrison profiles.".to_string())
 }
 
 fn create_profile_in_store(root: &Path, input: CreateProfileInput) -> Result<GameProfile, String> {
@@ -1694,7 +1696,7 @@ fn cached_steam_artwork_data_url(
     }
 
     let client = Client::builder()
-        .user_agent(format!("UniLoader/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Mod Garrison/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(8))
         .build()
@@ -1816,7 +1818,7 @@ fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<Ga
                 || normalize_filesystem_identity(&profile.game_path)
                     == normalize_filesystem_identity(&game.install_dir)
         }) {
-            return Err(format!("{} already has a UniLoader profile.", game.name));
+            return Err(format!("{} already has a Mod Garrison profile.", game.name));
         }
         create_profile_in_store(
             &root,
@@ -1927,7 +1929,7 @@ async fn launch_profile_game(
                 .map(str::trim)
                 .filter(|app_id| !app_id.is_empty())
                 .ok_or_else(|| {
-                    "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from UniLoader.".to_string()
+                    "This profile does not have a Steam App ID yet. Add it through Steam scan to launch it from Mod Garrison.".to_string()
                 })?;
 
             prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
@@ -2462,7 +2464,7 @@ fn remove_profile(
     let mut preserved_modified_files = false;
     for record in profile_mods.iter().filter(|record| {
         record.enabled
-            && record_is_uniloader_owned(record)
+            && record_is_mod_garrison_owned(record)
             && !suspended_ids.contains(record.id.as_str())
     }) {
         let policy = if force_forget_modified {
@@ -2523,14 +2525,14 @@ fn remove_profile(
 
     if let Err(error) = remove_pending_nexus_downloads_for_profile(&root, &profile.id) {
         warnings.push(format!(
-            "Profile was removed, but UniLoader could not clear its pending Nexus downloads: {error}"
+            "Profile was removed, but Mod Garrison could not clear its pending Nexus downloads: {error}"
         ));
     }
     let profile_data_dir = profile_dir(&root, &profile.id);
     if profile_data_dir.exists() {
         if let Err(error) = fs::remove_dir_all(&profile_data_dir) {
             warnings.push(format!(
-                "Profile was removed, but UniLoader could not remove its local data folder: {}.",
+                "Profile was removed, but Mod Garrison could not remove its local data folder: {}.",
                 error
             ));
         }
@@ -2597,7 +2599,7 @@ fn refresh_profile_sync(
                 bootstrap_warnings = install_profile_bootstrap_dependencies(&root, &profile);
             }
             Err(error) => runtime_refresh.warnings.push(format!(
-                "Runtime updates were skipped because UniLoader could not verify whether the game is running: {error}"
+                "Runtime updates were skipped because Mod Garrison could not verify whether the game is running: {error}"
             )),
         }
     }
@@ -2741,7 +2743,7 @@ fn bootstrap_profile_dependencies_sync(
             Ok(true) => Some("Dependency installation is postponed until the game is closed.".to_string()),
             Ok(false) => None,
             Err(error) => Some(format!(
-                "Dependency installation was skipped because UniLoader could not verify whether the game is running: {error}"
+                "Dependency installation was skipped because Mod Garrison could not verify whether the game is running: {error}"
             )),
         }
     };
@@ -3086,7 +3088,7 @@ fn export_profile_bundle_impl_with_options(
     for mut record in installed_mods {
         if options.self_contained && record.externally_managed {
             return Err(format!(
-                "Cannot create a self-contained key while {} is managed outside UniLoader. Reinstall that component through UniLoader, then generate the key again.",
+                "Cannot create a self-contained key while {} is managed outside Mod Garrison. Reinstall that component through Mod Garrison, then generate the key again.",
                 display_record_name(&record)
             ));
         }
@@ -3376,7 +3378,7 @@ fn import_profile_bundle_impl_unchecked(
                     == normalize_filesystem_identity(&profile.game_path)
         }) {
             return Err(format!(
-                "{} already has a UniLoader profile. Remove the existing profile before importing a replacement bundle.",
+                "{} already has a Mod Garrison profile. Remove the existing profile before importing a replacement bundle.",
                 profile.name
             ));
         }
@@ -3700,7 +3702,7 @@ fn refresh_profile_runtime_updates(root: &Path, profile: &GameProfile) -> Runtim
                         }
                         Err(error) => {
                             outcome.warnings.push(format!(
-                                "{} was repaired, but UniLoader could not reload its record: {error}",
+                                "{} was repaired, but Mod Garrison could not reload its record: {error}",
                                 format_loader(&runtime)
                             ));
                             continue;
@@ -3711,7 +3713,7 @@ fn refresh_profile_runtime_updates(root: &Path, profile: &GameProfile) -> Runtim
                 Err(error) => {
                     force_runtime_rehydrate = true;
                     outcome.warnings.push(format!(
-                        "Could not repair {} from its managed package: {error}. UniLoader will fetch a fresh verified package.",
+                        "Could not repair {} from its managed package: {error}. Mod Garrison will fetch a fresh verified package.",
                         format_loader(&runtime)
                     ));
                 }
@@ -3728,7 +3730,7 @@ fn refresh_profile_runtime_updates(root: &Path, profile: &GameProfile) -> Runtim
 
         if !runtime_record_allows_automatic_updates(&record) {
             outcome.notes.push(format!(
-                "{} was detected outside UniLoader and was left unchanged.",
+                "{} was detected outside Mod Garrison and was left unchanged.",
                 format_loader(&runtime)
             ));
             continue;
@@ -3886,7 +3888,7 @@ fn resolve_latest_runtime_release(
 ) -> Result<ReleaseDependencyRef, String> {
     let capability = dependency_provider_definition(&dependency.provider).ok_or_else(|| {
         format!(
-            "provider '{}' is not registered in this UniLoader build",
+            "provider '{}' is not registered in this Mod Garrison build",
             dependency.provider
         )
     })?;
@@ -4360,7 +4362,7 @@ fn cleanup_stale_runtime_files(
         }
         let Ok(relative) = destination.strip_prefix(game_root) else {
             cleanup.warnings.push(format!(
-                "UniLoader left an obsolete runtime file outside the game folder untouched: {}",
+                "Mod Garrison left an obsolete runtime file outside the game folder untouched: {}",
                 destination.to_string_lossy()
             ));
             continue;
@@ -4368,14 +4370,14 @@ fn cleanup_stale_runtime_files(
         validate_managed_record_path(root, profile, &destination)?;
         let Some(expected_hash) = previous.written_file_hashes.get(stale) else {
             cleanup.warnings.push(format!(
-                "UniLoader left modified or unverified obsolete runtime file {} untouched.",
+                "Mod Garrison left modified or unverified obsolete runtime file {} untouched.",
                 destination.to_string_lossy()
             ));
             continue;
         };
         if sha256_file(&destination)? != *expected_hash {
             cleanup.warnings.push(format!(
-                "UniLoader left user-modified obsolete runtime file {} untouched.",
+                "Mod Garrison left user-modified obsolete runtime file {} untouched.",
                 destination.to_string_lossy()
             ));
             continue;
@@ -4929,7 +4931,7 @@ where
             restore
                 .err()
                 .map(|restore_error| format!(
-                    " UniLoader also could not restore the previous version: {restore_error}"
+                    " Mod Garrison also could not restore the previous version: {restore_error}"
                 ))
                 .unwrap_or_default()
         ));
@@ -4975,7 +4977,7 @@ where
                 ) {
                     Ok(()) => Err(format!("{error} The previous version was restored.")),
                     Err(recovery_error) => Err(format!(
-                        "{error} UniLoader also could not fully restore the previous version: {recovery_error}"
+                        "{error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
                     )),
                 };
             }
@@ -4992,7 +4994,7 @@ where
         ) {
             Ok(()) => Err(format!("{error} The previous version was restored.")),
             Err(recovery_error) => Err(format!(
-                "{error} UniLoader also could not fully restore the previous version: {recovery_error}"
+                "{error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
             )),
         },
     }
@@ -5214,7 +5216,7 @@ async fn begin_nexus_requirement_download(
         });
         if let Some(dependency) = missing_confirmation_dependency {
             return Err(format!(
-                "{} requires {} first. Confirm the missing requirement in UniLoader before starting the parent download.",
+                "{} requires {} first. Confirm the missing requirement in Mod Garrison before starting the parent download.",
                 profile_game_label(&profile), dependency.name
             ));
         }
@@ -5921,7 +5923,7 @@ fn remove_mod_sync(
         .ok_or_else(|| format!("Installed mod not found: {}", installed_mod_id))?;
     if store.items[record_index].runtime_id.is_some() {
         return Err(
-            "System runtimes are protected. UniLoader keeps them available for dependent mods."
+            "System runtimes are protected. Mod Garrison keeps them available for dependent mods."
                 .to_string(),
         );
     }
@@ -6116,6 +6118,7 @@ pub fn run() {
             let _ = window.unminimize();
         })
         .setup(|app| {
+            migrate_legacy_app_data(app.handle()).map_err(io::Error::other)?;
             #[cfg(windows)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -6188,7 +6191,7 @@ pub fn run() {
             open_diagnostics_folder
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run UniLoader");
+        .expect("failed to run Mod Garrison");
 }
 
 fn reveal_main_window(app: &AppHandle) {
@@ -6243,15 +6246,15 @@ fn refresh_windows_shell_icons_once(app: &AppHandle) {
 fn refresh_windows_shell_icons_once(_app: &AppHandle) {}
 
 fn setup_tray(app: &mut tauri::App, icon: tauri::image::Image<'static>) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "tray-show", "Show UniLoader", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "tray-show", "Show Mod Garrison", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, "tray-hide", "Hide to tray", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "tray-quit", "Quit UniLoader", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "tray-quit", "Quit Mod Garrison", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&show_item, &hide_item, &separator, &quit_item])?;
 
     let tray = TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("UniLoader")
+        .tooltip("Mod Garrison")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -6605,7 +6608,7 @@ fn game_definitions() -> &'static [GameDefinition] {
     GAME_DEFINITIONS
         .get_or_init(|| {
             parse_json_allow_bom::<Vec<GameDefinition>>(GAME_DEFINITIONS_JSON)
-                .expect("bundled UniLoader game definitions must be valid JSON")
+                .expect("bundled Mod Garrison game definitions must be valid JSON")
         })
         .as_slice()
 }
@@ -6795,7 +6798,7 @@ fn runtime_definitions() -> &'static [RuntimeDefinition] {
     RUNTIME_REGISTRY
         .get_or_init(|| {
             parse_json_allow_bom::<Vec<RuntimeDefinition>>(RUNTIME_DEFINITIONS_JSON)
-                .expect("bundled UniLoader runtime definitions must be valid JSON")
+                .expect("bundled Mod Garrison runtime definitions must be valid JSON")
         })
         .as_slice()
 }
@@ -6806,7 +6809,7 @@ fn dependency_provider_definitions() -> &'static [DependencyProviderDefinition] 
             parse_json_allow_bom::<Vec<DependencyProviderDefinition>>(
                 DEPENDENCY_PROVIDER_DEFINITIONS_JSON,
             )
-            .expect("bundled UniLoader dependency provider definitions must be valid JSON")
+            .expect("bundled Mod Garrison dependency provider definitions must be valid JSON")
         })
         .as_slice()
 }
@@ -7802,7 +7805,7 @@ fn analyze_scanned_archive_with_identity(
         CompatibilityResult {
             status: "blocked".to_string(),
             reason: first_block_reason.unwrap_or_else(|| {
-                "UniLoader could not identify a verified automatic install route for this package. No game files were changed."
+                "Mod Garrison could not identify a verified automatic install route for this package. No game files were changed."
                     .to_string()
             }),
             confidence: package_identity.confidence,
@@ -8530,7 +8533,7 @@ fn loose_files_plan(scanned: &ScannedArchive) -> Option<InstallPlan> {
         mappings,
         dependencies: Vec::new(),
         warnings: vec![
-            "UniLoader could not identify a safe game-specific install layout.".to_string(),
+            "Mod Garrison could not identify a safe game-specific install layout.".to_string(),
             "Files will be staged in the profile data folder instead of deployed into the game."
                 .to_string(),
         ],
@@ -8713,7 +8716,7 @@ fn install_archive_impl_with_metadata(
             match rollback_install_graph(store_root, profile, &checkpoint) {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(format!(
-                    "{error} UniLoader also could not completely roll back the dependency graph: {rollback_error}"
+                    "{error} Mod Garrison also could not completely roll back the dependency graph: {rollback_error}"
                 )),
             }
         }
@@ -9065,7 +9068,7 @@ fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Some(
-            "UniLoader could not identify a safe game-specific install layout, so the package was not deployed."
+            "Mod Garrison could not identify a safe game-specific install layout, so the package was not deployed."
                 .to_string(),
         );
     }
@@ -9073,7 +9076,7 @@ fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -
     let supported_adapters = supported_adapters_for_profile(profile);
     if supported_adapters.is_empty() {
         return Some(format!(
-            "UniLoader could not prove a safe mod installation route from {}'s folder yet.",
+            "Mod Garrison could not prove a safe mod installation route from {}'s folder yet.",
             profile_game_label(profile)
         ));
     }
@@ -9344,7 +9347,7 @@ fn runtime_dependency_definition(
         provider: "manual".to_string(),
         source: format!("runtime:{runtime}"),
         notes: Some(
-            "This runtime needs a registry definition before UniLoader can install it automatically."
+            "This runtime needs a registry definition before Mod Garrison can install it automatically."
                 .to_string(),
         ),
     }
@@ -9468,7 +9471,7 @@ fn install_dependency_by_provider(
 ) -> Result<Vec<String>, String> {
     let capability = dependency_provider_definition(&dependency.provider).ok_or_else(|| {
         format!(
-            "{} uses dependency provider '{}', which is not registered in this UniLoader build.",
+            "{} uses dependency provider '{}', which is not registered in this Mod Garrison build.",
             dependency.name, dependency.provider
         )
     })?;
@@ -9505,7 +9508,7 @@ fn install_dependency_by_provider(
             )
         }),
         resolver => Err(format!(
-            "{} uses registered provider '{}' with resolver '{}', but this UniLoader build does not include that resolver.",
+            "{} uses registered provider '{}' with resolver '{}', but this Mod Garrison build does not include that resolver.",
             dependency.name, capability.display_name, resolver
         )),
     }
@@ -9517,7 +9520,7 @@ fn provider_capability_message(
 ) -> String {
     if capability.browser_handoff {
         return format!(
-            "{} is hosted on {}. This provider requires an authenticated browser handoff before UniLoader can install it.",
+            "{} is hosted on {}. This provider requires an authenticated browser handoff before Mod Garrison can install it.",
             dependency.name, capability.display_name
         );
     }
@@ -9928,7 +9931,7 @@ fn verified_discovery_provider_game(
     }
     .ok_or_else(|| {
         format!(
-            "UniLoader could not verify the {} game catalogue for {}.",
+            "Mod Garrison could not verify the {} game catalogue for {}.",
             provider_label(provider),
             profile_game_label(profile)
         )
@@ -10936,7 +10939,7 @@ fn fetch_nexus_mods_by_name(
     name: &str,
 ) -> Result<Vec<NexusModNode>, String> {
     const NEXUS_NAME_QUERY: &str = r#"
-        query UniLoaderFindModArtwork(
+        query ModGarrisonFindModArtwork(
           $filter: ModsFilter,
           $offset: Int,
           $count: Int
@@ -12630,7 +12633,7 @@ fn fetch_nexus_mod_page_with_sort(
     query: &str,
 ) -> Result<NexusModPage, String> {
     const NEXUS_DISCOVERY_QUERY: &str = r#"
-        query UniLoaderDiscoverMods(
+        query ModGarrisonDiscoverMods(
           $filter: ModsFilter,
           $sort: [ModsSort!],
           $offset: Int,
@@ -12747,7 +12750,7 @@ fn fetch_nexus_game_domain_by_name(client: &Client, name: &str) -> Option<String
 
 fn fetch_nexus_games_by_name(client: &Client, name: &str) -> Option<Vec<NexusGameNode>> {
     const NEXUS_GAME_QUERY: &str = r#"
-        query UniLoaderDiscoverGame(
+        query ModGarrisonDiscoverGame(
           $filter: GamesSearchFilter,
           $sort: [GamesSearchSort!],
           $offset: Int,
@@ -12901,7 +12904,7 @@ fn fetch_nexus_mod_requirements(
     api_key: Option<&str>,
 ) -> Result<Vec<NexusRequirement>, String> {
     const NEXUS_REQUIREMENTS_QUERY: &str = r#"
-        query UniLoaderModRequirements($filter: ModsFilter, $count: Int) {
+        query ModGarrisonModRequirements($filter: ModsFilter, $count: Int) {
           mods(filter: $filter, count: $count) {
             nodes {
               modId
@@ -13201,7 +13204,7 @@ fn nexus_mod_to_online_mod(
         .or(node.thumbnail_url)
         .or(node.picture_url);
     let install_note = if nexus_api_ready {
-        "Choose a file to install it through UniLoader."
+        "Choose a file to install it through Mod Garrison."
     } else if node.direct_download_enabled {
         "Add a Nexus API key in Settings to enable direct install for Nexus mods."
     } else {
@@ -13624,7 +13627,7 @@ fn install_resolved_nexus_file(
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
-            "{} downloaded, but UniLoader could not identify a safe automatic install layout.",
+            "{} downloaded, but Mod Garrison could not identify a safe automatic install layout.",
             nexus_file_display_name(file)
         ));
     }
@@ -13690,7 +13693,7 @@ fn install_nexus_requirement_dependencies(
                 Ok(mut installed_warnings) => warnings.append(&mut installed_warnings),
                 Err(error) => {
                     return Err(format!(
-                        "{} requires {}. UniLoader checked the game folder first, but the requirement is missing: {}",
+                        "{} requires {}. Mod Garrison checked the game folder first, but the requirement is missing: {}",
                         profile_game_label(profile), dependency.name, error
                     ));
                 }
@@ -13715,7 +13718,7 @@ fn install_nexus_requirement_dependencies(
         }
         if !account.is_premium {
             return Err(format!(
-                "Missing required Nexus mod: {}. Confirm this dependency in UniLoader, then authorize its Slow download on Nexus before installing the parent mod.",
+                "Missing required Nexus mod: {}. Confirm this dependency in Mod Garrison, then authorize its Slow download on Nexus before installing the parent mod.",
                 dependency.name
             ));
         }
@@ -13924,7 +13927,7 @@ fn find_pending_nexus_download(
         })
         .max_by_key(|pending| pending.created_at)
         .ok_or_else(|| {
-            "UniLoader did not request this Nexus download, or the request expired. Start it again from Discovery."
+            "Mod Garrison did not request this Nexus download, or the request expired. Start it again from Discovery."
                 .to_string()
         })
 }
@@ -14050,7 +14053,7 @@ fn nexus_api_get(client: &Client, url: &str, api_key: &str) -> reqwest::blocking
     client
         .get(url)
         .header("apikey", api_key)
-        .header("Application-Name", "UniLoader")
+        .header("Application-Name", "Mod Garrison")
         .header("Application-Version", env!("CARGO_PKG_VERSION"))
         .header("Accept", "application/json")
 }
@@ -14147,7 +14150,7 @@ fn choose_requested_nexus_file(
         .ok_or_else(|| "The selected Nexus file is no longer available.".to_string())?;
     if !nexus_file_supported(&file) {
         return Err(
-            "The selected Nexus file is not a ZIP, 7Z, or RAR archive that UniLoader can install."
+            "The selected Nexus file is not a ZIP, 7Z, or RAR archive that Mod Garrison can install."
                 .to_string(),
         );
     }
@@ -14349,7 +14352,7 @@ fn install_thunderstore_discovered_mod(
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
-            "{} downloaded, but UniLoader could not identify a safe automatic install layout.",
+            "{} downloaded, but Mod Garrison could not identify a safe automatic install layout.",
             package_version.full_name
         ));
     }
@@ -14460,7 +14463,7 @@ fn install_thunderstore_dependency(
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
-            "Dependency {} downloaded, but UniLoader could not identify a safe automatic install layout.",
+            "Dependency {} downloaded, but Mod Garrison could not identify a safe automatic install layout.",
             dependency.name
         ));
     }
@@ -14530,7 +14533,7 @@ fn install_release_dependency(
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
-            "Dependency {} downloaded, but UniLoader could not identify a safe automatic install layout.",
+            "Dependency {} downloaded, but Mod Garrison could not identify a safe automatic install layout.",
             dependency.name
         ));
     }
@@ -15585,7 +15588,7 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
         destination
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("uniloader"),
+            .unwrap_or("mod-garrison"),
         Uuid::new_v4()
     );
     let temp_path = destination.with_file_name(temp_name);
@@ -15618,7 +15621,7 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
     if let Some(content_length) = response.content_length() {
         if content_length > MAX_DOWNLOAD_BYTES {
             return Err(format!(
-                "Download is too large: {} MB exceeds UniLoader's {} MB safety limit.",
+                "Download is too large: {} MB exceeds Mod Garrison's {} MB safety limit.",
                 content_length / 1024 / 1024,
                 MAX_DOWNLOAD_BYTES / 1024 / 1024
             ));
@@ -15861,7 +15864,7 @@ fn thunderstore_client() -> Result<Client, String> {
 
 fn provider_client() -> Result<Client, String> {
     Client::builder()
-        .user_agent(format!("UniLoader/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Mod Garrison/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(30))
         .build()
@@ -16148,7 +16151,7 @@ fn deploy_plan_transaction(
                 .ok_or_else(|| "The expanded mod size overflowed its safety limit.".to_string())?;
             if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES {
                 return Err(format!(
-                    "The mod expands beyond UniLoader's {} GB safety limit.",
+                    "The mod expands beyond Mod Garrison's {} GB safety limit.",
                     MAX_ARCHIVE_EXPANDED_BYTES / 1024 / 1024 / 1024
                 ));
             }
@@ -16246,7 +16249,7 @@ fn deploy_plan_transaction(
                 };
                 outcome.rollback();
                 return Err(format!(
-                    "UniLoader could not verify the deployed file: {}",
+                    "Mod Garrison could not verify the deployed file: {}",
                     file.target_relative_path
                 ));
             }
@@ -16357,7 +16360,7 @@ fn validate_archive_relative_path(path: &str) -> Result<(), String> {
         ));
     }
     if normalized.len() > 1024 {
-        return Err("An archive path exceeds UniLoader's safety limit.".to_string());
+        return Err("An archive path exceeds Mod Garrison's safety limit.".to_string());
     }
     Ok(())
 }
@@ -16383,7 +16386,7 @@ fn copy_with_limit<R: Read + ?Sized, W: Write>(
     let copied = io::copy(&mut limited, writer).map_err(error_to_string)?;
     if copied > limit {
         return Err(format!(
-            "A file exceeded UniLoader's {} MB safety limit.",
+            "A file exceeded Mod Garrison's {} MB safety limit.",
             limit / 1024 / 1024
         ));
     }
@@ -16616,7 +16619,7 @@ fn persist_profile_launch_mode(
     write_store(&profiles_file, &profiles).map_err(error_to_string)
 }
 
-fn record_is_uniloader_owned(record: &InstalledModRecord) -> bool {
+fn record_is_mod_garrison_owned(record: &InstalledModRecord) -> bool {
     if record.externally_managed {
         return false;
     }
@@ -16634,7 +16637,7 @@ fn suspend_profile_mod_files(store_root: &Path, profile: &GameProfile) -> Result
     let mut suspended_records = Vec::<(InstalledModRecord, SuspendedLaunchMod)>::new();
 
     for record in store.items.iter().filter(|record| {
-        record.profile_id == profile.id && record.enabled && record_is_uniloader_owned(record)
+        record.profile_id == profile.id && record.enabled && record_is_mod_garrison_owned(record)
     }) {
         let has_active_files = record
             .files_written
@@ -16710,7 +16713,7 @@ fn resume_profile_mod_files(store_root: &Path, profile: &GameProfile) -> Result<
             record.id == suspended.mod_id
                 && record.profile_id == profile.id
                 && record.enabled
-                && record_is_uniloader_owned(record)
+                && record_is_mod_garrison_owned(record)
         }) else {
             continue;
         };
@@ -16765,7 +16768,7 @@ fn stage_launch_mod_files(
                 || !path_is_inside(destination_path, Path::new(&profile.game_path))
             {
                 return Err(format!(
-                    "UniLoader will not stage an unsafe mod path: {}",
+                    "Mod Garrison will not stage an unsafe mod path: {}",
                     destination_path.to_string_lossy()
                 ));
             }
@@ -17022,7 +17025,7 @@ fn deactivate_mod_files_with_policy(
         }
 
         let message = format!(
-            "UniLoader did not remove {} because it was modified after installation: {}",
+            "Mod Garrison did not remove {} because it was modified after installation: {}",
             display_record_name(record),
             path.to_string_lossy()
         );
@@ -17041,7 +17044,7 @@ fn deactivate_mod_files_with_policy(
                     let display_path = path.to_string_lossy().to_string();
                     preserved_files.push(display_path.clone());
                     warnings.push(format!(
-                        "UniLoader forgot the managed record but left this modified or unverified file untouched: {display_path}"
+                        "Mod Garrison forgot the managed record but left this modified or unverified file untouched: {display_path}"
                     ));
                 }
             }
@@ -17058,7 +17061,7 @@ fn deactivate_mod_files_with_policy(
             if !path.is_file() {
                 let _ = fs::remove_dir_all(&transaction_root);
                 return Err(format!(
-                    "UniLoader cannot safely replace a folder where a managed file was expected: {}",
+                    "Mod Garrison cannot safely replace a folder where a managed file was expected: {}",
                     path.to_string_lossy()
                 ));
             }
@@ -17248,7 +17251,7 @@ fn adopt_existing_native_script_mods(
                 &script_file.source_relative_path,
                 "game",
                 &script_file.target_relative_path,
-                "Existing game-side script mod adopted by UniLoader.",
+                "Existing game-side script mod adopted by Mod Garrison.",
             )],
             dependencies: Vec::new(),
             warnings: Vec::new(),
@@ -20175,7 +20178,7 @@ fn migrate_legacy_generated_mod_folders(
 
     for (store_index, record) in original_store.items.iter().enumerate() {
         if record.profile_id != profile.id
-            || !record_is_uniloader_owned(record)
+            || !record_is_mod_garrison_owned(record)
             || record.runtime_id.is_some()
             || record.plan.is_none()
         {
@@ -20187,7 +20190,7 @@ fn migrate_legacy_generated_mod_folders(
             Ok(migration) => migration,
             Err(reason) => {
                 outcome.warnings.push(format!(
-                    "UniLoader kept the existing folder for {} because {}.",
+                    "Mod Garrison kept the existing folder for {} because {}.",
                     display_record_name(record),
                     reason
                 ));
@@ -20262,7 +20265,7 @@ fn migrate_legacy_generated_mod_folders(
 
         if let Err(reason) = preflight {
             outcome.warnings.push(format!(
-                "UniLoader kept the existing folder for {} because {}.",
+                "Mod Garrison kept the existing folder for {} because {}.",
                 display_record_name(record),
                 reason
             ));
@@ -20354,7 +20357,7 @@ fn migrate_legacy_generated_mod_folders(
                 (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
                     if let Err(error) = fs::remove_file(&file_move.source) {
                         outcome.warnings.push(format!(
-                            "The clean folder is active, but UniLoader could not remove the old copy at {}: {error}",
+                            "The clean folder is active, but Mod Garrison could not remove the old copy at {}: {error}",
                             file_move.source.to_string_lossy()
                         ));
                     } else {
@@ -20362,7 +20365,7 @@ fn migrate_legacy_generated_mod_folders(
                     }
                 }
                 _ => outcome.warnings.push(format!(
-                    "The clean folder is active, but UniLoader kept an old copy whose contents could not be verified: {}",
+                    "The clean folder is active, but Mod Garrison kept an old copy whose contents could not be verified: {}",
                     file_move.source.to_string_lossy()
                 )),
             }
@@ -20378,7 +20381,7 @@ fn migrate_legacy_generated_mod_folders(
     for legacy_root in legacy_roots {
         if let Err(error) = remove_empty_migration_tree(&legacy_root) {
             outcome.warnings.push(format!(
-                "UniLoader renamed the managed files but could not remove an empty legacy folder at {}: {error}",
+                "Mod Garrison renamed the managed files but could not remove an empty legacy folder at {}: {error}",
                 legacy_root.to_string_lossy()
             ));
         }
@@ -21079,6 +21082,71 @@ fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+fn migrate_legacy_app_data(app: &AppHandle) -> Result<(), String> {
+    let current_root = app.path().app_data_dir().map_err(error_to_string)?;
+    let parent = current_root
+        .parent()
+        .ok_or_else(|| "Could not locate the application data parent folder.".to_string())?;
+    let legacy_root = parent.join(LEGACY_APP_IDENTIFIER);
+    migrate_legacy_data_directory(&legacy_root, &current_root).map_err(|error| {
+        format!("Could not migrate existing UniLoader data into Mod Garrison: {error}")
+    })
+}
+
+fn migrate_legacy_data_directory(legacy_root: &Path, current_root: &Path) -> io::Result<()> {
+    if legacy_root == current_root || !legacy_root.is_dir() {
+        return Ok(());
+    }
+
+    if !current_root.exists() && fs::rename(legacy_root, current_root).is_ok() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(current_root)?;
+    merge_legacy_directory(legacy_root, current_root)
+}
+
+fn merge_legacy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if !destination_path.exists() {
+            if fs::rename(&source_path, &destination_path).is_ok() {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                merge_legacy_directory(&source_path, &destination_path)?;
+            } else if file_type.is_file() {
+                fs::copy(&source_path, &destination_path)?;
+                fs::remove_file(&source_path)?;
+            }
+            continue;
+        }
+
+        if file_type.is_dir() && destination_path.is_dir() {
+            merge_legacy_directory(&source_path, &destination_path)?;
+        }
+    }
+
+    if fs::read_dir(source)?.next().is_none() {
+        fs::remove_dir(source)?;
+    }
+    Ok(())
+}
+
 fn ensure_app_settings(path: &Path) -> io::Result<()> {
     if !path.exists() {
         write_app_settings_raw(path, &AppSettings::default())?;
@@ -21117,8 +21185,20 @@ fn write_app_settings_raw(path: &Path, settings: &AppSettings) -> io::Result<()>
 }
 
 fn read_nexus_api_key() -> Result<Option<String>, String> {
-    let entry =
-        keyring::Entry::new(NEXUS_KEYRING_SERVICE, NEXUS_KEYRING_USER).map_err(error_to_string)?;
+    if let Some(value) = read_nexus_api_key_from_service(NEXUS_KEYRING_SERVICE)? {
+        return Ok(Some(value));
+    }
+
+    let Some(legacy_value) = read_nexus_api_key_from_service(LEGACY_NEXUS_KEYRING_SERVICE)? else {
+        return Ok(None);
+    };
+    write_nexus_api_key_to_service(NEXUS_KEYRING_SERVICE, &legacy_value)?;
+    let _ = delete_nexus_api_key_from_service(LEGACY_NEXUS_KEYRING_SERVICE);
+    Ok(Some(legacy_value))
+}
+
+fn read_nexus_api_key_from_service(service: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(service, NEXUS_KEYRING_USER).map_err(error_to_string)?;
     match entry.get_password() {
         Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
@@ -21129,21 +21209,36 @@ fn read_nexus_api_key() -> Result<Option<String>, String> {
 }
 
 fn write_nexus_api_key(value: Option<&str>) -> Result<(), String> {
-    let entry =
-        keyring::Entry::new(NEXUS_KEYRING_SERVICE, NEXUS_KEYRING_USER).map_err(error_to_string)?;
     let result = match value {
-        Some(value) => entry
-            .set_password(value)
-            .map_err(|error| format!("Could not save the Nexus API key securely: {error}")),
-        None => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(format!("Could not remove the Nexus API key: {error}")),
-        },
+        Some(value) => {
+            write_nexus_api_key_to_service(NEXUS_KEYRING_SERVICE, value)?;
+            let _ = delete_nexus_api_key_from_service(LEGACY_NEXUS_KEYRING_SERVICE);
+            Ok(())
+        }
+        None => {
+            delete_nexus_api_key_from_service(NEXUS_KEYRING_SERVICE)?;
+            delete_nexus_api_key_from_service(LEGACY_NEXUS_KEYRING_SERVICE)
+        }
     };
     if result.is_ok() {
         clear_stale_nexus_key_validation(value);
     }
     result
+}
+
+fn write_nexus_api_key_to_service(service: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(service, NEXUS_KEYRING_USER)
+        .map_err(error_to_string)?
+        .set_password(value)
+        .map_err(|error| format!("Could not save the Nexus API key securely: {error}"))
+}
+
+fn delete_nexus_api_key_from_service(service: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(service, NEXUS_KEYRING_USER).map_err(error_to_string)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not remove the Nexus API key: {error}")),
+    }
 }
 
 fn profiles_path(root: &Path) -> PathBuf {
@@ -21209,7 +21304,9 @@ fn recover_replacement_transactions_once(root: &Path) -> Result<(), String> {
     let mut recovered = RECOVERED_REPLACEMENT_ROOTS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .map_err(|_| "UniLoader's replacement recovery coordinator is unavailable.".to_string())?;
+        .map_err(|_| {
+            "Mod Garrison's replacement recovery coordinator is unavailable.".to_string()
+        })?;
     if recovered.contains(&recovery_key) {
         return Ok(());
     }
@@ -21300,7 +21397,7 @@ fn recover_store_transactions_once(root: &Path) -> Result<(), String> {
     let mut recovered = RECOVERED_STORE_ROOTS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .map_err(|_| "UniLoader's recovery coordinator is unavailable.".to_string())?;
+        .map_err(|_| "Mod Garrison's recovery coordinator is unavailable.".to_string())?;
     if recovered.contains(&recovery_key) {
         return Ok(());
     }
@@ -21524,7 +21621,9 @@ fn recover_deployment_transactions_once(root: &Path) -> Result<(), String> {
     let mut recovered = RECOVERED_DEPLOYMENT_ROOTS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .map_err(|_| "UniLoader's deployment recovery coordinator is unavailable.".to_string())?;
+        .map_err(|_| {
+            "Mod Garrison's deployment recovery coordinator is unavailable.".to_string()
+        })?;
     if recovered.contains(&recovery_key) {
         return Ok(());
     }
@@ -21805,7 +21904,9 @@ fn lock_mutations() -> Result<MutexGuard<'static, ()>, String> {
     MUTATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| "UniLoader's operation queue was poisoned by an earlier failure.".to_string())
+        .map_err(|_| {
+            "Mod Garrison's operation queue was poisoned by an earlier failure.".to_string()
+        })
 }
 
 fn lock_profile_imports() -> Result<MutexGuard<'static, ()>, String> {
@@ -21813,7 +21914,7 @@ fn lock_profile_imports() -> Result<MutexGuard<'static, ()>, String> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| {
-            "UniLoader's profile import queue was poisoned by an earlier failure.".to_string()
+            "Mod Garrison's profile import queue was poisoned by an earlier failure.".to_string()
         })
 }
 
@@ -21867,7 +21968,7 @@ fn lock_store_io() -> io::Result<MutexGuard<'static, ()>> {
     STORE_WRITE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| io::Error::other("UniLoader's storage lock was poisoned"))
+        .map_err(|_| io::Error::other("Mod Garrison's storage lock was poisoned"))
 }
 
 fn atomic_write_unlocked_with_backup(
@@ -22057,7 +22158,10 @@ fn github_asset_sha256(asset: &GithubReleaseAsset) -> Option<String> {
 
 fn update_installer_asset_score(name: &str) -> Option<i32> {
     let lower_name = name.to_lowercase();
-    if !lower_name.starts_with("uniloader") {
+    if !(lower_name.starts_with("mod garrison")
+        || lower_name.starts_with("mod-garrison")
+        || lower_name.starts_with("mod_garrison"))
+    {
         return None;
     }
 
@@ -22162,7 +22266,7 @@ fn validated_update_url(value: &str) -> Result<String, String> {
     }
     let expected_prefix = format!("/{APP_UPDATE_REPOSITORY}/releases/download/");
     if !parsed.path().starts_with(&expected_prefix) {
-        return Err("The update URL is not an official UniLoader release asset.".to_string());
+        return Err("The update URL is not an official Mod Garrison release asset.".to_string());
     }
     Ok(parsed.to_string())
 }
@@ -22248,7 +22352,7 @@ fn update_installer_file_name(url: &str, file_name: Option<&str>) -> Result<Stri
                 .and_then(|part| part.split('?').next())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "UniLoader-update-setup.exe".to_string());
+        .unwrap_or_else(|| "Mod-Garrison-update-setup.exe".to_string());
     let safe_name = sanitize_file_segment(&raw_name);
     let lower_name = safe_name.to_lowercase();
 
@@ -22273,6 +22377,63 @@ fn launch_update_installer(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_app_data_moves_into_the_mod_garrison_identity() {
+        let root = temp_game_dir("legacy-app-data-move");
+        let legacy_root = root.join(LEGACY_APP_IDENTIFIER);
+        let current_root = root.join("com.modgarrison.desktop");
+        fs::create_dir_all(legacy_root.join("profiles")).unwrap();
+        fs::write(legacy_root.join("profiles.json"), "legacy profiles").unwrap();
+        fs::write(
+            legacy_root.join("profiles").join("windrose.json"),
+            "legacy profile detail",
+        )
+        .unwrap();
+
+        migrate_legacy_data_directory(&legacy_root, &current_root).unwrap();
+
+        assert!(!legacy_root.exists());
+        assert_eq!(
+            fs::read_to_string(current_root.join("profiles.json")).unwrap(),
+            "legacy profiles"
+        );
+        assert_eq!(
+            fs::read_to_string(current_root.join("profiles").join("windrose.json")).unwrap(),
+            "legacy profile detail"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_app_data_merge_preserves_newer_conflicting_files() {
+        let root = temp_game_dir("legacy-app-data-merge");
+        let legacy_root = root.join(LEGACY_APP_IDENTIFIER);
+        let current_root = root.join("com.modgarrison.desktop");
+        fs::create_dir_all(&legacy_root).unwrap();
+        fs::create_dir_all(&current_root).unwrap();
+        fs::write(legacy_root.join("profiles.json"), "legacy profiles").unwrap();
+        fs::write(legacy_root.join("installed-mods.json"), "legacy mods").unwrap();
+        fs::write(current_root.join("profiles.json"), "current profiles").unwrap();
+
+        migrate_legacy_data_directory(&legacy_root, &current_root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(current_root.join("profiles.json")).unwrap(),
+            "current profiles"
+        );
+        assert_eq!(
+            fs::read_to_string(current_root.join("installed-mods.json")).unwrap(),
+            "legacy mods"
+        );
+        assert_eq!(
+            fs::read_to_string(legacy_root.join("profiles.json")).unwrap(),
+            "legacy profiles"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn process_paths_must_be_inside_the_exact_game_directory() {
@@ -22319,7 +22480,7 @@ mod tests {
 
         let game_root = temp_game_dir("running-game-probe");
         fs::create_dir_all(&game_root).unwrap();
-        let probe_executable = game_root.join("UniLoaderGameProbe.exe");
+        let probe_executable = game_root.join("Mod GarrisonGameProbe.exe");
         fs::copy(std::env::current_exe().unwrap(), &probe_executable).unwrap();
 
         let mut child = Command::new(&probe_executable)
@@ -22328,7 +22489,7 @@ mod tests {
                 "tests::running_game_probe_child_process",
                 "--nocapture",
             ])
-            .env("UNILOADER_PROCESS_PROBE_CHILD", "1")
+            .env("MOD_GARRISON_PROCESS_PROBE_CHILD", "1")
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -22361,7 +22522,7 @@ mod tests {
 
     #[test]
     fn running_game_probe_child_process() {
-        if std::env::var_os("UNILOADER_PROCESS_PROBE_CHILD").is_some() {
+        if std::env::var_os("MOD_GARRISON_PROCESS_PROBE_CHILD").is_some() {
             std::thread::sleep(Duration::from_secs(10));
         }
     }
@@ -23351,7 +23512,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_adopted_files_are_not_treated_as_uniloader_owned() {
+    fn legacy_adopted_files_are_not_treated_as_mod_garrison_owned() {
         let mut record = InstalledModRecord {
             id: "legacy-external".to_string(),
             profile_id: "profile".to_string(),
@@ -23379,11 +23540,11 @@ mod tests {
             plan: None,
         };
 
-        assert!(!record_is_uniloader_owned(&record));
+        assert!(!record_is_mod_garrison_owned(&record));
         record.package_id = Some("observed-runtime:ue4ss".to_string());
-        assert!(!record_is_uniloader_owned(&record));
+        assert!(!record_is_mod_garrison_owned(&record));
         record.package_id = Some("nexus:managed-mod".to_string());
-        assert!(record_is_uniloader_owned(&record));
+        assert!(record_is_mod_garrison_owned(&record));
     }
 
     #[test]
@@ -23488,20 +23649,20 @@ mod tests {
     fn update_checker_prefers_setup_exe_assets() {
         let release = GithubReleaseResponse {
             tag_name: "v0.5".to_string(),
-            html_url: Some("https://github.com/Chucksterboy/UniLoader/releases/tag/v0.5".to_string()),
+            html_url: Some("https://github.com/Chucksterboy/ModGarrison/releases/tag/v0.5".to_string()),
             assets: vec![
                 GithubReleaseAsset {
-                    name: "UniLoader_0.5.0_x64_en-US.msi".to_string(),
+                    name: "Mod Garrison_0.5.0_x64_en-US.msi".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64_en-US.msi"
+                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod%20Garrison_0.5.0_x64_en-US.msi"
                             .to_string(),
                     size: Some(42),
                     digest: None,
                 },
                 GithubReleaseAsset {
-                    name: "UniLoader_0.5.0_x64-setup.exe".to_string(),
+                    name: "Mod Garrison_0.5.0_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/UniLoader/releases/download/v0.5/UniLoader_0.5.0_x64-setup.exe"
+                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod%20Garrison_0.5.0_x64-setup.exe"
                             .to_string(),
                     size: Some(84),
                     digest: Some(format!("sha256:{}", "a".repeat(64))),
@@ -23510,7 +23671,7 @@ mod tests {
         };
 
         let asset = select_update_installer_asset(&release).unwrap();
-        assert_eq!(asset.name, "UniLoader_0.5.0_x64-setup.exe");
+        assert_eq!(asset.name, "Mod Garrison_0.5.0_x64-setup.exe");
         assert_eq!(asset.size, Some(84));
         assert_eq!(github_asset_sha256(asset), Some("a".repeat(64)));
     }
@@ -23518,9 +23679,9 @@ mod tests {
     #[test]
     fn github_release_digest_accepts_only_well_formed_sha256_values() {
         let asset = GithubReleaseAsset {
-            name: "UniLoader-setup.exe".to_string(),
+            name: "Mod Garrison-setup.exe".to_string(),
             browser_download_url:
-                "https://github.com/Chucksterboy/UniLoader/releases/download/v1/UniLoader-setup.exe"
+                "https://github.com/Chucksterboy/ModGarrison/releases/download/v1/Mod%20Garrison-setup.exe"
                     .to_string(),
             size: Some(42),
             digest: Some("sha256:not-a-hash".to_string()),
@@ -23533,8 +23694,8 @@ mod tests {
     fn update_installer_magic_rejects_web_payloads() {
         let root = temp_game_dir("update-installer-magic");
         fs::create_dir_all(&root).unwrap();
-        let executable = root.join("UniLoader-setup.exe");
-        let package = root.join("UniLoader.msi");
+        let executable = root.join("Mod Garrison-setup.exe");
+        let package = root.join("Mod Garrison.msi");
         let invalid = root.join("invalid-setup.exe");
         fs::write(&executable, b"MZ\0\0test").unwrap();
         fs::write(&package, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]).unwrap();
@@ -23688,7 +23849,7 @@ mod tests {
         let record = InstalledModRecord {
             id: "mod-1".to_string(),
             profile_id: profile.id.clone(),
-            archive_path: "C:/UniLoader/packages/ShipLootx2.zip".to_string(),
+            archive_path: "C:/Mod Garrison/packages/ShipLootx2.zip".to_string(),
             archive_name: "ShipLootx2-172-3-1777184245.zip".to_string(),
             display_name: Some("Ship Lootx 2".to_string()),
             package_id: None,
@@ -26552,7 +26713,7 @@ mod tests {
         assert_eq!(resolved.app_id, installed_game.app_id);
         assert!(resolve_profile_bundle_steam_game(&bundle_path, &[]).is_err());
 
-        // Importing a transferred bundle targets a fresh UniLoader profile store.
+        // Importing a transferred bundle targets a fresh Mod Garrison profile store.
         commit_removed_profile_state(&root, &profile.id).unwrap();
         let imported =
             import_profile_bundle_impl(&root, &transferred_bundle_path, &target_game).unwrap();
@@ -26739,7 +26900,7 @@ mod tests {
             ProfileBundleExportOptions::self_contained(),
         )
         .unwrap_err();
-        assert!(external_error.contains("managed outside UniLoader"));
+        assert!(external_error.contains("managed outside Mod Garrison"));
 
         let missing_root = temp_game_dir("self-contained-missing-runtime");
         let missing_fixture = managed_bepinex_fixture(&missing_root);
@@ -27147,15 +27308,15 @@ mod tests {
     #[test]
     fn nxm_handoffs_do_not_raise_the_existing_window() {
         assert!(contains_nxm_handoff_argument(&[
-            "uniloader.exe".to_string(),
+            "mod-garrison.exe".to_string(),
             "nxm://valheim/mods/1/files/2?key=test".to_string(),
         ]));
         assert!(contains_nxm_handoff_argument(&[
-            "uniloader.exe".to_string(),
+            "mod-garrison.exe".to_string(),
             "\"NXM://windrose/mods/3/files/4?key=test\"".to_string(),
         ]));
         assert!(!contains_nxm_handoff_argument(&[
-            "uniloader.exe".to_string(),
+            "mod-garrison.exe".to_string(),
             "--show".to_string(),
         ]));
     }
@@ -27614,7 +27775,7 @@ mod tests {
     }
 
     fn temp_game_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("uniloader-{}-{}", name, Uuid::new_v4()))
+        std::env::temp_dir().join(format!("mod-garrison-{}-{}", name, Uuid::new_v4()))
     }
 
     fn touch(root: &Path, relative_path: &str) {

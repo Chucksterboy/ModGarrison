@@ -1,12 +1,12 @@
-# UniLoader
+# Mod Garrison
 
-[Download releases](https://github.com/Chucksterboy/UniLoader/releases) |
+[Download releases](https://github.com/Chucksterboy/ModGarrison/releases) |
 [Privacy policy](PRIVACY.md) |
 [Code signing policy](CODE_SIGNING.md) |
 [Bundled asset licenses](ASSET_LICENSES.md) |
 [MIT license](LICENSE)
 
-UniLoader is a desktop mod manager prototype built around a practical universal model:
+Mod Garrison is a desktop mod manager prototype built around a practical universal model:
 
 - One app and profile system.
 - Per-game install adapters.
@@ -29,7 +29,7 @@ The first implementation supports ZIP archives, 7Z archives, and normal folder i
 
 ## Runtime Providers
 
-UniLoader can automatically resolve these loader/runtime dependencies:
+Mod Garrison can automatically resolve these loader/runtime dependencies:
 
 - Thunderstore package dependencies from `manifest.json`.
 - Valheim BepInEx from Thunderstore (`denikson/BepInExPack_Valheim`).
@@ -42,24 +42,24 @@ Source platforms such as Nexus Mods, CurseForge/Overwolf, Thunderstore, and Mod.
 
 ### Runtime Registry Extensions
 
-Bundled runtime definitions live in `src-tauri/src/runtime_definitions.json`. A local extension registry can add a runtime, or override a bundled runtime with the same `id`, without recompiling UniLoader:
+Bundled runtime definitions live in `src-tauri/src/runtime_definitions.json`. A local extension registry can add a runtime, or override a bundled runtime with the same `id`, without recompiling Mod Garrison:
 
 ```text
-%APPDATA%\com.uniloader.desktop\registry\runtime-definitions.json
+%APPDATA%\com.modgarrison.desktop\registry\runtime-definitions.json
 ```
 
-The extension file uses the same JSON array shape as the bundled registry. UniLoader validates runtime IDs, provider capabilities, detection marker types, and every relative detection path before accepting the registry. An invalid extension blocks startup with a specific registry error instead of silently falling back to unsafe or partial behavior. New provider resolvers still require an audited native implementation and an entry in `src-tauri/src/dependency_provider_definitions.json`; registry data cannot turn an unsupported provider into an automatic downloader.
+The extension file uses the same JSON array shape as the bundled registry. Mod Garrison validates runtime IDs, provider capabilities, detection marker types, and every relative detection path before accepting the registry. An invalid extension blocks startup with a specific registry error instead of silently falling back to unsafe or partial behavior. New provider resolvers still require an audited native implementation and an entry in `src-tauri/src/dependency_provider_definitions.json`; registry data cannot turn an unsupported provider into an automatic downloader.
 
 ## Run
 
-UniLoader now uses Tauri, so running from source requires Rust/Cargo plus the bundled Codex Node runtime or a local Node.js install.
+Mod Garrison now uses Tauri, so running from source requires Rust/Cargo plus the bundled Codex Node runtime or a local Node.js install.
 
 ```powershell
 pnpm install
 pnpm dev
 ```
 
-The Desktop shortcut points at `Start-UniLoader.cmd`. It starts a release build when one exists, otherwise it launches Tauri dev mode. If Rust is not installed, it will show a clear message instead of failing silently.
+The Desktop shortcut points at `Start-Mod-Garrison.cmd`. It starts a release build when one exists, otherwise it launches Tauri dev mode. If Rust is not installed, it will show a clear message instead of failing silently.
 
 ## Current State
 
@@ -67,14 +67,14 @@ This is a working foundation, not a finished public mod manager. It can create g
 
 The React frontend lives in `src/renderer`. The Tauri/Rust backend lives in `src-tauri`.
 
-The transfer tab exports a selected profile into a `.uniloader-profile` bundle. Importing that bundle prompts for the local game folder, recreates the profile, restores bundled config files, and redeploys enabled mods from the managed package copies.
+The transfer tab exports a selected profile into a `.modgarrison-profile` bundle. Importing that bundle prompts for the local game folder, recreates the profile, restores bundled config files, and redeploys enabled mods from the managed package copies. Legacy `.uniloader-profile` bundles remain importable.
 
 ## Releases and Updates
 
-UniLoader displays its current app version in the bottom-left rail. On startup, it checks the latest GitHub Release for `Chucksterboy/UniLoader`. If a newer release exists, a pulsing download indicator appears above the health dot in the left rail.
+Mod Garrison displays its current app version in the bottom-left rail. On startup, it checks the latest GitHub Release for `Chucksterboy/ModGarrison`. If a newer release exists, a pulsing download indicator appears above the health dot in the left rail.
 
 Official Windows installers and their SHA-256 checksum files are published on
-the [GitHub Releases page](https://github.com/Chucksterboy/UniLoader/releases).
+the [GitHub Releases page](https://github.com/Chucksterboy/ModGarrison/releases).
 
 To publish an installer build, push a version tag:
 
@@ -91,7 +91,7 @@ installer, publishes the release, and uploads SHA-256 checksum files.
 Known-game rules live in `src-tauri/src/game_definitions.json`. Add future games there first:
 
 - `executableNames` and `pathMarkers` identify the game.
-- `bootstrapRuntimes` declares loaders UniLoader should install after profile creation.
+- `bootstrapRuntimes` declares loaders Mod Garrison should install after profile creation.
 - `runtimeDependencies` maps runtimes to official providers and release assets.
 - `configRoots` adds game-specific config discovery paths.
 
@@ -103,11 +103,11 @@ Keep generic engine/loader detection in Rust, but prefer extending this manifest
 - Prefer game-specific adapters over blind file-copy installs.
 - Back up overwritten files before deploying into a game directory.
 - Resolve dependencies per game profile, while caching downloads globally.
-- Store imported mod sources in UniLoader's profile package library before deployment.
+- Store imported mod sources in Mod Garrison's profile package library before deployment.
 
 ## Privacy
 
-UniLoader is local-first and does not include project-operated telemetry,
+Mod Garrison is local-first and does not include project-operated telemetry,
 analytics, advertising, accounts, or cloud synchronization. It does connect to
 documented third-party services for updates, mod discovery, artwork, and
 runtime downloads. See the [Privacy Policy](PRIVACY.md) for the complete data
@@ -122,8 +122,8 @@ Free code signing provided by [SignPath.io](https://about.signpath.io/), certifi
 
 ## License
 
-UniLoader is available under the [MIT License](LICENSE). Third-party
+Mod Garrison is available under the [MIT License](LICENSE). Third-party
 dependencies retain their respective licenses. Game artwork, provider content,
-and mods fetched at runtime are not redistributed under the UniLoader license.
+and mods fetched at runtime are not redistributed under the Mod Garrison license.
 See [Bundled Asset Licenses](ASSET_LICENSES.md) for the provenance and license
 of the notification sounds and application artwork included in release builds.

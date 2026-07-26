@@ -193,11 +193,12 @@ type ForceRemovalPrompt =
 
 const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
-const forceRemovalRequiredPrefix = "UNILOADER_FORCE_REMOVAL_REQUIRED:";
+const forceRemovalRequiredPrefix = "MOD_GARRISON_FORCE_REMOVAL_REQUIRED:";
 const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
 const startupSplashMaximumMs = 8000;
-const modPresentationStorageKey = "uniloader.mod-presentations.v2";
+const modPresentationStorageKey = "modgarrison.mod-presentations.v2";
+const legacyModPresentationStorageKey = "uniloader.mod-presentations.v2";
 const maxInstalledModProfileCaches = 12;
 const maxArtworkRefreshProfiles = 48;
 const maxProcessedNxmLinks = 128;
@@ -739,7 +740,7 @@ export function App() {
           setNotice({
             kind: "warning",
             title: "Launch not detected",
-            detail: `Steam accepted the request, but UniLoader could not detect ${profileName} running.`
+            detail: `Steam accepted the request, but Mod Garrison could not detect ${profileName} running.`
           });
         } else {
           consecutiveStoppedChecks = 0;
@@ -951,7 +952,7 @@ export function App() {
       setNotice({
         kind: "warning",
         title: "Nexus download authorized",
-        detail: "UniLoader received the selected file and is checking it before installation."
+        detail: "Mod Garrison received the selected file and is checking it before installation."
       });
 
       try {
@@ -1114,7 +1115,7 @@ export function App() {
       setNotice({
         kind: "warning",
         title: "Downloading update",
-        detail: `UniLoader ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"} installer is downloading now.`
+        detail: `Mod Garrison ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"} installer is downloading now.`
       });
       try {
         const installerPath = await api.downloadUpdateInstaller(
@@ -1127,7 +1128,7 @@ export function App() {
         setNotice({
           kind: "success",
           title: "Installer launched",
-          detail: `Downloaded to ${installerPath}. UniLoader will close so the installer can update it.`
+          detail: `Downloaded to ${installerPath}. Mod Garrison will close so the installer can update it.`
         });
       } catch (caughtError) {
         setStatus("Update download failed");
@@ -1274,7 +1275,7 @@ export function App() {
       setForceRemovalPrompt(null);
       const baseDetail =
         result.removedModRecords > 0
-          ? `${result.name} was removed with ${result.removedModRecords} UniLoader mod record(s).`
+          ? `${result.name} was removed with ${result.removedModRecords} Mod Garrison mod record(s).`
           : `${result.name} was removed.`;
       setNotice({
         kind: result.warnings.length > 0 ? "warning" : "success",
@@ -1331,7 +1332,7 @@ export function App() {
         detail:
           games.length > 0
             ? `Found ${games.length} installed Steam game${games.length === 1 ? "" : "s"}. Pick one below to create a profile.`
-            : "UniLoader could not find Steam library manifests on this PC."
+            : "Mod Garrison could not find Steam library manifests on this PC."
       });
     } catch (caughtError) {
       setError(String(caughtError));
@@ -1423,7 +1424,7 @@ export function App() {
       setNotice({
         kind: "warning",
         title: "Profile already exists",
-        detail: `${existingProfile.name} is already in UniLoader.`
+        detail: `${existingProfile.name} is already in Mod Garrison.`
       });
       return;
     }
@@ -1546,8 +1547,8 @@ export function App() {
         kind: "success",
         title: enabled ? "Managed components restored" : "Unmodded state ready",
         detail: enabled
-          ? `Restored ${result.changedComponents} UniLoader-managed component${result.changedComponents === 1 ? "" : "s"}.`
-          : `Suspended ${result.changedComponents} UniLoader-managed component${result.changedComponents === 1 ? "" : "s"}, including applicable runtimes. Pre-existing game files were preserved.`
+          ? `Restored ${result.changedComponents} Mod Garrison-managed component${result.changedComponents === 1 ? "" : "s"}.`
+          : `Suspended ${result.changedComponents} Mod Garrison-managed component${result.changedComponents === 1 ? "" : "s"}, including applicable runtimes. Pre-existing game files were preserved.`
       });
     } catch (caughtError) {
       setError(String(caughtError));
@@ -1787,7 +1788,7 @@ export function App() {
         setNotice({
           kind: "warning",
           title: "Continue in Nexus",
-          detail: "Click Slow download, then Open via UniLoader for automated installs."
+          detail: "Click Slow download, then Open via Mod Garrison for automated installs."
         });
       } catch (caughtError) {
         if (pendingNexusInstallTimeoutRef.current !== null) {
@@ -1888,7 +1889,7 @@ export function App() {
         setNotice({
           kind: "warning",
           title: `Required: ${missingNexusDependency.name}`,
-          detail: "Click Slow download, then Open via UniLoader. Retry the original mod after this requirement installs."
+          detail: "Click Slow download, then Open via Mod Garrison. Retry the original mod after this requirement installs."
         });
       } catch (caughtError) {
         playInstallSound("failure");
@@ -2284,8 +2285,8 @@ export function App() {
     >
       <header className="vault-titlebar" onMouseDown={startTitlebarDrag}>
         <div className="vault-brand">
-          <span className="vault-brand-mark"><UniLoaderMark /></span>
-          <strong>UniLoader</strong>
+          <span className="vault-brand-mark"><ModGarrisonMark /></span>
+          <strong>Mod Garrison</strong>
         </div>
         <nav className="vault-primary-nav" aria-label="Primary navigation">
           <button
@@ -2827,7 +2828,7 @@ export function App() {
           <Heart size={19} />
           <span>Support Me</span>
         </button>
-        <div className="vault-version" title={`UniLoader ${appVersion || "loading"}`}>
+        <div className="vault-version" title={`Mod Garrison ${appVersion || "loading"}`}>
           <span className="rail-status" />
           {appVersion ? `v${appVersion}` : ""}
         </div>
@@ -3191,8 +3192,8 @@ function ProfileRemovalDialog({
           <p className="eyebrow">Remove Profile</p>
           <h3>{profile.name}</h3>
           <p>
-            This removes every UniLoader-managed mod, dependency, and runtime, then restores any
-            game files they replaced. Components that existed before UniLoader are preserved.
+            This removes every Mod Garrison-managed mod, dependency, and runtime, then restores any
+            game files they replaced. Components that existed before Mod Garrison are preserved.
           </p>
         </div>
         <div className="confirm-actions">
@@ -3240,7 +3241,7 @@ function ForceRemovalDialog({
           <p className="eyebrow">Modified Files Found</p>
           <h3>Forget {itemType === "profile" ? "profile" : "mod"} anyway?</h3>
           <p>
-            UniLoader will remove every file that still matches its installation receipt, leave
+            Mod Garrison will remove every file that still matches its installation receipt, leave
             modified or unverified files untouched, and forget {itemName}.
           </p>
           <p>{detail}</p>
@@ -3287,7 +3288,7 @@ function DependencyInstallDialog({
         <div className="confirm-copy">
           <p className="eyebrow">Required Components</p>
           <h3>{modName}</h3>
-          <p>UniLoader checked this profile first. These required components are still missing:</p>
+          <p>Mod Garrison checked this profile first. These required components are still missing:</p>
           <div className="dependency-confirm-list">
             {missingDependencies.map((dependency) => (
               <div className="dependency-confirm-item" key={dependency.id}>
@@ -3604,7 +3605,7 @@ function UpdateRailIndicator({
 
   const tone = updateInfo?.updateAvailable ? "available" : "warning";
   const title = updateInfo?.updateAvailable
-    ? `Download UniLoader ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"}`
+    ? `Download Mod Garrison ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"}`
     : isDownloading
       ? "Downloading update"
       : isChecking
@@ -3653,7 +3654,7 @@ function HealthPanel({
   );
 }
 
-function UniLoaderMark() {
+function ModGarrisonMark() {
   return (
     <svg aria-hidden="true" viewBox="0 0 48 48">
       <path
@@ -3664,10 +3665,11 @@ function UniLoaderMark() {
         strokeWidth="1.7"
       />
       <path
-        d="M13 12h7v14.2c0 3.7 1.4 6 4 7.4 2.6-1.4 4-3.7 4-7.4V12h7v14.2c0 7.6-4.4 12.1-11 14.9-6.6-2.8-11-7.3-11-14.9V12Z"
+        d="M10.5 20h3v-5h5v5h3v-5h5v5h3v-5h5v5h3v15H30v-7H18v7h-7.5V20Z"
         fill="currentColor"
       />
-      <path d="m20 12 4-4 4 4-4 4-4-4Z" fill="#fff" fillOpacity="0.5" />
+      <path d="M18 35v-7a6 6 0 0 1 12 0v7H18Z" fill="#05090b" fillOpacity="0.92" />
+      <path d="M22 35v-6.5a2 2 0 0 1 4 0V35h-4Z" fill="currentColor" fillOpacity="0.36" />
     </svg>
   );
 }
@@ -3675,12 +3677,12 @@ function UniLoaderMark() {
 function StartupSplash({ phase }: { phase: StartupSplashPhase }) {
   return (
     <div
-      aria-label="UniLoader starting"
+      aria-label="Mod Garrison starting"
       className={phase === "exiting" ? "startup-splash exiting" : "startup-splash"}
       role="status"
     >
       <div className="startup-splash-mark">
-        <UniLoaderMark />
+        <ModGarrisonMark />
       </div>
     </div>
   );
@@ -4369,7 +4371,7 @@ function OnlineModCard({
             ) : null}
             {selectedFile?.action === "browser" ? (
               <div className="online-mod-file-message warning">
-                Click Slow download, then Open via UniLoader for automated installs.
+                Click Slow download, then Open via Mod Garrison for automated installs.
               </div>
             ) : null}
           </section>
@@ -4461,7 +4463,7 @@ function TransferView({
       <div className="transfer-hero">
         <p className="eyebrow">Profile transfer</p>
         <h2>Import / Export</h2>
-        <span>Move complete profiles between PCs using portable UniLoader bundle files.</span>
+        <span>Move complete profiles between PCs using portable Mod Garrison bundle files.</span>
       </div>
 
       <div className="transfer-choice-grid">
@@ -4472,7 +4474,7 @@ function TransferView({
         >
           <Download size={24} />
           <strong>Import</strong>
-          <span>Restore a shared UniLoader profile bundle into a selected game folder.</span>
+          <span>Restore a shared Mod Garrison profile bundle into a selected game folder.</span>
         </button>
         <button
           className={mode === "export" ? "transfer-choice active" : "transfer-choice"}
@@ -4502,8 +4504,8 @@ function TransferView({
           {mode === "import" ? (
             <>
               <div className="transfer-steps">
-                <span>1. Choose a `.uniloader-profile` bundle.</span>
-                <span>2. UniLoader finds and verifies the matching installed Steam game.</span>
+                <span>1. Choose a `.modgarrison-profile` bundle (legacy `.uniloader-profile` files also work).</span>
+                <span>2. Mod Garrison finds and verifies the matching installed Steam game.</span>
                 <span>3. The profile, enabled mods, and configuration files are restored.</span>
               </div>
               <button
@@ -4597,7 +4599,7 @@ function SettingsView({
         <label className="setting-toggle-row">
           <div>
             <strong>Minimize to system tray on close</strong>
-            <span>Close hides UniLoader; left-click tray to restore, right-click tray to quit.</span>
+            <span>Close hides Mod Garrison; left-click tray to restore, right-click tray to quit.</span>
           </div>
           <input
             checked={appSettings.minimizeToTrayOnClose}
@@ -4621,7 +4623,7 @@ function SettingsView({
           <Activity size={20} />
         </div>
         <p className="muted">
-          UniLoader keeps a small rotating operation log without API keys or mod contents.
+          Mod Garrison keeps a small rotating operation log without API keys or mod contents.
         </p>
         <div className="settings-key-actions">
           <button className="secondary-button" onClick={onOpenDiagnostics} type="button">
@@ -4696,7 +4698,7 @@ function SettingsView({
           </li>
           <li>
             <strong>Step 4</strong>
-            <span>Paste the key into UniLoader.</span>
+            <span>Paste the key into Mod Garrison.</span>
           </li>
         </ol>
       </section>
@@ -4846,14 +4848,21 @@ function actionableDependencyWarnings(warnings: string[]): string[] {
 
 function loadStoredModPresentations(): StoredModPresentations {
   try {
-    const raw = window.localStorage.getItem(modPresentationStorageKey);
+    const current = window.localStorage.getItem(modPresentationStorageKey);
+    const legacy = current ? null : window.localStorage.getItem(legacyModPresentationStorageKey);
+    const raw = current ?? legacy;
     if (!raw) {
       return {};
     }
     const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    const presentations = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? pruneStoredModPresentations(parsed as StoredModPresentations)
       : {};
+    if (legacy) {
+      window.localStorage.setItem(modPresentationStorageKey, JSON.stringify(presentations));
+      window.localStorage.removeItem(legacyModPresentationStorageKey);
+    }
+    return presentations;
   } catch {
     return {};
   }
@@ -5157,15 +5166,15 @@ function getDetectionIssue(detection: GameDetectionResult | null): string {
   }
 
   if (detection.engine === "unknown" && detection.loader === "none") {
-    return "UniLoader could not identify the game engine or loader route from this folder.";
+    return "Mod Garrison could not identify the game engine or loader route from this folder.";
   }
 
   if (detection.engine === "unknown") {
-    return "UniLoader could not identify the game engine from this folder.";
+    return "Mod Garrison could not identify the game engine from this folder.";
   }
 
   if (detection.loader === "none" && detection.expectedModFolders.length === 0) {
-    return "UniLoader could not identify a loader route for this folder.";
+    return "Mod Garrison could not identify a loader route for this folder.";
   }
 
   return "";
@@ -5180,7 +5189,7 @@ function detectionRouteDetail(detection: GameDetectionResult): string {
     return "Mod folder routes are ready.";
   }
 
-  return "UniLoader identified the setup and will choose the install route automatically.";
+  return "Mod Garrison identified the setup and will choose the install route automatically.";
 }
 
 interface DetectionWarningProps {
@@ -5197,7 +5206,7 @@ function DetectionWarning({ detection, detectionIssue, isDetecting }: DetectionW
   if (!detection) {
     return (
       <div className="detection-card muted-card">
-        UniLoader will detect the game setup after Steam game selection.
+        Mod Garrison will detect the game setup after Steam game selection.
       </div>
     );
   }
@@ -5271,7 +5280,7 @@ function DropZone({
       <h4>{isInstalling ? "Installing..." : selectedProfile ? "Drop mod file or folder here" : "Create a profile first"}</h4>
       <p>
         {selectedProfile
-          ? "UniLoader accepts ZIP, 7Z, RAR, and folders, then chooses the safest adapter and reports the result."
+          ? "Mod Garrison accepts ZIP, 7Z, RAR, and folders, then chooses the safest adapter and reports the result."
           : "Add a game name and select the main game folder before importing mods."}
       </p>
       {analysis && selectedPlan ? (

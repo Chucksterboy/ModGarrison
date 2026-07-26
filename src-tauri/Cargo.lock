@@ -2354,6 +2354,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-garrison"
+version = "0.10.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "keyring",
+ "rars",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sevenz-rust2",
+ "sha2 0.10.9",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-deep-link",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "toml_edit 0.22.27",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
+ "winreg",
+ "zip",
+]
+
+[[package]]
 name = "muda"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4746,35 +4775,6 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
-
-[[package]]
-name = "uniloader"
-version = "0.9.21"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "hex",
- "keyring",
- "rars",
- "reqwest 0.12.28",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sevenz-rust2",
- "sha2 0.10.9",
- "tauri",
- "tauri-build",
- "tauri-plugin-deep-link",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
- "toml_edit 0.22.27",
- "url",
- "uuid",
- "windows-sys 0.61.2",
- "winreg",
- "zip",
-]
 
 [[package]]
 name = "unsafe-libyaml"

@@ -1,15 +1,15 @@
 [package]
-name = "uniloader"
-version = "0.9.21"
-description = "UniLoader cross-game mod manager"
+name = "mod-garrison"
+version = "0.10.0"
+description = "Mod Garrison cross-game mod manager"
 authors = ["Chucksterboy"]
 license = "MIT"
-repository = "https://github.com/Chucksterboy/UniLoader"
-homepage = "https://github.com/Chucksterboy/UniLoader"
+repository = "https://github.com/Chucksterboy/ModGarrison"
+homepage = "https://github.com/Chucksterboy/ModGarrison"
 edition = "2021"
 
 [lib]
-name = "uniloader_lib"
+name = "mod_garrison_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
@@ -17,7 +17,7 @@ default = []
 custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
-name = "uniloader"
+name = "mod-garrison"
 path = "src/main.rs"
 
 [build-dependencies]
