@@ -7,6 +7,7 @@ const expectedAssets = new Set([
   "src-tauri/icons/icon.ico",
   "src-tauri/icons/icon.png",
   "src-tauri/icons/mod-garrison-mark.svg",
+  "src-tauri/icons/taskbar-icon.png",
   "src-tauri/icons/tray-icon.png",
   "src-tauri/icons/tray-icon.svg"
 ]);

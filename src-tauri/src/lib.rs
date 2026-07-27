@@ -88,8 +88,10 @@ const GITHUB_API_BASE: &str = "https://api.github.com/repos";
 const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/ModGarrison";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
 const BEPINBUILDS_BEPINEX_BE: &str = "https://builds.bepinex.dev/projects/bepinex_be";
-const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/icon.png");
+const APP_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/taskbar-icon.png");
 const TRAY_ICON: tauri::image::Image<'static> = tauri::include_image!("./icons/tray-icon.png");
+#[cfg(windows)]
+const WINDOWS_SHELL_ICON_REVISION: &str = "taskbar-2";
 const GAME_DEFINITIONS_JSON: &str = include_str!("game_definitions.json");
 const RUNTIME_DEFINITIONS_JSON: &str = include_str!("runtime_definitions.json");
 const DEPENDENCY_PROVIDER_DEFINITIONS_JSON: &str =
@@ -6041,29 +6043,41 @@ fn download_update_installer_sync(
     if let Some(expected_size) = expected_size {
         let actual_size = destination.metadata().map_err(error_to_string)?.len();
         if actual_size != expected_size {
-            let _ = fs::remove_file(&destination);
+            remove_download_artifact(&destination);
             return Err("The downloaded installer size does not match the selected GitHub asset and was deleted.".to_string());
         }
     }
     match has_expected_installer_magic(&destination) {
         Ok(true) => {}
         Ok(false) => {
-            let _ = fs::remove_file(&destination);
+            remove_download_artifact(&destination);
             return Err(
                 "The downloaded file is not a recognized Windows installer and was deleted."
                     .to_string(),
             );
         }
         Err(error) => {
-            let _ = fs::remove_file(&destination);
+            remove_download_artifact(&destination);
             return Err(error);
         }
     }
     let checksum_url = format!("{trimmed_url}.sha256");
-    let expected_hash = download_update_checksum(&client, &checksum_url, &safe_name)?;
-    let actual_hash = sha256_file(&destination)?;
+    let expected_hash = match download_update_checksum(&client, &checksum_url, &safe_name) {
+        Ok(hash) => hash,
+        Err(error) => {
+            remove_download_artifact(&destination);
+            return Err(error);
+        }
+    };
+    let actual_hash = match sha256_file(&destination) {
+        Ok(hash) => hash,
+        Err(error) => {
+            remove_download_artifact(&destination);
+            return Err(error);
+        }
+    };
     if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
-        let _ = fs::remove_file(&destination);
+        remove_download_artifact(&destination);
         return Err(
             "The downloaded installer failed its SHA-256 integrity check and was deleted."
                 .to_string(),
@@ -6071,7 +6085,7 @@ fn download_update_installer_sync(
     }
     if let Some(api_hash) = expected_sha256.as_deref() {
         if !actual_hash.eq_ignore_ascii_case(api_hash) {
-            let _ = fs::remove_file(&destination);
+            remove_download_artifact(&destination);
             return Err(
                 "The downloaded installer does not match GitHub's release digest and was deleted."
                     .to_string(),
@@ -6220,9 +6234,12 @@ fn refresh_windows_shell_icons_once(app: &AppHandle) {
         return;
     };
     let marker_path = app_data_dir.join("shell-icon-version.txt");
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = format!(
+        "{}:{WINDOWS_SHELL_ICON_REVISION}",
+        env!("CARGO_PKG_VERSION")
+    );
     if fs::read_to_string(&marker_path)
-        .map(|value| value.trim() == current_version)
+        .map(|value| value.trim() == current_version.as_str())
         .unwrap_or(false)
     {
         return;
@@ -15700,6 +15717,11 @@ fn download_artifact_metadata_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!("{file_name}.download.json"))
 }
 
+fn remove_download_artifact(destination: &Path) {
+    let _ = fs::remove_file(destination);
+    let _ = fs::remove_file(download_artifact_metadata_path(destination));
+}
+
 fn cached_download_is_verified(destination: &Path, source_url: &str) -> Result<bool, String> {
     if !destination.is_file() {
         return Ok(false);
@@ -22158,12 +22180,17 @@ fn github_asset_sha256(asset: &GithubReleaseAsset) -> Option<String> {
 
 fn update_installer_asset_score(name: &str) -> Option<i32> {
     let lower_name = name.to_lowercase();
-    if !(lower_name.starts_with("mod garrison")
-        || lower_name.starts_with("mod-garrison")
-        || lower_name.starts_with("mod_garrison"))
-    {
+    let brand_score = if lower_name.starts_with("mod-garrison") {
+        30
+    } else if lower_name.starts_with("mod garrison") || lower_name.starts_with("mod_garrison") {
+        20
+    } else if lower_name.starts_with("mod.garrison") || lower_name.starts_with("modgarrison") {
+        10
+    } else if lower_name.starts_with("uniloader") {
+        0
+    } else {
         return None;
-    }
+    };
 
     let mut score = if lower_name.ends_with("_x64-setup.exe")
         || lower_name.ends_with("-x64-setup.exe")
@@ -22183,7 +22210,59 @@ fn update_installer_asset_score(name: &str) -> Option<i32> {
         score += 6;
     }
 
-    Some(score)
+    Some(score + brand_score)
+}
+
+fn update_checksum_file_name_matches(expected: &str, actual: &str) -> bool {
+    if expected.eq_ignore_ascii_case(actual) {
+        return true;
+    }
+
+    fn normalized_mod_garrison_name(value: &str) -> Option<String> {
+        let lower_name = value.to_lowercase();
+        [
+            "mod garrison",
+            "mod-garrison",
+            "mod_garrison",
+            "mod.garrison",
+            "modgarrison",
+        ]
+        .iter()
+        .find_map(|prefix| {
+            lower_name
+                .strip_prefix(prefix)
+                .map(|suffix| format!("mod-garrison{suffix}"))
+        })
+    }
+
+    normalized_mod_garrison_name(expected)
+        .zip(normalized_mod_garrison_name(actual))
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+
+fn parse_update_checksum(text: &str) -> Result<(&str, &str), String> {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let line = lines
+        .next()
+        .ok_or_else(|| "The update checksum file is empty.".to_string())?;
+    if lines.next().is_some() {
+        return Err("The update checksum file contains more than one entry.".to_string());
+    }
+
+    let separator = line
+        .find(char::is_whitespace)
+        .ok_or_else(|| "The update checksum file is invalid.".to_string())?;
+    let hash = &line[..separator];
+    if hash.len() != 64 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("The update checksum file is invalid.".to_string());
+    }
+
+    let file_name = line[separator..].trim().trim_start_matches('*').trim();
+    if file_name.is_empty() {
+        return Err("The update checksum is not bound to an installer file.".to_string());
+    }
+
+    Ok((hash, file_name))
 }
 
 fn open_folder_in_shell(path: &Path) -> Result<(), String> {
@@ -22295,16 +22374,8 @@ fn download_update_checksum(
         return Err("The update checksum file is unexpectedly large.".to_string());
     }
     let text = String::from_utf8(bytes).map_err(error_to_string)?;
-    let mut fields = text.split_whitespace();
-    let hash = fields
-        .next()
-        .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
-        .ok_or_else(|| "The update checksum file is invalid.".to_string())?;
-    let checksum_file_name = fields
-        .next()
-        .map(|value| value.trim_start_matches('*'))
-        .ok_or_else(|| "The update checksum is not bound to an installer file.".to_string())?;
-    if !checksum_file_name.eq_ignore_ascii_case(expected_file_name) {
+    let (hash, checksum_file_name) = parse_update_checksum(&text)?;
+    if !update_checksum_file_name_matches(expected_file_name, checksum_file_name) {
         return Err("The update checksum belongs to a different installer asset.".to_string());
     }
     Ok(hash.to_lowercase())
@@ -23652,17 +23723,17 @@ mod tests {
             html_url: Some("https://github.com/Chucksterboy/ModGarrison/releases/tag/v0.5".to_string()),
             assets: vec![
                 GithubReleaseAsset {
-                    name: "Mod Garrison_0.5.0_x64_en-US.msi".to_string(),
+                    name: "Mod.Garrison_0.5.0_x64_en-US.msi".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod%20Garrison_0.5.0_x64_en-US.msi"
+                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod.Garrison_0.5.0_x64_en-US.msi"
                             .to_string(),
                     size: Some(42),
                     digest: None,
                 },
                 GithubReleaseAsset {
-                    name: "Mod Garrison_0.5.0_x64-setup.exe".to_string(),
+                    name: "Mod.Garrison_0.5.0_x64-setup.exe".to_string(),
                     browser_download_url:
-                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod%20Garrison_0.5.0_x64-setup.exe"
+                        "https://github.com/Chucksterboy/ModGarrison/releases/download/v0.5/Mod.Garrison_0.5.0_x64-setup.exe"
                             .to_string(),
                     size: Some(84),
                     digest: Some(format!("sha256:{}", "a".repeat(64))),
@@ -23671,9 +23742,75 @@ mod tests {
         };
 
         let asset = select_update_installer_asset(&release).unwrap();
-        assert_eq!(asset.name, "Mod Garrison_0.5.0_x64-setup.exe");
+        assert_eq!(asset.name, "Mod.Garrison_0.5.0_x64-setup.exe");
         assert_eq!(asset.size, Some(84));
         assert_eq!(github_asset_sha256(asset), Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn update_checker_prefers_stable_alias_and_accepts_legacy_brand() {
+        let release = GithubReleaseResponse {
+            tag_name: "v0.11.0".to_string(),
+            html_url: None,
+            assets: vec![
+                GithubReleaseAsset {
+                    name: "UniLoader_0.11.0_x64-setup.exe".to_string(),
+                    browser_download_url: "https://example.invalid/legacy".to_string(),
+                    size: Some(42),
+                    digest: None,
+                },
+                GithubReleaseAsset {
+                    name: "Mod.Garrison_0.11.0_x64-setup.exe".to_string(),
+                    browser_download_url: "https://example.invalid/normalized".to_string(),
+                    size: Some(42),
+                    digest: None,
+                },
+                GithubReleaseAsset {
+                    name: "Mod-Garrison_0.11.0_x64-setup.exe".to_string(),
+                    browser_download_url: "https://example.invalid/stable".to_string(),
+                    size: Some(42),
+                    digest: None,
+                },
+            ],
+        };
+
+        let asset = select_update_installer_asset(&release).unwrap();
+        assert_eq!(asset.name, "Mod-Garrison_0.11.0_x64-setup.exe");
+        assert!(update_installer_asset_score("UniLoader_0.11.0_x64-setup.exe").is_some());
+        assert!(update_installer_asset_score("unrelated_0.11.0_x64-setup.exe").is_none());
+    }
+
+    #[test]
+    fn update_checksum_accepts_github_brand_separator_normalization_only() {
+        assert!(update_checksum_file_name_matches(
+            "Mod.Garrison_0.10.0_x64-setup.exe",
+            "Mod Garrison_0.10.0_x64-setup.exe"
+        ));
+        assert!(update_checksum_file_name_matches(
+            "Mod-Garrison_0.10.0_x64-setup.exe",
+            "Mod-Garrison_0.10.0_x64-setup.exe"
+        ));
+        assert!(!update_checksum_file_name_matches(
+            "Mod.Garrison_0.10.0_x64-setup.exe",
+            "Mod Garrison_0.10.1_x64-setup.exe"
+        ));
+        assert!(!update_checksum_file_name_matches(
+            "UniLoader_0.10.0_x64-setup.exe",
+            "Mod Garrison_0.10.0_x64-setup.exe"
+        ));
+    }
+
+    #[test]
+    fn update_checksum_parser_preserves_spaces_and_rejects_multiple_entries() {
+        let hash = "a".repeat(64);
+        let checksum = format!("{hash}  Mod Garrison_0.10.0_x64-setup.exe\r\n");
+        assert_eq!(
+            parse_update_checksum(&checksum),
+            Ok((hash.as_str(), "Mod Garrison_0.10.0_x64-setup.exe"))
+        );
+
+        let duplicate = format!("{hash}  Mod Garrison_0.10.0_x64-setup.exe\n{hash}  other.exe\n");
+        assert!(parse_update_checksum(&duplicate).is_err());
     }
 
     #[test]

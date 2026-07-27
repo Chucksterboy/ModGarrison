@@ -51,16 +51,16 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Mod Garrison ${{ github.ref_name }}"
           releaseBody: |
-            Mod Garrison v0.10.0 is the complete product rebrand of UniLoader.
+            Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - The application, executable, installers, repository, shortcuts, tray menu, update flow, and interface now use the Mod Garrison identity.
-            - Existing UniLoader profiles, settings, Nexus credentials, and portable profile bundles migrate automatically.
-            - A new fortress-and-gate mark replaces the former shield-U artwork across the window, splash screen, taskbar, installer, and system tray.
-            - The pinned Windows upgrade identity keeps the rebrand on the existing installation path instead of creating a duplicate app.
-          releaseDraft: false
+            - Repairs update compatibility across the UniLoader-to-Mod Garrison repository and release-asset rename.
+            - Refreshes release metadata immediately before downloading an update.
+            - Replaces the undersized Windows taskbar icon with a larger, sharper fortress mark while preserving the system-tray icon.
+            - Existing UniLoader profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
+          releaseDraft: true
           prerelease: false
 
-      - name: Generate and upload SHA-256 checksums
+      - name: Generate checksums and stable update aliases
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -68,9 +68,31 @@ jobs:
           $installers = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File |
             Where-Object { $_.Extension -in @(".exe", ".msi") }
           if (-not $installers) { throw "No Windows installer was produced." }
+
+          $aliasDirectory = Join-Path $env:RUNNER_TEMP "mod-garrison-release-assets"
+          New-Item -ItemType Directory -Path $aliasDirectory -Force | Out-Null
+
           foreach ($installer in $installers) {
             $checksumPath = "$($installer.FullName).sha256"
             $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($installer.Name)" | Set-Content -LiteralPath $checksumPath -Encoding ascii
             gh release upload "${{ github.ref_name }}" $checksumPath --clobber
+
+            if ($installer.Name -notmatch "^Mod(?: Garrison|\.Garrison|-Garrison|_Garrison|Garrison)_(.+)$") {
+              throw "Unexpected installer name: $($installer.Name)"
+            }
+            # GitHub normalizes spaces in release asset names. Keep a stable alias
+            # that deployed Mod Garrison updaters can select without ambiguity.
+            $aliasName = "Mod-Garrison_$($Matches[1])"
+            $aliasPath = Join-Path $aliasDirectory $aliasName
+            Copy-Item -LiteralPath $installer.FullName -Destination $aliasPath -Force
+            $aliasChecksumPath = "$aliasPath.sha256"
+            "$hash  $aliasName" | Set-Content -LiteralPath $aliasChecksumPath -Encoding ascii
+            gh release upload "${{ github.ref_name }}" $aliasPath $aliasChecksumPath --clobber
           }
+
+      - name: Publish complete release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --latest

@@ -1099,30 +1099,45 @@ export function App() {
 
   async function showUpdateDetails() {
     if (updateInfo?.updateAvailable) {
-      if (!updateInfo.installerUrl) {
-        setNotice({
-          kind: "error",
-          title: "Installer unavailable",
-          detail: updateInfo.releaseUrl
-            ? `${updateInfo.message} No installer asset was found on the latest release.`
-            : updateInfo.message
-        });
-        return;
-      }
-
       setIsDownloadingUpdate(true);
-      setStatus("Downloading update");
+      setStatus("Refreshing update details");
       setNotice({
         kind: "warning",
-        title: "Downloading update",
-        detail: `Mod Garrison ${updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : "update"} installer is downloading now.`
+        title: "Preparing update",
+        detail: "Refreshing the latest release details before downloading."
       });
       try {
+        const latestUpdateInfo = await api.checkAppUpdate();
+        setUpdateInfo(latestUpdateInfo);
+        if (!latestUpdateInfo.updateAvailable) {
+          const unavailable = latestUpdateInfo.status !== "up-to-date";
+          setStatus(unavailable ? "Update unavailable" : "Up to date");
+          setNotice({
+            kind: unavailable ? "error" : "success",
+            title: unavailable ? "Update unavailable" : "Mod Garrison is up to date",
+            detail: latestUpdateInfo.message
+          });
+          return;
+        }
+        if (!latestUpdateInfo.installerUrl) {
+          throw new Error(
+            latestUpdateInfo.releaseUrl
+              ? `${latestUpdateInfo.message} No installer asset was found on the latest release.`
+              : latestUpdateInfo.message
+          );
+        }
+
+        setStatus("Downloading update");
+        setNotice({
+          kind: "warning",
+          title: "Downloading update",
+          detail: `Mod Garrison ${latestUpdateInfo.latestVersion ? `v${latestUpdateInfo.latestVersion}` : "update"} installer is downloading now.`
+        });
         const installerPath = await api.downloadUpdateInstaller(
-          updateInfo.installerUrl,
-          updateInfo.installerName,
-          updateInfo.installerSize,
-          updateInfo.installerSha256
+          latestUpdateInfo.installerUrl,
+          latestUpdateInfo.installerName,
+          latestUpdateInfo.installerSize,
+          latestUpdateInfo.installerSha256
         );
         setStatus("Installer launched");
         setNotice({
