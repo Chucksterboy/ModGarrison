@@ -251,6 +251,7 @@ export function App() {
   const [removingDiscoverModId, setRemovingDiscoverModId] = useState("");
   const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
   const [onlineModTotal, setOnlineModTotal] = useState(0);
+  const [discoverProviderWarning, setDiscoverProviderWarning] = useState("");
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
   const [installedModQuery, setInstalledModQuery] = useState("");
   const [expandedInstalledModId, setExpandedInstalledModId] = useState("");
@@ -886,6 +887,7 @@ export function App() {
       discoverProfileIdRef.current = profileId;
       setIsDiscoveringMods(false);
       setIsLoadingDiscoverInstalledMods(false);
+      setDiscoverProviderWarning("");
     }
     setDiscoverProfileId(profileId);
   }
@@ -1666,7 +1668,8 @@ export function App() {
     profileId: string,
     page = 1,
     sort: OnlineSortMode = "downloads",
-    query = ""
+    query = "",
+    forceRefresh = false
   ): Promise<boolean> {
     const requestId = ++discoveryRequestSequence.current;
     setError("");
@@ -1679,7 +1682,8 @@ export function App() {
         discoverPageSize,
         sort,
         query,
-        requestId
+        requestId,
+        forceRefresh
       );
       if (
         requestId !== discoveryRequestSequence.current ||
@@ -1691,7 +1695,8 @@ export function App() {
       setOnlineMods(result.items);
       setOnlineModTotal(result.total);
       setDiscoverLoadedProfileId(profileId);
-      const providerWarning = result.providerWarnings[0];
+      const providerWarning = result.providerWarnings.filter(Boolean).join(" ");
+      setDiscoverProviderWarning(providerWarning ?? "");
       setStatus(providerWarning ? "Discovery ready with warnings" : "Discovery ready");
       const profile = profiles.find((item) => item.id === profileId);
       setNotice({
@@ -2806,13 +2811,18 @@ export function App() {
             modPresentations={modPresentations}
             removingModId={removingDiscoverModId}
             total={discoverLoadedProfileId === discoverProfileId ? onlineModTotal : 0}
+            providerWarning={
+              discoverLoadedProfileId === discoverProfileId ? discoverProviderWarning : ""
+            }
             profiles={profiles}
             selectedProfileId={discoverProfileId}
             onInstall={(mod, file) => void installOnlineMod(mod, file)}
             onLoadFiles={loadOnlineModFiles}
             onNeedsAuth={openNexusAuthSettings}
             onOpenPage={(url) => void openExternalUrl(url)}
-            onLoad={(page, sort, query) => loadOnlineMods(discoverProfileId, page, sort, query)}
+            onLoad={(page, sort, query, forceRefresh) =>
+              loadOnlineMods(discoverProfileId, page, sort, query, forceRefresh)
+            }
             onRemoveInstalledMod={(mod) => void removeDiscoverInstalledMod(mod)}
             onSelectProfile={selectDiscoverProfile}
           />
@@ -3714,18 +3724,24 @@ interface DiscoverViewProps {
   modPresentations: StoredModPresentations;
   removingModId: string;
   total: number;
+  providerWarning: string;
   profiles: GameProfile[];
   selectedProfileId: string;
   onInstall(mod: OnlineModRecord, file?: OnlineModFileOption): void;
   onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
   onOpenPage(url: string): void;
-  onLoad(page: number, sort: OnlineSortMode, query: string): Promise<boolean>;
+  onLoad(
+    page: number,
+    sort: OnlineSortMode,
+    query: string,
+    forceRefresh: boolean
+  ): Promise<boolean>;
   onRemoveInstalledMod(mod: InstalledModRecord): void;
   onSelectProfile(profileId: string): void;
 }
 
-function DiscoverView({
+export function DiscoverView({
   hasLoaded,
   installCompletionId,
   installedMods,
@@ -3736,6 +3752,7 @@ function DiscoverView({
   modPresentations,
   removingModId,
   total,
+  providerWarning,
   profiles,
   selectedProfileId,
   onInstall,
@@ -3790,14 +3807,14 @@ function DiscoverView({
     }
     const timeout = window.setTimeout(() => {
       setPage(1);
-      void onLoadRef.current(1, sortModeRef.current, query.trim());
+      void onLoadRef.current(1, sortModeRef.current, query.trim(), false);
     }, 300);
     return () => window.clearTimeout(timeout);
   }, [hasLoaded, query, selectedProfileId]);
 
   async function changeSort(nextSort: OnlineSortMode) {
     setExpandedModId("");
-    if (await onLoad(1, nextSort, query.trim())) {
+    if (await onLoad(1, nextSort, query.trim(), false)) {
       setSortMode(nextSort);
       setPage(1);
     }
@@ -3806,7 +3823,7 @@ function DiscoverView({
   async function changePage(nextPage: number) {
     const safePage = Math.max(1, Math.min(pageCount, nextPage));
     setExpandedModId("");
-    if (await onLoad(safePage, sortMode, query.trim())) {
+    if (await onLoad(safePage, sortMode, query.trim(), false)) {
       setPage(safePage);
     }
   }
@@ -3828,7 +3845,7 @@ function DiscoverView({
           disabled={!selectedProfileId || isLoading}
           onClick={() => {
             setExpandedModId("");
-            void onLoad(currentPage, sortMode, query.trim());
+            void onLoad(currentPage, sortMode, query.trim(), true);
           }}
           type="button"
         >
@@ -3946,7 +3963,10 @@ function DiscoverView({
           {!isLoading && hasLoaded && mods.length === 0 ? (
             <div className="empty-mods discover-empty">
               <Compass size={26} />
-              <p>No online provider results were found for this profile.</p>
+              <p>
+                {providerWarning ||
+                  "No online provider results were found for this profile."}
+              </p>
             </div>
           ) : null}
           {!isLoading && hasLoaded && mods.length > 0 && visibleMods.length === 0 ? (

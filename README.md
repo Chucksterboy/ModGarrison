@@ -73,7 +73,7 @@ The transfer tab exports a selected profile into a `.modgarrison-profile` bundle
 
 Mod Garrison displays its current app version in the bottom-left rail. On startup, it checks the latest GitHub Release for `Chucksterboy/ModGarrison`. If a newer release exists, a pulsing download indicator appears above the health dot in the left rail.
 
-Official Windows installers and their SHA-256 checksum files are published on
+The official Windows `.exe` installer and its SHA-256 checksum are published on
 the [GitHub Releases page](https://github.com/Chucksterboy/ModGarrison/releases).
 
 To publish an installer build, push a version tag:
@@ -83,8 +83,9 @@ git tag v0.2.1
 git push origin v0.2.1
 ```
 
-The GitHub Actions release workflow validates the project, builds the Windows
-installer, publishes the release, and uploads SHA-256 checksum files.
+The GitHub Actions release workflow validates the project, builds the single
+Windows NSIS `.exe` installer, publishes the release, and uploads its SHA-256
+checksum.
 
 ## Future Game Support
 
@@ -96,6 +97,13 @@ Known-game rules live in `src-tauri/src/game_definitions.json`. Add future games
 - `configRoots` adds game-specific config discovery paths.
 
 Keep generic engine/loader detection in Rust, but prefer extending this manifest for game-specific behavior.
+
+For games without a bundled provider domain, Discover automatically matches the
+canonical Steam manifest title to the provider's game catalogue and caches the
+verified mapping by Steam App ID. An explicit Refresh bypasses that cache and
+resolves it again. This flow has no confirmation dialog or game chooser; if a
+unique safe match cannot be established, discovery fails closed with a warning
+instead of silently selecting a similarly named game.
 
 ## Safety Rules
 

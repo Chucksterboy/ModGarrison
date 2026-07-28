@@ -62,6 +62,7 @@ const DISCOVERY_CANCELLED_ERROR: &str = "Discovery request was superseded.";
 const FORCE_REMOVAL_REQUIRED_PREFIX: &str = "MOD_GARRISON_FORCE_REMOVAL_REQUIRED:";
 const THUNDERSTORE_CACHE_MAX_ENTRIES: usize = 32;
 const PROVIDER_MAPPING_CACHE_MAX_ENTRIES: usize = 128;
+const PROVIDER_GAME_MAPPING_MAX_ENTRIES: usize = 512;
 const PROFILE_RUNTIME_CACHE_MAX_ENTRIES: usize = 128;
 const NEXUS_GAME_ID_CACHE_MAX_ENTRIES: usize = 256;
 const NEXUS_GAME_ID_CACHE_HOURS: u64 = 24;
@@ -104,6 +105,7 @@ const LEGACY_APP_IDENTIFIER: &str = "com.uniloader.desktop";
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PROFILE_IMPORT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PROVIDER_GAME_MAPPING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static THUNDERSTORE_CACHE: OnceLock<Mutex<HashMap<String, ThunderstoreCacheEntry>>> =
     OnceLock::new();
 static PROVIDER_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, ProviderMappingCacheEntry>>> =
@@ -134,6 +136,25 @@ struct ThunderstoreCacheEntry {
 struct ProviderMappingCacheEntry {
     fetched_at: Instant,
     value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProviderGameMapping {
+    provider: String,
+    steam_app_id: String,
+    canonical_game_name: String,
+    provider_game_id: String,
+    #[serde(default)]
+    provider_catalogue_id: Option<String>,
+    resolution: String,
+    verified_at: String,
+}
+
+#[derive(Debug)]
+struct ProviderGameResolution {
+    mapping: Option<ProviderGameMapping>,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +216,7 @@ struct DiscoveryQuery<'a> {
     sort: &'a str,
     query: &'a str,
     request_id: u64,
+    force_refresh: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1892,6 +1914,10 @@ fn verify_installed_steam_game(requested: &SteamGameRecord) -> Result<SteamGameR
 }
 
 fn ensure_verified_steam_profile(profile: &GameProfile) -> Result<(), String> {
+    verified_steam_game_for_profile(profile).map(|_| ())
+}
+
+fn verified_steam_game_for_profile(profile: &GameProfile) -> Result<SteamGameRecord, String> {
     let app_id = profile
         .steam_app_id
         .as_deref()
@@ -1905,7 +1931,6 @@ fn ensure_verified_steam_profile(profile: &GameProfile) -> Result<(), String> {
         install_dir: profile.game_path.clone(),
         library_path: String::new(),
     })
-    .map(|_| ())
 }
 
 #[tauri::command]
@@ -4769,6 +4794,7 @@ async fn install_archive(app: AppHandle, request: InstallRequest) -> Result<Inst
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn discover_online_mods(
     app: AppHandle,
     profile_id: String,
@@ -4777,6 +4803,7 @@ async fn discover_online_mods(
     sort: String,
     query: String,
     request_id: u64,
+    force_refresh: bool,
 ) -> Result<DiscoveryPage, String> {
     operation::begin_discovery(&profile_id, request_id)?;
     let operation_profile_id = profile_id.clone();
@@ -4803,6 +4830,7 @@ async fn discover_online_mods(
                     sort: &sort,
                     query: &query,
                     request_id,
+                    force_refresh,
                 },
             )
         },
@@ -5028,6 +5056,7 @@ async fn list_discovered_mod_files(
         ensure_verified_steam_profile(&profile)?;
         let settings = read_app_settings(&root)?;
         list_discovered_mod_files_impl(
+            &root,
             &profile,
             &settings,
             &provider,
@@ -5054,7 +5083,13 @@ async fn preflight_discovered_mod_install(
         let (dependencies, install_targets) = match provider.as_str() {
             "nexus" => {
                 let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
-                verified_discovery_provider_game(&profile, "nexus", Some(&domain), Some(&domain))?;
+                verified_discovery_provider_game(
+                    &root,
+                    &profile,
+                    "nexus",
+                    Some(&domain),
+                    Some(&domain),
+                )?;
                 let client = provider_client()?;
                 let requirements = fetch_nexus_mod_requirements(
                     &client,
@@ -5099,7 +5134,7 @@ async fn preflight_discovered_mod_install(
                 )
             }
             "thunderstore" => {
-                verified_discovery_provider_game(&profile, "thunderstore", None, None)?;
+                verified_discovery_provider_game(&root, &profile, "thunderstore", None, None)?;
                 let raw_id = mod_id
                     .strip_prefix("thunderstore:")
                     .ok_or_else(|| format!("Invalid Thunderstore mod id: {mod_id}"))?;
@@ -5194,6 +5229,7 @@ async fn begin_nexus_requirement_download(
         })?;
         let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&dependency_id)?;
         let provider_game_id = verified_discovery_provider_game(
+            &root,
             &profile,
             "nexus",
             Some(&domain),
@@ -5276,6 +5312,7 @@ async fn begin_nexus_browser_download(
         })?;
         let (domain, nexus_mod_id) = parse_nexus_online_mod_id(&mod_id)?;
         let verified_provider_game_id = verified_discovery_provider_game(
+            &root,
             &profile,
             "nexus",
             provider_game_id.as_deref(),
@@ -5330,6 +5367,7 @@ async fn install_nexus_nxm_link(
         let profile = get_profile(&root, &pending.profile_id)?;
         ensure_verified_steam_profile(&profile)?;
         let provider_game_id = verified_discovery_provider_game(
+            &root,
             &profile,
             "nexus",
             Some(&pending.provider_game_id),
@@ -9559,12 +9597,24 @@ fn discover_online_mods_for_profile(
     let needed = offset.saturating_add(page_size);
     let mut results = Vec::new();
     let mut provider_errors = Vec::new();
+    let mut provider_warnings = Vec::new();
     let mut provider_total = 0_usize;
     let normalized_query = request.query.trim().to_lowercase();
 
     ensure_discovery_is_current(&profile.id, request.request_id)?;
+    if request.force_refresh {
+        clear_cached_provider_mapping("thunderstore", profile);
+        clear_cached_provider_mapping("nexus", profile);
+        clear_discovery_provider_cache_for_profile(&profile.id);
+    }
 
-    if let Some(community) = thunderstore_community_for_profile(profile) {
+    let thunderstore_community = thunderstore_community_for_profile(profile);
+    if request.force_refresh {
+        if let Some(community) = thunderstore_community.as_deref() {
+            clear_thunderstore_community_cache(community);
+        }
+    }
+    if let Some(community) = thunderstore_community {
         match discover_thunderstore_community_mods(store_root, profile, &community) {
             Ok(mut records) => {
                 records.retain(|record| !is_external_mod_manager_listing(record));
@@ -9579,7 +9629,13 @@ fn discover_online_mods_for_profile(
     }
     ensure_discovery_is_current(&profile.id, request.request_id)?;
 
-    if let Some(domain) = nexus_domain_for_profile(profile) {
+    let nexus_resolution =
+        resolve_nexus_mapping_for_discovery(store_root, profile, request.force_refresh);
+    if let Some(warning) = nexus_resolution.warning {
+        provider_warnings.push(warning);
+    }
+    if let Some(mapping) = nexus_resolution.mapping {
+        let domain = mapping.provider_game_id;
         let cache_key = format!(
             "nexus:{}:{}:{}:{}",
             profile.id,
@@ -9652,6 +9708,7 @@ fn discover_online_mods_for_profile(
     if results.is_empty() && !provider_errors.is_empty() {
         return Err(provider_errors.join(" "));
     }
+    provider_warnings.extend(provider_errors);
 
     let items = results
         .into_iter()
@@ -9664,7 +9721,7 @@ fn discover_online_mods_for_profile(
         total: provider_total,
         page,
         page_size,
-        provider_warnings: provider_errors,
+        provider_warnings,
     })
 }
 
@@ -9781,6 +9838,16 @@ fn cached_discovery_provider_snapshot(key: &str) -> Option<DiscoveryProviderCach
         return None;
     }
     Some(entry.clone())
+}
+
+fn clear_discovery_provider_cache_for_profile(profile_id: &str) {
+    let prefix = format!("nexus:{profile_id}:");
+    if let Ok(mut cache) = DISCOVERY_PROVIDER_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.retain(|key, _| !key.starts_with(&prefix));
+    }
 }
 
 fn ensure_discovery_is_current(profile_id: &str, request_id: u64) -> Result<(), String> {
@@ -9923,19 +9990,26 @@ fn thunderstore_community_for_profile(profile: &GameProfile) -> Option<String> {
 }
 
 fn nexus_domain_for_profile(profile: &GameProfile) -> Option<String> {
-    if let Some(domain) = profile
+    if let Some(domain) = bundled_nexus_domain_for_profile(profile) {
+        return Some(domain);
+    }
+
+    auto_detect_nexus_mapping(profile, false)
+        .ok()
+        .flatten()
+        .map(|mapping| mapping.provider_game_id)
+}
+
+fn bundled_nexus_domain_for_profile(profile: &GameProfile) -> Option<String> {
+    profile
         .game_id
         .as_deref()
         .and_then(game_definition_by_id)
         .and_then(|definition| definition.nexus_game_domain.clone())
-    {
-        return Some(domain);
-    }
-
-    auto_detect_nexus_domain(profile)
 }
 
 fn verified_discovery_provider_game(
+    store_root: &Path,
     profile: &GameProfile,
     provider: &str,
     supplied_provider_game_id: Option<&str>,
@@ -9943,7 +10017,14 @@ fn verified_discovery_provider_game(
 ) -> Result<String, String> {
     let expected = match provider {
         "thunderstore" => thunderstore_community_for_profile(profile),
-        "nexus" => nexus_domain_for_profile(profile),
+        "nexus" => bundled_nexus_domain_for_profile(profile)
+            .or_else(|| {
+                persisted_provider_game_mapping(store_root, "nexus", profile)
+                    .ok()
+                    .flatten()
+                    .map(|mapping| mapping.provider_game_id)
+            })
+            .or_else(|| nexus_domain_for_profile(profile)),
         _ => None,
     }
     .ok_or_else(|| {
@@ -9978,7 +10059,7 @@ fn verified_discovery_provider_game(
 }
 
 fn auto_detect_thunderstore_community(profile: &GameProfile) -> Option<String> {
-    cached_provider_mapping("thunderstore", profile, || {
+    cached_provider_mapping("thunderstore", profile, false, || {
         let client = provider_client().ok()?;
         let candidates = provider_slug_candidates(profile);
         parallel_first_map(&candidates, &|candidate| {
@@ -10000,47 +10081,93 @@ fn thunderstore_community_available(client: &Client, community: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn auto_detect_nexus_domain(profile: &GameProfile) -> Option<String> {
-    cached_provider_mapping("nexus", profile, || {
-        let client = provider_client().ok()?;
-        let slugs = provider_slug_candidates(profile);
-        if let Some(domain) = parallel_first_map(&slugs, &|candidate| {
-            nexus_domain_has_mods(&client, candidate).then(|| candidate.to_string())
-        }) {
-            return Some(domain);
+fn auto_detect_nexus_mapping(
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> Result<Option<ProviderGameMapping>, String> {
+    let canonical_game = verified_steam_game_for_profile(profile)?;
+    let canonical_name = canonical_game.name;
+    let steam_app_id = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Automatic Nexus catalogue matching requires a verified Steam App ID.".to_string()
+        })?
+        .to_string();
+    let mut resolved_node = None;
+    let mut resolution = "catalog-exact-name".to_string();
+    let mut resolution_error = None;
+    let domain = cached_provider_mapping("nexus", profile, force_refresh, || {
+        let client = match provider_client() {
+            Ok(client) => client,
+            Err(error) => {
+                resolution_error = Some(error);
+                return None;
+            }
+        };
+        match resolve_nexus_game_node(&client, &canonical_name) {
+            Ok(Some((node, source))) => {
+                let domain = node.domain_name.clone();
+                resolution = source;
+                resolved_node = Some(node);
+                Some(domain)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                resolution_error = Some(error);
+                None
+            }
         }
+    });
 
-        let names = provider_name_candidates(profile);
-        parallel_first_map(&names, &|name| {
-            let domain = fetch_nexus_game_domain_by_name(&client, name)?;
-            nexus_domain_has_mods(&client, &domain).then_some(domain)
-        })
-    })
+    if domain.is_none() {
+        if let Some(error) = resolution_error {
+            return Err(error);
+        }
+        return Ok(None);
+    }
+    let domain = domain.expect("checked above");
+    let provider_catalogue_id = resolved_node
+        .as_ref()
+        .and_then(|node| node.id)
+        .map(|id| id.to_string());
+    Ok(Some(ProviderGameMapping {
+        provider: "nexus".to_string(),
+        steam_app_id,
+        canonical_game_name: canonical_name,
+        provider_game_id: domain,
+        provider_catalogue_id,
+        resolution,
+        verified_at: now_string(),
+    }))
 }
 
-fn cached_provider_mapping<F>(provider: &str, profile: &GameProfile, resolve: F) -> Option<String>
+fn cached_provider_mapping<F>(
+    provider: &str,
+    profile: &GameProfile,
+    force_refresh: bool,
+    resolve: F,
+) -> Option<String>
 where
     F: FnOnce() -> Option<String>,
 {
-    let game_identity = Path::new(&profile.game_path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&profile.game_path))
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_lowercase();
-    let cache_key = format!("{provider}:{game_identity}");
-    if let Ok(cache) = PROVIDER_MAPPING_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        if let Some(entry) = cache.get(&cache_key) {
-            let ttl = if entry.value.is_some() {
-                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
-            } else {
-                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
-            };
-            if entry.fetched_at.elapsed() < ttl {
-                return entry.value.clone();
+    let cache_key = provider_mapping_cache_key(provider, profile);
+    if !force_refresh {
+        if let Ok(cache) = PROVIDER_MAPPING_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            if let Some(entry) = cache.get(&cache_key) {
+                let ttl = if entry.value.is_some() {
+                    Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
+                } else {
+                    Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
+                };
+                if entry.fetched_at.elapsed() < ttl {
+                    return entry.value.clone();
+                }
             }
         }
     }
@@ -10073,6 +10200,264 @@ where
         );
     }
     value
+}
+
+fn provider_mapping_cache_key(provider: &str, profile: &GameProfile) -> String {
+    if let Some(app_id) = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("{provider}:steam:{}", app_id.to_ascii_lowercase());
+    }
+
+    let game_identity = Path::new(&profile.game_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&profile.game_path))
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    format!("{provider}:path:{game_identity}")
+}
+
+fn clear_cached_provider_mapping(provider: &str, profile: &GameProfile) {
+    let cache_key = provider_mapping_cache_key(provider, profile);
+    if let Ok(mut cache) = PROVIDER_MAPPING_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.remove(&cache_key);
+    }
+}
+
+fn resolve_nexus_mapping_for_discovery(
+    store_root: &Path,
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> ProviderGameResolution {
+    if let Some(domain) = bundled_nexus_domain_for_profile(profile) {
+        return ProviderGameResolution {
+            mapping: Some(ProviderGameMapping {
+                provider: "nexus".to_string(),
+                steam_app_id: profile.steam_app_id.clone().unwrap_or_default(),
+                canonical_game_name: canonical_game_name_for_profile(profile),
+                provider_game_id: domain,
+                provider_catalogue_id: None,
+                resolution: "bundled".to_string(),
+                verified_at: now_string(),
+            }),
+            warning: None,
+        };
+    }
+
+    let saved = match persisted_provider_game_mapping(store_root, "nexus", profile) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            return ProviderGameResolution {
+                mapping: auto_detect_nexus_mapping(profile, true)
+                    .ok()
+                    .flatten(),
+                warning: Some(format!(
+                    "Nexus Mods catalogue matching is available, but Mod Garrison could not read its saved provider mapping: {error}"
+                )),
+            };
+        }
+    };
+    if !force_refresh {
+        if let Some(mapping) = saved {
+            return ProviderGameResolution {
+                mapping: Some(mapping),
+                warning: None,
+            };
+        }
+    }
+
+    clear_cached_provider_mapping("nexus", profile);
+    match auto_detect_nexus_mapping(profile, true) {
+        Ok(Some(mapping)) => {
+            let warning = remember_provider_game_mapping(store_root, mapping.clone())
+                .err()
+                .map(|error| {
+                    format!(
+                        "Nexus Mods was linked automatically, but Mod Garrison could not remember the verified mapping: {error}"
+                    )
+                });
+            ProviderGameResolution {
+                mapping: Some(mapping),
+                warning,
+            }
+        }
+        Ok(None) => {
+            let forget_warning = forget_provider_game_mapping(store_root, "nexus", profile)
+                .err()
+                .map(|error| format!(" The obsolete saved mapping could not be removed: {error}"))
+                .unwrap_or_default();
+            ProviderGameResolution {
+                mapping: None,
+                warning: Some(format!(
+                    "{}{}",
+                    unlinked_nexus_catalogue_message(profile),
+                    forget_warning
+                )),
+            }
+        }
+        Err(error) => {
+            if let Some(mapping) = saved {
+                return ProviderGameResolution {
+                    mapping: Some(mapping),
+                    warning: Some(format!(
+                        "Nexus Mods could not refresh its catalogue mapping ({error}). Mod Garrison kept the last verified mapping."
+                    )),
+                };
+            }
+            ProviderGameResolution {
+                mapping: None,
+                warning: Some(format!(
+                    "{} Nexus Mods could not be reached while matching the catalogue: {error}",
+                    unlinked_nexus_catalogue_message(profile)
+                )),
+            }
+        }
+    }
+}
+
+fn unlinked_nexus_catalogue_message(profile: &GameProfile) -> String {
+    let canonical_name = canonical_game_name_for_profile(profile);
+    let steam_suffix = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|app_id| format!(" (Steam App ID {app_id})"))
+        .unwrap_or_default();
+    format!(
+        "Nexus Mods catalogue could not be linked automatically for {canonical_name}{steam_suffix}."
+    )
+}
+
+fn canonical_game_name_for_profile(profile: &GameProfile) -> String {
+    verified_steam_game_for_profile(profile)
+        .ok()
+        .map(|game| game.name)
+        .or_else(|| {
+            profile
+                .game_id
+                .as_deref()
+                .and_then(game_definition_by_id)
+                .map(|definition| definition.display_name.clone())
+        })
+        .unwrap_or_else(|| profile_game_label(profile))
+}
+
+fn persisted_provider_game_mapping(
+    store_root: &Path,
+    provider: &str,
+    profile: &GameProfile,
+) -> Result<Option<ProviderGameMapping>, String> {
+    let Some(steam_app_id) = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let store = read_store::<ProviderGameMapping>(&provider_game_mappings_path(store_root))
+        .map_err(error_to_string)?;
+    let mapping = store.items.into_iter().find(|mapping| {
+        mapping.provider.eq_ignore_ascii_case(provider)
+            && mapping.steam_app_id == steam_app_id
+            && valid_provider_game_id(&mapping.provider_game_id)
+    });
+    if let Some(mapping) = mapping.as_ref() {
+        if let Some(game_id) = mapping
+            .provider_catalogue_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            cache_nexus_game_id(&compact_provider_slug(&mapping.provider_game_id), game_id);
+        }
+    }
+    Ok(mapping)
+}
+
+fn remember_provider_game_mapping(
+    store_root: &Path,
+    mapping: ProviderGameMapping,
+) -> Result<(), String> {
+    if mapping.steam_app_id.trim().is_empty()
+        || !mapping
+            .steam_app_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        || !valid_provider_game_id(&mapping.provider_game_id)
+    {
+        return Err("The verified provider mapping contains an invalid game identity.".to_string());
+    }
+    let _mapping_guard = PROVIDER_GAME_MAPPING_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "The provider mapping store is unavailable.".to_string())?;
+    let path = provider_game_mappings_path(store_root);
+    let mut store = read_store::<ProviderGameMapping>(&path).map_err(error_to_string)?;
+    store.items.retain(|existing| {
+        !(existing.provider.eq_ignore_ascii_case(&mapping.provider)
+            && existing.steam_app_id == mapping.steam_app_id)
+    });
+    store.items.push(mapping);
+    if store.items.len() > PROVIDER_GAME_MAPPING_MAX_ENTRIES {
+        store.items.sort_by(|first, second| {
+            first
+                .verified_at
+                .cmp(&second.verified_at)
+                .then_with(|| first.provider.cmp(&second.provider))
+                .then_with(|| first.steam_app_id.cmp(&second.steam_app_id))
+        });
+        let remove_count = store
+            .items
+            .len()
+            .saturating_sub(PROVIDER_GAME_MAPPING_MAX_ENTRIES);
+        store.items.drain(0..remove_count);
+    }
+    write_store(&path, &store).map_err(error_to_string)
+}
+
+fn forget_provider_game_mapping(
+    store_root: &Path,
+    provider: &str,
+    profile: &GameProfile,
+) -> Result<(), String> {
+    let Some(steam_app_id) = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let _mapping_guard = PROVIDER_GAME_MAPPING_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "The provider mapping store is unavailable.".to_string())?;
+    let path = provider_game_mappings_path(store_root);
+    let mut store = read_store::<ProviderGameMapping>(&path).map_err(error_to_string)?;
+    let previous_len = store.items.len();
+    store.items.retain(|mapping| {
+        !(mapping.provider.eq_ignore_ascii_case(provider) && mapping.steam_app_id == steam_app_id)
+    });
+    if store.items.len() != previous_len {
+        write_store(&path, &store).map_err(error_to_string)?;
+    }
+    Ok(())
+}
+
+fn valid_provider_game_id(value: &str) -> bool {
+    let value = value.trim();
+    (2..=128).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn evict_oldest_provider_mapping_entry(
@@ -10122,10 +10507,106 @@ where
     })
 }
 
-fn nexus_domain_has_mods(client: &Client, domain: &str) -> bool {
-    fetch_nexus_mod_page(client, domain, 0, 1)
-        .map(|page| page.total_count > 0 || !page.nodes.is_empty())
-        .unwrap_or(false)
+fn resolve_nexus_game_node(
+    client: &Client,
+    canonical_name: &str,
+) -> Result<Option<(NexusGameNode, String)>, String> {
+    if canonical_name.trim().is_empty() {
+        return Ok(None);
+    }
+    let primary_nodes = fetch_nexus_games_by_name_result(client, canonical_name)?;
+    if let Some((node, match_kind)) = select_nexus_game_match(canonical_name, &primary_nodes) {
+        return Ok(Some((node, format!("catalog-{match_kind}-name"))));
+    }
+
+    let Some(editionless_name) = editionless_provider_name_variant(canonical_name) else {
+        return Ok(None);
+    };
+    let nodes = fetch_nexus_games_by_name_result(client, &editionless_name)?;
+    Ok(select_nexus_game_match(canonical_name, &nodes)
+        .map(|(node, match_kind)| (node, format!("catalog-{match_kind}-edition-alias"))))
+}
+
+fn select_nexus_game_match(
+    requested_name: &str,
+    nodes: &[NexusGameNode],
+) -> Option<(NexusGameNode, &'static str)> {
+    let requested_compact = compact_provider_slug(requested_name);
+    let exact = unique_nexus_game_match(nodes.iter().filter(|node| {
+        compact_provider_slug(&node.name) == requested_compact
+            || compact_provider_slug(&node.domain_name) == requested_compact
+    }));
+    if let Some(node) = exact {
+        return Some((node, "exact"));
+    }
+
+    let requested_editionless = editionless_provider_title(requested_name);
+    if requested_editionless.is_empty() || requested_editionless == requested_compact {
+        return None;
+    }
+    unique_nexus_game_match(
+        nodes
+            .iter()
+            .filter(|node| editionless_provider_title(&node.name) == requested_editionless),
+    )
+    .map(|node| (node, "edition"))
+}
+
+fn unique_nexus_game_match<'a>(
+    nodes: impl Iterator<Item = &'a NexusGameNode>,
+) -> Option<NexusGameNode> {
+    let mut matches = Vec::new();
+    let mut seen_domains = HashSet::new();
+    for node in nodes {
+        if !valid_provider_game_id(&node.domain_name) {
+            continue;
+        }
+        let key = compact_provider_slug(&node.domain_name);
+        if seen_domains.insert(key) {
+            matches.push(node.clone());
+        }
+    }
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn editionless_provider_title(value: &str) -> String {
+    let readable = readable_provider_text(value);
+    let mut words = readable
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    const SUFFIXES: &[&[&str]] = &[
+        &["game", "of", "the", "year", "edition"],
+        &["definitive", "edition"],
+        &["complete", "edition"],
+        &["ultimate", "edition"],
+        &["deluxe", "edition"],
+        &["enhanced", "edition"],
+        &["remastered", "edition"],
+        &["goty", "edition"],
+        &["definitive"],
+        &["complete"],
+        &["ultimate"],
+        &["deluxe"],
+        &["enhanced"],
+        &["remastered"],
+        &["goty"],
+    ];
+    if let Some(suffix) = SUFFIXES
+        .iter()
+        .find(|suffix| provider_words_end_with(&words, suffix))
+    {
+        words.truncate(words.len().saturating_sub(suffix.len()));
+    }
+    compact_provider_slug(&words.join(" "))
+}
+
+fn provider_words_end_with(words: &[String], suffix: &[&str]) -> bool {
+    words.len() >= suffix.len()
+        && words[words.len() - suffix.len()..]
+            .iter()
+            .map(String::as_str)
+            .eq(suffix.iter().copied())
 }
 
 fn provider_name_candidates(profile: &GameProfile) -> Vec<String> {
@@ -10171,8 +10652,25 @@ fn provider_slug_candidates(profile: &GameProfile) -> Vec<String> {
 }
 
 fn provider_candidate_texts(profile: &GameProfile) -> Vec<String> {
+    let canonical_steam_name = verified_steam_game_for_profile(profile)
+        .ok()
+        .map(|game| game.name);
+    provider_candidate_texts_with_canonical_name(profile, canonical_steam_name.as_deref())
+}
+
+fn provider_candidate_texts_with_canonical_name(
+    profile: &GameProfile,
+    canonical_steam_name: Option<&str>,
+) -> Vec<String> {
     let mut texts = Vec::new();
     let mut seen = HashSet::new();
+
+    if let Some(canonical_name) = canonical_steam_name {
+        push_unique_string(&mut texts, &mut seen, canonical_name.to_string());
+        if let Some(editionless) = editionless_provider_name_variant(canonical_name) {
+            push_unique_string(&mut texts, &mut seen, editionless);
+        }
+    }
 
     if let Some(folder_name) = Path::new(&profile.game_path)
         .file_name()
@@ -10194,8 +10692,50 @@ fn provider_candidate_texts(profile: &GameProfile) -> Vec<String> {
     texts
 }
 
+fn editionless_provider_name_variant(value: &str) -> Option<String> {
+    let readable = readable_provider_text(value);
+    let mut words = readable
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    const SUFFIXES: &[&[&str]] = &[
+        &["game", "of", "the", "year", "edition"],
+        &["definitive", "edition"],
+        &["complete", "edition"],
+        &["ultimate", "edition"],
+        &["deluxe", "edition"],
+        &["enhanced", "edition"],
+        &["remastered", "edition"],
+        &["goty", "edition"],
+        &["definitive"],
+        &["complete"],
+        &["ultimate"],
+        &["deluxe"],
+        &["enhanced"],
+        &["remastered"],
+        &["goty"],
+    ];
+    let lower_words = words
+        .iter()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let suffix = SUFFIXES
+        .iter()
+        .find(|suffix| provider_words_end_with(&lower_words, suffix))?;
+    words.truncate(words.len().saturating_sub(suffix.len()));
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
 fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRuntimeInference> {
     if !profile_bootstrap_dependencies(profile).is_empty() {
+        return None;
+    }
+    if profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .is_some()
+    {
         return None;
     }
 
@@ -12460,6 +13000,15 @@ fn fetch_thunderstore_community_packages(
     Ok(packages)
 }
 
+fn clear_thunderstore_community_cache(community: &str) {
+    if let Ok(mut cache) = THUNDERSTORE_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.remove(community);
+    }
+}
+
 fn is_discoverable_thunderstore_package(package: &ThunderstoreCommunityPackage) -> bool {
     if package.is_deprecated || package.has_nsfw_content || package.versions.is_empty() {
         return false;
@@ -12751,21 +13300,14 @@ fn fetch_nexus_mod_page_with_sort(
         .ok_or_else(|| "Nexus Mods returned no discovery data.".to_string())
 }
 
-fn fetch_nexus_game_domain_by_name(client: &Client, name: &str) -> Option<String> {
-    let nodes = fetch_nexus_games_by_name(client, name)?;
-    let normalized_name = compact_provider_slug(name);
-    nodes.into_iter().find_map(|node| {
-        let node_name = compact_provider_slug(&node.name);
-        let node_domain = compact_provider_slug(&node.domain_name);
-        if node_name == normalized_name || node_domain == normalized_name {
-            Some(node.domain_name)
-        } else {
-            None
-        }
-    })
+fn fetch_nexus_games_by_name(client: &Client, name: &str) -> Option<Vec<NexusGameNode>> {
+    fetch_nexus_games_by_name_result(client, name).ok()
 }
 
-fn fetch_nexus_games_by_name(client: &Client, name: &str) -> Option<Vec<NexusGameNode>> {
+fn fetch_nexus_games_by_name_result(
+    client: &Client,
+    name: &str,
+) -> Result<Vec<NexusGameNode>, String> {
     const NEXUS_GAME_QUERY: &str = r#"
         query ModGarrisonDiscoverGame(
           $filter: GamesSearchFilter,
@@ -12799,17 +13341,25 @@ fn fetch_nexus_games_by_name(client: &Client, name: &str) -> Option<Vec<NexusGam
         .post(NEXUS_GRAPHQL_API_BASE)
         .json(&body)
         .send()
-        .ok()?
+        .map_err(error_to_string)?
         .error_for_status()
-        .ok()?
+        .map_err(error_to_string)?
         .json::<NexusGamesGraphqlResponse>()
-        .ok()?;
+        .map_err(error_to_string)?;
 
     if !response.errors.is_empty() {
-        return None;
+        return Err(response
+            .errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; "));
     }
 
-    Some(response.data?.games.nodes)
+    response
+        .data
+        .map(|data| data.games.nodes)
+        .ok_or_else(|| "Nexus Mods returned no game catalogue data.".to_string())
 }
 
 fn nexus_game_lookup_names(profile: &GameProfile, domain: &str) -> Vec<String> {
@@ -13303,6 +13853,7 @@ fn latest_active_thunderstore_version(
 }
 
 fn list_discovered_mod_files_impl(
+    store_root: &Path,
     profile: &GameProfile,
     settings: &AppSettings,
     provider: &str,
@@ -13310,9 +13861,15 @@ fn list_discovered_mod_files_impl(
     supplied_provider_game_id: Option<&str>,
 ) -> Result<Vec<OnlineModFileOption>, String> {
     match provider {
-        "nexus" => list_nexus_mod_files(profile, settings, mod_id, supplied_provider_game_id),
+        "nexus" => list_nexus_mod_files(
+            store_root,
+            profile,
+            settings,
+            mod_id,
+            supplied_provider_game_id,
+        ),
         "thunderstore" => {
-            list_thunderstore_mod_versions(profile, mod_id, supplied_provider_game_id)
+            list_thunderstore_mod_versions(store_root, profile, mod_id, supplied_provider_game_id)
         }
         _ => Err(format!(
             "{} does not expose selectable files in this build.",
@@ -13322,6 +13879,7 @@ fn list_discovered_mod_files_impl(
 }
 
 fn list_nexus_mod_files(
+    store_root: &Path,
     profile: &GameProfile,
     settings: &AppSettings,
     mod_id: &str,
@@ -13331,7 +13889,13 @@ fn list_nexus_mod_files(
         "Add your Nexus API key in Settings before loading this mod's files.".to_string()
     })?;
     let (domain, nexus_mod_id) = parse_nexus_online_mod_id(mod_id)?;
-    verified_discovery_provider_game(profile, "nexus", supplied_provider_game_id, Some(&domain))?;
+    verified_discovery_provider_game(
+        store_root,
+        profile,
+        "nexus",
+        supplied_provider_game_id,
+        Some(&domain),
+    )?;
 
     let client = provider_client()?;
     let account = validate_nexus_api_key(api_key)?;
@@ -13385,6 +13949,7 @@ fn list_nexus_mod_files(
 }
 
 fn list_thunderstore_mod_versions(
+    store_root: &Path,
     profile: &GameProfile,
     mod_id: &str,
     supplied_provider_game_id: Option<&str>,
@@ -13399,6 +13964,7 @@ fn list_thunderstore_mod_versions(
         )
     })?;
     let community = verified_discovery_provider_game(
+        store_root,
         profile,
         "thunderstore",
         supplied_provider_game_id,
@@ -13497,6 +14063,7 @@ fn install_nexus_discovered_mod(
     })?;
     let (domain, nexus_mod_id) = parse_nexus_online_mod_id(mod_id)?;
     let provider_game_id = verified_discovery_provider_game(
+        store_root,
         profile,
         "nexus",
         supplied_provider_game_id,
@@ -13720,6 +14287,7 @@ fn install_nexus_requirement_dependencies(
 
         let (dependency_domain, dependency_mod_id) = parse_nexus_online_mod_id(&dependency.id)?;
         verified_discovery_provider_game(
+            store_root,
             profile,
             "nexus",
             Some(&dependency_domain),
@@ -14291,6 +14859,7 @@ fn install_thunderstore_discovered_mod(
         )
     })?;
     let provider_game_id = verified_discovery_provider_game(
+        store_root,
         profile,
         "thunderstore",
         supplied_provider_game_id,
@@ -21098,6 +21667,8 @@ fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(root.join("profiles")).map_err(error_to_string)?;
     ensure_store::<GameProfile>(&profiles_path(&root)).map_err(error_to_string)?;
     ensure_store::<InstalledModRecord>(&installed_mods_path(&root)).map_err(error_to_string)?;
+    ensure_store::<ProviderGameMapping>(&provider_game_mappings_path(&root))
+        .map_err(error_to_string)?;
     ensure_app_settings(&settings_path(&root)).map_err(error_to_string)?;
     recover_deployment_transactions_once(&root)?;
     recover_replacement_transactions_once(&root)?;
@@ -21273,6 +21844,10 @@ fn settings_path(root: &Path) -> PathBuf {
 
 fn installed_mods_path(root: &Path) -> PathBuf {
     root.join("installed-mods.json")
+}
+
+fn provider_game_mappings_path(root: &Path) -> PathBuf {
+    root.join("provider-game-mappings.json")
 }
 
 fn store_transactions_dir(root: &Path) -> PathBuf {
@@ -23890,6 +24465,179 @@ mod tests {
         );
         let lookup_names = nexus_game_lookup_names(&dragonwilds, "runescapedragonwilds");
         assert_eq!(lookup_names.first().unwrap(), "RuneScape: Dragonwilds");
+    }
+
+    #[test]
+    fn canonical_steam_title_is_the_first_provider_candidate() {
+        let mut profile = test_profile("unknown", "My Renamed Profile", "unreal", "none");
+        profile.game_id = None;
+        profile.game_path = "D:/Steam/steamapps/common/The Mound".to_string();
+
+        let candidates = provider_candidate_texts_with_canonical_name(
+            &profile,
+            Some("The Mound: Omen of Cthulhu"),
+        );
+
+        assert_eq!(candidates.first().unwrap(), "The Mound: Omen of Cthulhu");
+        assert!(candidates.contains(&"The Mound".to_string()));
+        assert!(!candidates.contains(&profile.name));
+    }
+
+    #[test]
+    fn nexus_catalogue_matching_accepts_an_exact_title_with_a_different_domain() {
+        let node = NexusGameNode {
+            id: Some(9450),
+            name: "The Mound: Omen of Cthulhu".to_string(),
+            domain_name: "themoundomenofcthulhu".to_string(),
+        };
+
+        let matched =
+            select_nexus_game_match("THE MOUND - OMEN OF CTHULHU", std::slice::from_ref(&node))
+                .expect("punctuation and case should not prevent an exact title match");
+
+        assert_eq!(matched.0.domain_name, "themoundomenofcthulhu");
+        assert_eq!(matched.0.id, Some(9450));
+        assert_eq!(matched.1, "exact");
+    }
+
+    #[test]
+    fn nexus_catalogue_matching_uses_only_a_unique_edition_alias() {
+        let base = NexusGameNode {
+            id: Some(100),
+            name: "Example Game".to_string(),
+            domain_name: "examplegame".to_string(),
+        };
+        let matched = select_nexus_game_match(
+            "Example Game: Definitive Edition",
+            std::slice::from_ref(&base),
+        )
+        .expect("a unique base-title match should be accepted");
+        assert_eq!(matched.0.domain_name, "examplegame");
+        assert_eq!(matched.1, "edition");
+
+        let ambiguous = [
+            base,
+            NexusGameNode {
+                id: Some(101),
+                name: "Example Game Complete Edition".to_string(),
+                domain_name: "examplegamecomplete".to_string(),
+            },
+        ];
+        assert!(
+            select_nexus_game_match("Example Game: Definitive Edition", &ambiguous).is_none(),
+            "multiple edition-equivalent catalogues must fail closed"
+        );
+    }
+
+    #[test]
+    fn forced_provider_resolution_bypasses_a_negative_mapping_cache() {
+        let mut profile = test_profile("unknown", "Cache Test", "unreal", "none");
+        profile.game_id = None;
+        profile.steam_app_id = Some("9999999901".to_string());
+        clear_cached_provider_mapping("nexus-test", &profile);
+
+        assert_eq!(
+            cached_provider_mapping("nexus-test", &profile, false, || None),
+            None
+        );
+        assert_eq!(
+            cached_provider_mapping("nexus-test", &profile, false, || {
+                panic!("the negative cache should suppress this resolver")
+            }),
+            None
+        );
+        assert_eq!(
+            cached_provider_mapping("nexus-test", &profile, true, || {
+                Some("resolvedgame".to_string())
+            }),
+            Some("resolvedgame".to_string())
+        );
+
+        clear_cached_provider_mapping("nexus-test", &profile);
+    }
+
+    #[test]
+    fn provider_mappings_persist_by_provider_and_steam_app_id() {
+        let root = temp_game_dir("provider-game-mapping");
+        let mut profile = test_profile("unknown", "Original Profile Name", "unreal", "none");
+        profile.game_id = None;
+        profile.steam_app_id = Some("9999999902".to_string());
+        let first = ProviderGameMapping {
+            provider: "nexus".to_string(),
+            steam_app_id: "9999999902".to_string(),
+            canonical_game_name: "Canonical Game Name".to_string(),
+            provider_game_id: "canonicalgame".to_string(),
+            provider_catalogue_id: Some("1234".to_string()),
+            resolution: "catalog-exact-name".to_string(),
+            verified_at: "2026-07-28T10:00:00Z".to_string(),
+        };
+        remember_provider_game_mapping(&root, first).unwrap();
+
+        profile.name = "Renamed Local Profile".to_string();
+        profile.game_path = "E:/Moved/Install".to_string();
+        let restored = persisted_provider_game_mapping(&root, "nexus", &profile)
+            .unwrap()
+            .expect("profile names and install paths must not change the mapping");
+        assert_eq!(restored.provider_game_id, "canonicalgame");
+        assert!(
+            persisted_provider_game_mapping(&root, "thunderstore", &profile)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut other_game = profile.clone();
+        other_game.steam_app_id = Some("9999999903".to_string());
+        assert!(persisted_provider_game_mapping(&root, "nexus", &other_game)
+            .unwrap()
+            .is_none());
+
+        remember_provider_game_mapping(
+            &root,
+            ProviderGameMapping {
+                provider_game_id: "updatedgame".to_string(),
+                verified_at: "2026-07-28T11:00:00Z".to_string(),
+                ..restored
+            },
+        )
+        .unwrap();
+        let store = read_store::<ProviderGameMapping>(&provider_game_mappings_path(&root)).unwrap();
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].provider_game_id, "updatedgame");
+
+        forget_provider_game_mapping(&root, "nexus", &profile).unwrap();
+        assert!(persisted_provider_game_mapping(&root, "nexus", &profile)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_provider_game_ids_are_rejected() {
+        assert!(valid_provider_game_id("themoundomenofcthulhu"));
+        assert!(valid_provider_game_id("game-domain_2"));
+        assert!(!valid_provider_game_id(""));
+        assert!(!valid_provider_game_id("game/domain"));
+        assert!(!valid_provider_game_id("game domain"));
+    }
+
+    #[test]
+    fn mound_definition_is_bundled_without_automatic_runtime_bootstrap() {
+        let definition =
+            game_definition_by_steam_app_id("2569760").expect("The Mound must be registered");
+        assert_eq!(definition.id, "the-mound");
+        assert_eq!(
+            definition.nexus_game_domain.as_deref(),
+            Some("themoundomenofcthulhu")
+        );
+        assert!(definition.bootstrap_runtimes.is_empty());
+
+        let mut profile = test_profile("the-mound", "The Mound", "unreal", "none");
+        profile.steam_app_id = Some("2569760".to_string());
+        assert_eq!(
+            bundled_nexus_domain_for_profile(&profile).as_deref(),
+            Some("themoundomenofcthulhu")
+        );
+        assert!(infer_profile_foundation_runtime(&profile).is_none());
     }
 
     #[test]

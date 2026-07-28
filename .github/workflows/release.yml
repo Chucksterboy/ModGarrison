@@ -47,48 +47,54 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --features custom-protocol
+          args: --features custom-protocol --bundles nsis
+          assetNamePattern: "Mod-Garrison_[version]_[arch][setup][ext]"
           tagName: ${{ github.ref_name }}
           releaseName: "Mod Garrison ${{ github.ref_name }}"
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Repairs update compatibility across the UniLoader-to-Mod Garrison repository and release-asset rename.
-            - Refreshes release metadata immediately before downloading an update.
-            - Replaces the undersized Windows taskbar icon with a larger, sharper fortress mark while preserving the system-tray icon.
-            - Existing UniLoader profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
+            - Adds automatic, verified Nexus catalogue matching based on the canonical Steam game title.
+            - Adds built-in Discover support for The Mound: Omen of Cthulhu.
+            - Persists verified provider mappings by Steam App ID and re-resolves them on an explicit Refresh.
+            - Fails closed with a visible warning when a unique safe provider match cannot be established.
+            - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
+            - Existing profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
           releaseDraft: true
           prerelease: false
 
-      - name: Generate checksums and stable update aliases
+      - name: Generate installer checksum
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $installers = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File |
-            Where-Object { $_.Extension -in @(".exe", ".msi") }
-          if (-not $installers) { throw "No Windows installer was produced." }
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File |
+            Where-Object { $_.Extension -eq ".exe" })
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows .exe installer, found $($installers.Count)."
+          }
 
-          $aliasDirectory = Join-Path $env:RUNNER_TEMP "mod-garrison-release-assets"
-          New-Item -ItemType Directory -Path $aliasDirectory -Force | Out-Null
+          $installer = $installers[0]
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $assetName = "Mod-Garrison_${version}_x64-setup.exe"
+          $remoteInstallers = @(gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' |
+            Where-Object { $_ -like "*.exe" })
+          if ($remoteInstallers.Count -ne 1 -or $remoteInstallers[0] -ne $assetName) {
+            throw "Expected the single release installer '$assetName', found: $($remoteInstallers -join ', ')"
+          }
 
-          foreach ($installer in $installers) {
-            $checksumPath = "$($installer.FullName).sha256"
-            $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $($installer.Name)" | Set-Content -LiteralPath $checksumPath -Encoding ascii
-            gh release upload "${{ github.ref_name }}" $checksumPath --clobber
+          $checksumDirectory = Join-Path $env:RUNNER_TEMP "mod-garrison-checksum"
+          New-Item -ItemType Directory -Path $checksumDirectory -Force | Out-Null
+          $checksumPath = Join-Path $checksumDirectory "$assetName.sha256"
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $assetName" | Set-Content -LiteralPath $checksumPath -Encoding ascii
+          gh release upload "${{ github.ref_name }}" $checksumPath --clobber
 
-            if ($installer.Name -notmatch "^Mod(?: Garrison|\.Garrison|-Garrison|_Garrison|Garrison)_(.+)$") {
-              throw "Unexpected installer name: $($installer.Name)"
-            }
-            # GitHub normalizes spaces in release asset names. Keep a stable alias
-            # that deployed Mod Garrison updaters can select without ambiguity.
-            $aliasName = "Mod-Garrison_$($Matches[1])"
-            $aliasPath = Join-Path $aliasDirectory $aliasName
-            Copy-Item -LiteralPath $installer.FullName -Destination $aliasPath -Force
-            $aliasChecksumPath = "$aliasPath.sha256"
-            "$hash  $aliasName" | Set-Content -LiteralPath $aliasChecksumPath -Encoding ascii
-            gh release upload "${{ github.ref_name }}" $aliasPath $aliasChecksumPath --clobber
+          $expectedAssets = @($assetName, "$assetName.sha256") | Sort-Object
+          $actualAssets = @(gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name') |
+            Sort-Object
+          if (Compare-Object $expectedAssets $actualAssets) {
+            throw "Release assets did not match the expected installer and checksum: $($actualAssets -join ', ')"
           }
 
       - name: Publish complete release

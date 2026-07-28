@@ -490,7 +490,8 @@ export interface DesktopApi {
     pageSize: number,
     sort: "downloads" | "newest" | "oldest",
     query: string,
-    requestId: number
+    requestId: number,
+    forceRefresh: boolean
   ): Promise<DiscoveryPage>;
   listDiscoveredModFiles(
     profileId: string,

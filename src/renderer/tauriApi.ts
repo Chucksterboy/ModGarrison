@@ -174,14 +174,15 @@ export const desktopApi: DesktopApi = {
     }),
   installArchive: (request: InstallRequest) =>
     invoke<InstallResult>("install_archive", { request }),
-  discoverOnlineMods: (profileId, page, pageSize, sort, query, requestId) =>
+  discoverOnlineMods: (profileId, page, pageSize, sort, query, requestId, forceRefresh) =>
     invoke<DiscoveryPage>("discover_online_mods", {
       profileId,
       page,
       pageSize,
       sort,
       query,
-      requestId
+      requestId,
+      forceRefresh
     }),
   listDiscoveredModFiles: (profileId: string, mod: OnlineModRecord) =>
     invoke<OnlineModFileOption[]>("list_discovered_mod_files", {

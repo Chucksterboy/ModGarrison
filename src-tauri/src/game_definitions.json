@@ -33,6 +33,20 @@
     "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
   },
   {
+    "id": "the-mound",
+    "displayName": "The Mound: Omen of Cthulhu",
+    "engine": "unreal",
+    "steamAppIds": ["2569760"],
+    "executableNames": ["themound.exe", "themound-win64-shipping.exe"],
+    "pathMarkers": ["themound/content/paks"],
+    "supportedAdapters": ["unreal-pak", "ue4ss"],
+    "configRoots": [
+      "TheMound/Content/Paks/~mods",
+      "TheMound/Binaries/Win64/ue4ss/Mods"
+    ],
+    "nexusGameDomain": "themoundomenofcthulhu"
+  },
+  {
     "id": "witchspire",
     "displayName": "Witchspire",
     "engine": "unreal",
