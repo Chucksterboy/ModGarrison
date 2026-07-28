@@ -438,10 +438,32 @@ export interface AppState {
   installedMods: InstalledModRecord[];
 }
 
+export interface GarrisonCoreHealthJob {
+  kind: string;
+  status: "succeeded" | "failed";
+  summary: string;
+  completedAt?: string;
+}
+
+export interface GarrisonCoreHealth {
+  backendReady: boolean;
+  storageReady: boolean;
+  modIndexReady: boolean;
+  activeProfileReady: boolean;
+  loadOrderReady: boolean;
+  gameExecutableFound: boolean;
+  modsDirectoryReady: boolean;
+  usingFallback: boolean;
+  indexedModCount: number;
+  warnings: string[];
+  lastJob?: GarrisonCoreHealthJob | null;
+}
+
 export interface DesktopApi {
   getAppSettings(): Promise<AppSettings>;
   updateAppSettings(input: AppSettings): Promise<AppSettings>;
   saveNexusApiKey(apiKey: string): Promise<AppSettings>;
+  systemHealth(profileId?: string): Promise<GarrisonCoreHealth>;
   checkAppUpdate(): Promise<AppUpdateInfo>;
   minimizeWindow(): Promise<void>;
   toggleMaximizeWindow(): Promise<void>;

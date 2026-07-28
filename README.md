@@ -93,6 +93,10 @@ Known-game rules live in `src-tauri/src/game_definitions.json`. Add future games
 
 - `executableNames` and `pathMarkers` identify the game.
 - `bootstrapRuntimes` declares loaders Mod Garrison should install after profile creation.
+- When `bootstrapRuntimes` is empty, profile creation and Refresh inspect the
+  linked provider catalogue for a uniquely supported runtime. Known games only
+  accept an inferred runtime when its adapter is explicitly listed in
+  `supportedAdapters`.
 - `runtimeDependencies` maps runtimes to official providers and release assets.
 - `configRoots` adds game-specific config discovery paths.
 

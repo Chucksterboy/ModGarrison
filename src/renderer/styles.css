@@ -4506,7 +4506,7 @@ code {
   --circuit-node: rgba(220, 177, 91, 0.2);
   --shadow: 0 24px 64px rgba(0, 0, 0, 0.48);
   --titlebar-height: 62px;
-  --vault-statusbar-height: 64px;
+  --vault-statusbar-height: 50px;
   --titlebar-surface: rgba(8, 11, 12, 0.985);
   --titlebar-surface-accent: rgba(18, 20, 18, 0.98);
   --titlebar-line: rgba(215, 168, 78, 0.22);
@@ -5922,11 +5922,52 @@ body {
   height: var(--vault-statusbar-height);
   align-items: stretch;
   gap: 0;
+  isolation: isolate;
   border-top: 1px solid rgba(216, 169, 79, 0.2);
   background:
     linear-gradient(90deg, rgba(213, 166, 77, 0.035), transparent 32%),
     rgba(8, 11, 12, 0.985);
   box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.25);
+}
+
+.vault-statusbar::before {
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 1px;
+  content: "";
+  opacity: 0.72;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(78, 221, 145, 0.2) 16%,
+    rgba(95, 239, 164, 0.74) 47%,
+    rgba(78, 221, 145, 0.18) 72%,
+    transparent
+  );
+  pointer-events: none;
+}
+
+.vault-statusbar::after {
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  left: -28%;
+  width: 28%;
+  height: 1px;
+  content: "";
+  opacity: 0.95;
+  background: linear-gradient(90deg, transparent, #73f5aa, transparent);
+  box-shadow: 0 0 10px rgba(81, 238, 151, 0.46);
+  pointer-events: none;
+  animation: status-line-scan 3.4s linear infinite;
+}
+
+.vault-statusbar > * {
+  position: relative;
+  z-index: 1;
 }
 
 .vault-footer-service,
@@ -6065,6 +6106,213 @@ body {
   padding: 6px 14px;
   font-size: 9px;
   text-align: center;
+}
+
+.status-health-control {
+  position: relative;
+  display: flex;
+  min-width: 290px;
+  flex: 1 1 560px;
+  align-items: stretch;
+  border-right: 1px solid rgba(216, 169, 79, 0.12);
+}
+
+.status-health {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-width: 290px;
+  width: 290px;
+  flex: 0 1 290px;
+  align-items: center;
+  gap: 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 14px 0 11px;
+  text-align: left;
+}
+
+.status-health::before {
+  position: absolute;
+  z-index: -1;
+  inset: 6px 5px;
+  border-radius: 8px;
+  content: "";
+  opacity: 0;
+  background: rgba(255, 255, 255, 0.035);
+  transform: scale(0.96);
+  transition:
+    opacity 150ms ease,
+    transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.status-health:hover::before,
+.status-health:focus-visible::before {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.status-health:focus-visible {
+  outline: 2px solid #bd84ff;
+  outline-offset: -3px;
+}
+
+.status-ecg {
+  display: grid;
+  width: 38px;
+  height: 34px;
+  overflow: hidden;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(72, 224, 142, 0.37);
+  border-radius: 7px;
+  background:
+    linear-gradient(rgba(83, 226, 148, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(83, 226, 148, 0.04) 1px, transparent 1px),
+    rgba(24, 100, 66, 0.18);
+  background-size: 7px 7px;
+  box-shadow:
+    inset 0 0 17px rgba(57, 214, 129, 0.08),
+    0 0 14px rgba(48, 200, 114, 0.06);
+}
+
+.status-ecg svg {
+  width: 46px;
+  height: 28px;
+  overflow: visible;
+}
+
+.status-ecg path {
+  fill: none;
+  vector-effect: non-scaling-stroke;
+}
+
+.status-ecg-baseline {
+  stroke: rgba(79, 226, 145, 0.15);
+  stroke-width: 1;
+}
+
+.status-ecg-trace {
+  stroke: #69e99e;
+  stroke-width: 1.55;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 76;
+  stroke-dashoffset: 76;
+  filter: drop-shadow(0 0 4px rgba(87, 235, 152, 0.55));
+  animation: status-ecg-travel 1.7s linear infinite;
+}
+
+.status-health-copy {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+}
+
+.status-health-copy small {
+  color: #d8b36d;
+  font-size: 7px;
+  font-weight: 780;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.status-health-copy strong {
+  margin-top: 1px;
+  overflow: hidden;
+  color: #70e5a2;
+  font-size: 9px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-health--checking .status-ecg-trace {
+  stroke: #ae83ee;
+  filter: drop-shadow(0 0 4px rgba(166, 108, 232, 0.5));
+}
+
+.status-health--checking .status-health-copy strong {
+  color: #b893e7;
+}
+
+.status-health--degraded .status-ecg {
+  border-color: rgba(229, 172, 75, 0.38);
+  background-color: rgba(103, 75, 24, 0.18);
+}
+
+.status-health--degraded .status-ecg-trace,
+.status-health--degraded .status-health-copy strong {
+  color: #dfb05e;
+  stroke: #dfb05e;
+}
+
+.status-health--error .status-ecg {
+  border-color: rgba(224, 100, 117, 0.38);
+  background-color: rgba(104, 31, 42, 0.18);
+}
+
+.status-health--error .status-ecg-trace,
+.status-health--error .status-health-copy strong {
+  color: #df7d89;
+  stroke: #df7d89;
+}
+
+.status-health-detail {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 11px;
+  width: min(440px, calc(100vw - 24px));
+  border: 1px solid rgba(216, 169, 79, 0.3);
+  border-radius: 7px;
+  background: rgba(6, 10, 12, 0.98);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.5);
+  color: #c7ccc8;
+  font-size: 10px;
+  line-height: 1.45;
+  opacity: 0;
+  padding: 9px 11px;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition:
+    opacity 150ms ease,
+    transform 190ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.status-health:hover + .status-health-detail,
+.status-health:focus-visible + .status-health-detail {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@keyframes status-line-scan {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(460%);
+  }
+}
+
+@keyframes status-ecg-travel {
+  0% {
+    opacity: 0;
+    stroke-dashoffset: 76;
+  }
+
+  12%,
+  78% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
+    stroke-dashoffset: 0;
+  }
 }
 
 .vault-version {
@@ -6350,6 +6598,32 @@ body {
   .vault-statusbar .health-panel {
     grid-template-columns: 34px minmax(90px, 1fr) minmax(150px, 180px);
     min-width: 330px;
+  }
+}
+
+@media (max-width: 1050px) {
+  .status-health-control {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .status-health {
+    min-width: 0;
+    width: 290px;
+    flex: 0 1 290px;
+    padding-inline: 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vault-statusbar::after {
+    display: none;
+  }
+
+  .status-ecg-trace {
+    animation: none !important;
+    opacity: 1;
+    stroke-dashoffset: 0;
   }
 }
 

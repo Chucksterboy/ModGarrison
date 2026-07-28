@@ -9,6 +9,7 @@ import {
   DesktopApi,
   GameDetectionResult,
   GameProfile,
+  GarrisonCoreHealth,
   DiscoveryPage,
   InstalledModRecord,
   InstallRequest,
@@ -38,6 +39,8 @@ export const desktopApi: DesktopApi = {
     invoke<AppSettings>("update_app_settings", { input }),
   saveNexusApiKey: (apiKey: string) =>
     invoke<AppSettings>("save_nexus_api_key", { apiKey }),
+  systemHealth: (profileId?: string) =>
+    invoke<GarrisonCoreHealth>("system_health", { profileId }),
   checkAppUpdate: () => invoke<AppUpdateInfo>("check_app_update"),
   minimizeWindow: () => getCurrentWindow().minimize(),
   toggleMaximizeWindow: () => getCurrentWindow().toggleMaximize(),

@@ -31,6 +31,7 @@ const MAX_UNREAL_PAK_ROOT_SCAN_DEPTH: usize = 9;
 const MAX_UNREAL_PAK_ROOTS: usize = 64;
 const MAX_DEPENDENCY_DEPTH: usize = 8;
 const MAX_CONFIG_READ_BYTES: u64 = 512 * 1024;
+const MAX_HEALTH_DIAGNOSTICS_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CONFIG_SCAN_DEPTH: usize = 5;
 const MAX_PROFILE_CONFIG_FILES: usize = 500;
 const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1251,6 +1252,46 @@ pub struct AppUpdateInfo {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GarrisonHealthJob {
+    kind: String,
+    status: String,
+    summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GarrisonCoreHealth {
+    backend_ready: bool,
+    storage_ready: bool,
+    mod_index_ready: bool,
+    active_profile_ready: bool,
+    load_order_ready: bool,
+    game_executable_found: bool,
+    mods_directory_ready: bool,
+    using_fallback: bool,
+    indexed_mod_count: usize,
+    warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_job: Option<GarrisonHealthJob>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthOperationLogEntry {
+    #[serde(default)]
+    timestamp: Option<String>,
+    operation: String,
+    #[serde(default)]
+    profile_id: Option<String>,
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NexusNxmInstallResult {
@@ -1858,7 +1899,7 @@ fn create_steam_profile_sync(app: AppHandle, game: SteamGameRecord) -> Result<Ga
     };
     let profile_operation = operation::profile_lock(&profile.id)?;
     let _profile_operation = operation::lock_profile(&profile_operation)?;
-    if enrich_profile_with_provider_runtime(&mut profile).is_some() {
+    if enrich_profile_with_provider_runtime(&mut profile, true).is_some() {
         persist_profile(&root, &profile)?;
     }
     let mut setup_warnings = install_profile_bootstrap_dependencies(&root, &profile);
@@ -2604,7 +2645,7 @@ fn refresh_profile_sync(
     if detection.loader != "none" || runtime_definition_by_id(&profile.loader).is_none() {
         profile.loader = detection.loader.clone();
     }
-    let runtime_inference = enrich_profile_with_provider_runtime(&mut profile);
+    let runtime_inference = enrich_profile_with_provider_runtime(&mut profile, true);
     profile.updated_at = now_string();
 
     let launch_suspension = read_profile_launch_suspension(&root, &profile.id)?;
@@ -2943,7 +2984,7 @@ fn update_profile_game_folder_impl(
     profile.steam_app_id = steam_app_id;
     profile.engine = detection.engine.clone();
     profile.loader = detection.loader.clone();
-    let runtime_inference = enrich_profile_with_provider_runtime(&mut profile);
+    let runtime_inference = enrich_profile_with_provider_runtime(&mut profile, true);
     profile.updated_at = now_string();
 
     let installed_mods_file = installed_mods_path(root);
@@ -6001,6 +6042,297 @@ fn remove_mod_sync(
 }
 
 #[tauri::command]
+async fn system_health(
+    app: AppHandle,
+    profile_id: Option<String>,
+) -> Result<GarrisonCoreHealth, String> {
+    let root = app.path().app_data_dir().map_err(error_to_string)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(system_health_from_root(&root, profile_id.as_deref()))
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn system_health_from_root(root: &Path, requested_profile_id: Option<&str>) -> GarrisonCoreHealth {
+    let requested_profile_id = requested_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty());
+    let mut warnings = Vec::new();
+
+    let root_ready = health_directory_is_readable(root);
+    if !root_ready {
+        warnings.push("Garrison's application data directory is unavailable.".to_string());
+    }
+
+    let settings_ready = health_read_json::<AppSettings>(&settings_path(root)).is_ok();
+    if !settings_ready {
+        warnings.push("Garrison's settings storage is unavailable or corrupt.".to_string());
+    }
+
+    let profiles_store = health_read_json::<StoreFile<GameProfile>>(&profiles_path(root));
+    let profiles_ready = profiles_store
+        .as_ref()
+        .is_ok_and(|store| store.version == 1);
+    if !profiles_ready {
+        warnings.push("Garrison's profile storage is unavailable or corrupt.".to_string());
+    }
+
+    let profiles_directory_ready = health_directory_is_readable(&root.join("profiles"));
+    if !profiles_directory_ready {
+        warnings.push("Garrison's profile data directory is unavailable.".to_string());
+    }
+
+    let installed_mods_store =
+        health_read_json::<StoreFile<InstalledModRecord>>(&installed_mods_path(root));
+    let mod_index_ready = installed_mods_store
+        .as_ref()
+        .is_ok_and(|store| store.version == 1);
+    if !mod_index_ready {
+        warnings.push("The installed mod index is unavailable or corrupt.".to_string());
+    }
+
+    let profiles = profiles_store
+        .as_ref()
+        .ok()
+        .filter(|store| store.version == 1)
+        .map(|store| store.items.as_slice());
+    let installed_mods = installed_mods_store
+        .as_ref()
+        .ok()
+        .filter(|store| store.version == 1)
+        .map(|store| store.items.as_slice());
+
+    let matching_profiles = requested_profile_id
+        .zip(profiles)
+        .map(|(profile_id, items)| {
+            items
+                .iter()
+                .filter(|profile| profile.id == profile_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let active_profile = (matching_profiles.len() == 1)
+        .then(|| matching_profiles[0])
+        .filter(|profile| health_profile_is_valid(profile));
+    let active_profile_ready = requested_profile_id.is_none() || active_profile.is_some();
+    if requested_profile_id.is_some() && !active_profile_ready {
+        warnings.push("The active profile is missing or corrupt.".to_string());
+    }
+
+    let load_order_ready =
+        profiles
+            .zip(installed_mods)
+            .is_some_and(|(profiles, installed_mods)| {
+                health_load_order_is_valid(profiles, installed_mods)
+            });
+    if profiles.is_some() && installed_mods.is_some() && !load_order_ready {
+        warnings.push(
+            "The installed mod order contains duplicate or missing profile references.".to_string(),
+        );
+    }
+
+    let indexed_mod_count = installed_mods
+        .map(|records| {
+            if let Some(profile_id) = requested_profile_id {
+                records
+                    .iter()
+                    .filter(|record| record.profile_id == profile_id)
+                    .count()
+            } else {
+                records.len()
+            }
+        })
+        .unwrap_or_default();
+
+    let game_executable_found = active_profile
+        .map(health_game_executable_found)
+        .unwrap_or(requested_profile_id.is_none());
+    if active_profile.is_some() && !game_executable_found {
+        warnings.push("The configured game executable was not found.".to_string());
+    }
+
+    let mods_directory_ready = active_profile
+        .map(|profile| health_directory_is_readable(&profile_dir(root, &profile.id)))
+        .unwrap_or(requested_profile_id.is_none());
+    if active_profile.is_some() && !mods_directory_ready {
+        warnings.push("The active profile's managed mod directory is unavailable.".to_string());
+    }
+
+    GarrisonCoreHealth {
+        backend_ready: true,
+        storage_ready: root_ready && settings_ready && profiles_ready && profiles_directory_ready,
+        mod_index_ready,
+        active_profile_ready,
+        load_order_ready,
+        game_executable_found,
+        mods_directory_ready,
+        using_fallback: false,
+        indexed_mod_count,
+        warnings,
+        last_job: latest_health_job(root, requested_profile_id),
+    }
+}
+
+fn health_read_json<T>(path: &Path) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let raw = fs::read_to_string(path).map_err(error_to_string)?;
+    parse_json_allow_bom(&raw).map_err(error_to_string)
+}
+
+fn health_directory_is_readable(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    fs::read_dir(path)
+        .and_then(|mut entries| entries.next().transpose().map(|_| ()))
+        .is_ok()
+}
+
+fn health_profile_is_valid(profile: &GameProfile) -> bool {
+    let id = profile.id.trim();
+    !id.is_empty()
+        && !id.contains(['/', '\\'])
+        && id != "."
+        && id != ".."
+        && !profile.name.trim().is_empty()
+        && !profile.game_path.trim().is_empty()
+        && !profile.engine.trim().is_empty()
+        && !profile.loader.trim().is_empty()
+}
+
+fn health_load_order_is_valid(
+    profiles: &[GameProfile],
+    installed_mods: &[InstalledModRecord],
+) -> bool {
+    let mut profile_ids = HashSet::with_capacity(profiles.len());
+    if profiles.iter().any(|profile| {
+        !health_profile_is_valid(profile) || !profile_ids.insert(profile.id.as_str())
+    }) {
+        return false;
+    }
+
+    let mut installed_ids = HashSet::with_capacity(installed_mods.len());
+    installed_mods.iter().all(|record| {
+        !record.id.trim().is_empty()
+            && !record.profile_id.trim().is_empty()
+            && profile_ids.contains(record.profile_id.as_str())
+            && installed_ids.insert((record.profile_id.as_str(), record.id.as_str()))
+    })
+}
+
+fn health_game_executable_found(profile: &GameProfile) -> bool {
+    let game_root = Path::new(&profile.game_path);
+    let Ok(entries) = fs::read_dir(game_root) else {
+        return false;
+    };
+    let executable_names = profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .or_else(|| {
+            profile
+                .steam_app_id
+                .as_deref()
+                .and_then(game_definition_by_steam_app_id)
+        })
+        .map(|definition| {
+            definition
+                .executable_names
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        entry.path().is_file()
+            && if executable_names.is_empty() {
+                name.ends_with(".exe")
+            } else {
+                executable_names.contains(&name)
+            }
+    })
+}
+
+fn latest_health_job(root: &Path, requested_profile_id: Option<&str>) -> Option<GarrisonHealthJob> {
+    let path = root.join("diagnostics").join("operations.jsonl");
+    let raw = read_health_diagnostics_tail(&path).ok()?;
+
+    raw.lines().rev().find_map(|line| {
+        let entry = serde_json::from_str::<HealthOperationLogEntry>(line).ok()?;
+        if requested_profile_id.is_some_and(|profile_id| {
+            entry
+                .profile_id
+                .as_deref()
+                .is_some_and(|entry_profile_id| entry_profile_id != profile_id)
+        }) {
+            return None;
+        }
+        let kind = health_job_kind(&entry.operation)?;
+        let status = match entry.status.to_ascii_lowercase().as_str() {
+            "error" | "failed" => "failed",
+            "completed" | "succeeded" => "succeeded",
+            _ => return None,
+        };
+        let summary = if status == "failed" {
+            entry
+                .error
+                .filter(|error| !error.trim().is_empty())
+                .unwrap_or_else(|| format!("The latest {kind} job failed."))
+        } else {
+            format!("The latest {kind} job completed successfully.")
+        };
+        Some(GarrisonHealthJob {
+            kind: kind.to_string(),
+            status: status.to_string(),
+            summary,
+            completed_at: entry.timestamp,
+        })
+    })
+}
+
+fn health_job_kind(operation: &str) -> Option<&'static str> {
+    let operation = operation.to_ascii_lowercase();
+    if operation.contains("import") {
+        Some("import")
+    } else if operation.contains("install") || operation.contains("bootstrap") {
+        Some("install")
+    } else if operation.contains("deploy")
+        || operation.contains("launch_profile_game")
+        || operation.contains("mod_launch_mode")
+    {
+        Some("deploy")
+    } else if operation.contains("scan") || operation.contains("discover") {
+        Some("scan")
+    } else {
+        None
+    }
+}
+
+fn read_health_diagnostics_tail(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(MAX_HEALTH_DIAGNOSTICS_BYTES);
+    if start > 0 {
+        file.seek(io::SeekFrom::Start(start))?;
+    }
+    let mut bytes = Vec::with_capacity((length - start).min(usize::MAX as u64) as usize);
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_newline);
+        } else {
+            bytes.clear();
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tauri::command]
 fn get_store_path(app: AppHandle) -> Result<String, String> {
     Ok(store_root(&app)?.to_string_lossy().to_string())
 }
@@ -6239,6 +6571,7 @@ pub fn run() {
             open_external_url,
             download_update_installer,
             check_app_update,
+            system_health,
             get_store_path,
             open_diagnostics_folder
         ])
@@ -6736,8 +7069,9 @@ fn repair_profile_identity_from_steam_app_id(
 
 fn enrich_profile_with_provider_runtime(
     profile: &mut GameProfile,
+    force_refresh: bool,
 ) -> Option<ProviderRuntimeInference> {
-    let inference = infer_profile_foundation_runtime(profile)?;
+    let inference = infer_profile_foundation_runtime(profile, force_refresh)?;
     let runtime = runtime_definition_by_id(&inference.runtime_id)?;
 
     profile.loader = runtime.id.clone();
@@ -9977,6 +10311,13 @@ fn online_mod_timestamp(record: &OnlineModRecord) -> i64 {
 }
 
 fn thunderstore_community_for_profile(profile: &GameProfile) -> Option<String> {
+    thunderstore_community_for_profile_with_refresh(profile, false)
+}
+
+fn thunderstore_community_for_profile_with_refresh(
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> Option<String> {
     if let Some(community) = profile
         .game_id
         .as_deref()
@@ -9986,15 +10327,22 @@ fn thunderstore_community_for_profile(profile: &GameProfile) -> Option<String> {
         return Some(community);
     }
 
-    auto_detect_thunderstore_community(profile)
+    auto_detect_thunderstore_community(profile, force_refresh)
 }
 
 fn nexus_domain_for_profile(profile: &GameProfile) -> Option<String> {
+    nexus_domain_for_profile_with_refresh(profile, false)
+}
+
+fn nexus_domain_for_profile_with_refresh(
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> Option<String> {
     if let Some(domain) = bundled_nexus_domain_for_profile(profile) {
         return Some(domain);
     }
 
-    auto_detect_nexus_mapping(profile, false)
+    auto_detect_nexus_mapping(profile, force_refresh)
         .ok()
         .flatten()
         .map(|mapping| mapping.provider_game_id)
@@ -10058,8 +10406,11 @@ fn verified_discovery_provider_game(
     Ok(expected)
 }
 
-fn auto_detect_thunderstore_community(profile: &GameProfile) -> Option<String> {
-    cached_provider_mapping("thunderstore", profile, false, || {
+fn auto_detect_thunderstore_community(
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> Option<String> {
+    cached_provider_mapping("thunderstore", profile, force_refresh, || {
         let client = provider_client().ok()?;
         let candidates = provider_slug_candidates(profile);
         parallel_first_map(&candidates, &|candidate| {
@@ -10726,27 +11077,38 @@ fn editionless_provider_name_variant(value: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
 }
 
-fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRuntimeInference> {
+fn infer_profile_foundation_runtime(
+    profile: &GameProfile,
+    force_refresh: bool,
+) -> Option<ProviderRuntimeInference> {
     if !profile_bootstrap_dependencies(profile).is_empty() {
         return None;
     }
-    if profile
-        .game_id
-        .as_deref()
-        .and_then(game_definition_by_id)
-        .is_some()
-    {
+    if !profile_supports_any_inferred_runtime(profile) {
         return None;
     }
 
-    let thunderstore_community = thunderstore_community_for_profile(profile);
-    let nexus_domain = nexus_domain_for_profile(profile);
+    if force_refresh {
+        clear_cached_provider_mapping("thunderstore", profile);
+        clear_cached_provider_mapping("nexus", profile);
+    }
+
+    let thunderstore_community =
+        thunderstore_community_for_profile_with_refresh(profile, force_refresh);
+    let nexus_domain = nexus_domain_for_profile_with_refresh(profile, force_refresh);
     if thunderstore_community.is_none() && nexus_domain.is_none() {
         return None;
     }
+    if force_refresh {
+        if let Some(community) = thunderstore_community.as_deref() {
+            clear_thunderstore_community_cache(community);
+        }
+    }
 
     let cache_key = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
+        profile.steam_app_id.as_deref().unwrap_or_default(),
+        profile.game_id.as_deref().unwrap_or_default(),
         profile.engine.to_lowercase(),
         profile.loader.to_lowercase(),
         thunderstore_community.as_deref().unwrap_or_default(),
@@ -10754,15 +11116,10 @@ fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRun
     );
     let cache = PROFILE_RUNTIME_INFERENCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock() {
-        if let Some(entry) = cache.get(&cache_key) {
-            let ttl = if entry.value.is_some() {
-                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
-            } else {
-                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
-            };
-            if entry.fetched_at.elapsed() < ttl {
-                return entry.value.clone();
-            }
+        if let Some(value) =
+            cached_profile_runtime_inference_value(&cache, &cache_key, force_refresh)
+        {
+            return value;
         }
     }
 
@@ -10797,16 +11154,12 @@ fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRun
         }
     }
 
+    retain_supported_runtime_inference_votes(profile, &mut supporters, &mut providers);
     let value = choose_runtime_inference(supporters, providers, sampled_mods);
     if let Ok(mut cache) = cache.lock() {
         let now = Instant::now();
         cache.retain(|_, entry| {
-            let ttl = if entry.value.is_some() {
-                Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
-            } else {
-                Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
-            };
-            now.duration_since(entry.fetched_at) < ttl
+            now.duration_since(entry.fetched_at) < runtime_inference_cache_ttl(&entry.value)
         });
         if cache.len() >= PROFILE_RUNTIME_CACHE_MAX_ENTRIES && !cache.contains_key(&cache_key) {
             if let Some(oldest) = cache
@@ -10826,6 +11179,60 @@ fn infer_profile_foundation_runtime(profile: &GameProfile) -> Option<ProviderRun
         );
     }
     value
+}
+
+fn runtime_inference_cache_ttl(value: &Option<ProviderRuntimeInference>) -> Duration {
+    if value.is_some() {
+        Duration::from_secs(PROVIDER_MAPPING_CACHE_HOURS * 60 * 60)
+    } else {
+        Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
+    }
+}
+
+fn cached_profile_runtime_inference_value(
+    cache: &HashMap<String, RuntimeInferenceCacheEntry>,
+    cache_key: &str,
+    force_refresh: bool,
+) -> Option<Option<ProviderRuntimeInference>> {
+    if force_refresh {
+        return None;
+    }
+    let entry = cache.get(cache_key)?;
+    (entry.fetched_at.elapsed() < runtime_inference_cache_ttl(&entry.value))
+        .then(|| entry.value.clone())
+}
+
+fn retain_supported_runtime_inference_votes(
+    profile: &GameProfile,
+    supporters: &mut HashMap<String, HashSet<String>>,
+    providers: &mut HashMap<String, HashSet<String>>,
+) {
+    supporters.retain(|runtime, _| profile_supports_inferred_runtime(profile, runtime.as_str()));
+    providers.retain(|runtime, _| supporters.contains_key(runtime));
+}
+
+fn profile_supports_inferred_runtime(profile: &GameProfile, runtime: &str) -> bool {
+    let Some(definition) = profile.game_id.as_deref().and_then(game_definition_by_id) else {
+        return true;
+    };
+    let adapter = runtime_adapter_id(runtime);
+    definition
+        .supported_adapters
+        .iter()
+        .any(|supported| supported.eq_ignore_ascii_case(adapter))
+}
+
+fn profile_supports_any_inferred_runtime(profile: &GameProfile) -> bool {
+    let Some(definition) = profile.game_id.as_deref().and_then(game_definition_by_id) else {
+        return true;
+    };
+    runtime_definitions().iter().any(|runtime| {
+        let adapter = runtime_adapter_id(&runtime.id);
+        definition
+            .supported_adapters
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(adapter))
+    })
 }
 
 fn collect_thunderstore_runtime_votes(
@@ -23025,6 +23432,168 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_health_reports_ready_core_state_without_mutating_storage() {
+        let root = temp_game_dir("system-health-ready");
+        let game_root = root.join("game");
+        fs::create_dir_all(&game_root).unwrap();
+        fs::write(game_root.join("TheMound.exe"), b"test executable").unwrap();
+
+        let mut profile =
+            test_profile("the-mound", "The Mound: Omen of Cthulhu", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let record = test_installed_record(&profile.id, "minimap", Some("nexus:minimap"), true);
+        write_health_fixture(&root, &profile, &[record]);
+        let profiles_before = fs::read(profiles_path(&root)).unwrap();
+        let mods_before = fs::read(installed_mods_path(&root)).unwrap();
+        let settings_before = fs::read(settings_path(&root)).unwrap();
+
+        let health = system_health_from_root(&root, Some(&profile.id));
+
+        assert!(health.backend_ready);
+        assert!(health.storage_ready);
+        assert!(health.mod_index_ready);
+        assert!(health.active_profile_ready);
+        assert!(health.load_order_ready);
+        assert!(health.game_executable_found);
+        assert!(health.mods_directory_ready);
+        assert!(!health.using_fallback);
+        assert_eq!(health.indexed_mod_count, 1);
+        assert!(health.warnings.is_empty());
+        assert_eq!(fs::read(profiles_path(&root)).unwrap(), profiles_before);
+        assert_eq!(fs::read(installed_mods_path(&root)).unwrap(), mods_before);
+        assert_eq!(fs::read(settings_path(&root)).unwrap(), settings_before);
+
+        let serialized = serde_json::to_value(&health).unwrap();
+        assert_eq!(serialized["backendReady"], true);
+        assert_eq!(serialized["indexedModCount"], 1);
+        assert!(serialized.get("backend_ready").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_health_exposes_required_profile_corruption_without_repairing_it() {
+        let root = temp_game_dir("system-health-corrupt-profile");
+        let mut profile = test_profile("the-mound", "The Mound", "unreal", "ue4ss");
+        profile.game_path = root.join("game").to_string_lossy().to_string();
+        write_health_fixture(&root, &profile, &[]);
+        fs::write(profiles_path(&root), b"{ definitely not profile json").unwrap();
+
+        let health = system_health_from_root(&root, Some(&profile.id));
+
+        assert!(!health.storage_ready);
+        assert!(health.mod_index_ready);
+        assert!(!health.active_profile_ready);
+        assert!(!health.load_order_ready);
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("profile storage")));
+        assert_eq!(
+            fs::read(profiles_path(&root)).unwrap(),
+            b"{ definitely not profile json"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_health_keeps_optional_missing_paths_separate_from_required_storage() {
+        let root = temp_game_dir("system-health-optional-paths");
+        let mut profile = test_profile("the-mound", "The Mound", "unreal", "ue4ss");
+        profile.game_path = root.join("missing-game").to_string_lossy().to_string();
+        write_health_fixture(&root, &profile, &[]);
+        fs::remove_dir_all(profile_dir(&root, &profile.id)).unwrap();
+
+        let health = system_health_from_root(&root, Some(&profile.id));
+
+        assert!(health.storage_ready);
+        assert!(health.mod_index_ready);
+        assert!(health.active_profile_ready);
+        assert!(health.load_order_ready);
+        assert!(!health.game_executable_found);
+        assert!(!health.mods_directory_ready);
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("game executable")));
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("managed mod directory")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_health_detects_invalid_installed_mod_references() {
+        let root = temp_game_dir("system-health-load-order");
+        let mut profile = test_profile("the-mound", "The Mound", "unreal", "ue4ss");
+        profile.game_path = root.join("game").to_string_lossy().to_string();
+        let mut record = test_installed_record(&profile.id, "orphan", None, true);
+        record.profile_id = "missing-profile".to_string();
+        write_health_fixture(&root, &profile, &[record]);
+
+        let health = system_health_from_root(&root, Some(&profile.id));
+
+        assert!(health.storage_ready);
+        assert!(health.mod_index_ready);
+        assert!(health.active_profile_ready);
+        assert!(!health.load_order_ready);
+        assert_eq!(health.indexed_mod_count, 0);
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("missing profile references")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_health_maps_the_latest_relevant_failed_job() {
+        let root = temp_game_dir("system-health-last-job");
+        let mut profile = test_profile("the-mound", "The Mound", "unreal", "ue4ss");
+        profile.game_path = root.join("game").to_string_lossy().to_string();
+        write_health_fixture(&root, &profile, &[]);
+        let diagnostics = root.join("diagnostics").join("operations.jsonl");
+        fs::create_dir_all(diagnostics.parent().unwrap()).unwrap();
+        fs::write(
+            &diagnostics,
+            concat!(
+                "{\"timestamp\":\"2026-07-28T08:00:00Z\",\"operation\":\"import_profile_bundle\",",
+                "\"profileId\":\"profile-the-mound\",\"durationMs\":14,\"status\":\"error\",",
+                "\"error\":\"Bundle manifest is corrupt.\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let health = system_health_from_root(&root, Some(&profile.id));
+        let serialized = serde_json::to_value(&health).unwrap();
+        let last_job = health.last_job.expect("failed import should be reported");
+
+        assert_eq!(serialized["lastJob"]["kind"], "import");
+        assert_eq!(serialized["lastJob"]["status"], "failed");
+        assert_eq!(serialized["lastJob"]["completedAt"], "2026-07-28T08:00:00Z");
+        assert_eq!(last_job.kind, "import");
+        assert_eq!(last_job.status, "failed");
+        assert_eq!(last_job.summary, "Bundle manifest is corrupt.");
+        assert_eq!(
+            last_job.completed_at.as_deref(),
+            Some("2026-07-28T08:00:00Z")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_health_does_not_create_a_missing_store_root() {
+        let root = temp_game_dir("system-health-read-only");
+        assert!(!root.exists());
+
+        let health = system_health_from_root(&root, None);
+
+        assert!(health.backend_ready);
+        assert!(!health.storage_ready);
+        assert!(!health.mod_index_ready);
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn legacy_app_data_moves_into_the_mod_garrison_identity() {
         let root = temp_game_dir("legacy-app-data-move");
         let legacy_root = root.join(LEGACY_APP_IDENTIFIER);
@@ -24621,7 +25190,7 @@ mod tests {
     }
 
     #[test]
-    fn mound_definition_is_bundled_without_automatic_runtime_bootstrap() {
+    fn mound_definition_infers_ue4ss_from_provider_evidence_without_hardcoding_it() {
         let definition =
             game_definition_by_steam_app_id("2569760").expect("The Mound must be registered");
         assert_eq!(definition.id, "the-mound");
@@ -24637,7 +25206,78 @@ mod tests {
             bundled_nexus_domain_for_profile(&profile).as_deref(),
             Some("themoundomenofcthulhu")
         );
-        assert!(infer_profile_foundation_runtime(&profile).is_none());
+        assert!(profile_bootstrap_dependencies(&profile).is_empty());
+        assert!(profile_supports_any_inferred_runtime(&profile));
+        assert!(profile_supports_inferred_runtime(&profile, "ue4ss"));
+
+        let nodes = serde_json::from_value::<Vec<NexusModNode>>(serde_json::json!([
+            {
+                "modId": 12,
+                "name": "MiniMap Mod",
+                "modRequirements": {
+                    "nexusRequirements": {
+                        "nodes": [{ "modName": "UE4SS for The Mound" }]
+                    }
+                }
+            },
+            {
+                "modId": 11,
+                "name": "Mod Settings",
+                "modRequirements": {
+                    "nexusRequirements": {
+                        "nodes": [{ "modName": "UE4SS for The Mound" }]
+                    }
+                }
+            }
+        ]))
+        .unwrap();
+        let mut supporters = HashMap::new();
+        let mut providers = HashMap::new();
+        let sampled = collect_nexus_runtime_votes(
+            &profile,
+            "themoundomenofcthulhu",
+            &nodes,
+            &mut supporters,
+            &mut providers,
+        );
+        retain_supported_runtime_inference_votes(&profile, &mut supporters, &mut providers);
+        let inference = choose_runtime_inference(supporters, providers, sampled).unwrap();
+        assert_eq!(inference.runtime_id, "ue4ss");
+        assert_eq!(inference.supporting_mods, 2);
+
+        profile.loader = inference.runtime_id;
+        let dependencies = profile_bootstrap_dependencies(&profile);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id, "runtime:ue4ss");
+        assert_eq!(dependencies[0].provider, "github-release");
+    }
+
+    #[test]
+    fn known_games_reject_inferred_runtimes_their_adapters_do_not_support() {
+        for game_id in ["witchspire", "marvel-rivals"] {
+            let profile = test_profile(game_id, game_id, "unreal", "none");
+            assert!(!profile_supports_any_inferred_runtime(&profile));
+            assert!(!profile_supports_inferred_runtime(&profile, "ue4ss"));
+
+            let mut supporters = HashMap::from([(
+                "ue4ss".to_string(),
+                HashSet::from(["mod-a".to_string(), "mod-b".to_string()]),
+            )]);
+            let mut providers = HashMap::from([(
+                "ue4ss".to_string(),
+                HashSet::from(["Nexus Mods".to_string()]),
+            )]);
+            retain_supported_runtime_inference_votes(&profile, &mut supporters, &mut providers);
+            assert!(supporters.is_empty());
+            assert!(providers.is_empty());
+        }
+    }
+
+    #[test]
+    fn declared_bootstrap_runtime_still_suppresses_provider_inference() {
+        let profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        assert!(!profile_bootstrap_dependencies(&profile).is_empty());
+        assert!(infer_profile_foundation_runtime(&profile, true).is_none());
     }
 
     #[test]
@@ -27198,6 +27838,44 @@ mod tests {
     }
 
     #[test]
+    fn forced_runtime_inference_bypasses_positive_and_negative_cache_entries() {
+        let positive_key = "positive".to_string();
+        let negative_key = "negative".to_string();
+        let cache = HashMap::from([
+            (
+                positive_key.clone(),
+                RuntimeInferenceCacheEntry {
+                    fetched_at: Instant::now(),
+                    value: Some(ProviderRuntimeInference {
+                        runtime_id: "ue4ss".to_string(),
+                        providers: vec!["Nexus Mods".to_string()],
+                        supporting_mods: 2,
+                        sampled_mods: 11,
+                    }),
+                },
+            ),
+            (
+                negative_key.clone(),
+                RuntimeInferenceCacheEntry {
+                    fetched_at: Instant::now(),
+                    value: None,
+                },
+            ),
+        ]);
+
+        assert!(
+            cached_profile_runtime_inference_value(&cache, &positive_key, false)
+                .is_some_and(|value| value.is_some())
+        );
+        assert!(
+            cached_profile_runtime_inference_value(&cache, &negative_key, false)
+                .is_some_and(|value| value.is_none())
+        );
+        assert!(cached_profile_runtime_inference_value(&cache, &positive_key, true).is_none());
+        assert!(cached_profile_runtime_inference_value(&cache, &negative_key, true).is_none());
+    }
+
+    #[test]
     fn nexus_requirements_distinguish_foundation_runtime_and_optional_addons() {
         let profile = test_profile(
             "mhwilds",
@@ -28657,6 +29335,31 @@ mod tests {
             manifest: None,
             package_identity: identity,
         }
+    }
+
+    fn write_health_fixture(
+        root: &Path,
+        profile: &GameProfile,
+        installed_mods: &[InstalledModRecord],
+    ) {
+        fs::create_dir_all(profile_dir(root, &profile.id)).unwrap();
+        write_app_settings_raw(&settings_path(root), &AppSettings::default()).unwrap();
+        write_store(
+            &profiles_path(root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+        write_store(
+            &installed_mods_path(root),
+            &StoreFile {
+                version: 1,
+                items: installed_mods.to_vec(),
+            },
+        )
+        .unwrap();
     }
 
     fn temp_game_dir(name: &str) -> PathBuf {

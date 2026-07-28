@@ -36,6 +36,9 @@ jobs:
       - name: Check frontend
         run: pnpm run typecheck
 
+      - name: Test frontend
+        run: pnpm run test:frontend
+
       - name: Test backend
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
@@ -54,10 +57,10 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Adds automatic, verified Nexus catalogue matching based on the canonical Steam game title.
-            - Adds built-in Discover support for The Mound: Omen of Cthulhu.
-            - Persists verified provider mappings by Steam App ID and re-resolves them on an explicit Refresh.
-            - Fails closed with a visible warning when a unique safe provider match cannot be established.
+            - Detects supported foundation runtimes from provider mod requirements during profile creation and Refresh, including UE4SS for The Mound: Omen of Cthulhu.
+            - Bypasses stale positive and negative provider caches on explicit Refresh while rejecting runtimes outside a known game's supported adapters.
+            - Replaces the cosmetic footer status with a real, read-only four-state core health check and Starfold-style ECG control.
+            - Runs health checks after startup, on click, once per visible minute, and when the application returns to the foreground.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
             - Existing profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
           releaseDraft: true

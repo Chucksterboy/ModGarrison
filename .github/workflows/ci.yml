@@ -37,6 +37,9 @@ jobs:
       - name: Check frontend
         run: pnpm run typecheck
 
+      - name: Test frontend
+        run: pnpm run test:frontend
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 

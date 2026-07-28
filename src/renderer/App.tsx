@@ -66,6 +66,7 @@ import {
 import { desktopApi } from "./tauriApi";
 import { rememberBoundedSetValue } from "./boundedCache";
 import { profileNeedsAttention } from "./health";
+import { SystemHealthButton } from "./SystemHealthButton";
 import {
   type MotionPhase,
   motionDurationMs,
@@ -290,6 +291,7 @@ export function App() {
     useState<PendingDependencyPrompt | null>(null);
   const selectedProfileIdRef = useRef("");
   const discoverProfileIdRef = useRef("");
+  const appShellRef = useRef<HTMLElement>(null);
   const [error, setErrorState] = useState<string>("");
   const [errorMotionId, setErrorMotionId] = useState(0);
   const noticeSequence = useRef(0);
@@ -445,6 +447,14 @@ export function App() {
   const profileCreatorPresence = useFadePresence(profileCreatorOpen ? true : null);
   const noticePresence = useFadePresence(notice, 140);
   const errorPresence = useFadePresence(error ? error : null, 140);
+  const modalOpen = Boolean(
+    configModalPresence.value ||
+      profileRenamePresence.value ||
+      profileRemovalPresence.value ||
+      forceRemovalPresence.value ||
+      dependencyPromptPresence.value ||
+      profileCreatorPresence.value
+  );
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === selectedProfileId),
     [profiles, selectedProfileId]
@@ -553,6 +563,19 @@ export function App() {
     : healthTone === "success"
       ? "All systems functional"
       : "Needs attention";
+
+  useEffect(() => {
+    const appShell = appShellRef.current;
+    if (appShell) {
+      appShell.inert = modalOpen;
+    }
+
+    return () => {
+      if (appShell) {
+        appShell.inert = false;
+      }
+    };
+  }, [modalOpen]);
 
   useEffect(() => {
     void bootstrap();
@@ -2300,8 +2323,10 @@ export function App() {
     <>
     {startupSplashPhase !== "hidden" ? <StartupSplash phase={startupSplashPhase} /> : null}
     <main
+      aria-hidden={modalOpen || undefined}
       className={renderedView === "manager" ? "app-shell" : "app-shell settings-shell"}
       data-theme={defaultThemeId}
+      ref={appShellRef}
     >
       <header className="vault-titlebar" onMouseDown={startTitlebarDrag}>
         <div className="vault-brand">
@@ -2857,11 +2882,10 @@ export function App() {
           <span className="rail-status" />
           {appVersion ? `v${appVersion}` : ""}
         </div>
-        <HealthPanel
-          healthMessage={healthMessage}
-          healthTone={healthTone}
-          motionClassName={viewMotion.className}
-          status={status}
+        <SystemHealthButton
+          probeCore={api.systemHealth}
+          profileId={selectedProfileId || undefined}
+          ready={bootstrapReady}
         />
         <button
           className={appSettings.nexusApiKeyConfigured ? "vault-footer-service connected" : "vault-footer-service"}
@@ -3648,34 +3672,6 @@ function UpdateRailIndicator({
     >
       <Download className={isChecking || isDownloading ? "spin-icon" : ""} size={16} />
     </button>
-  );
-}
-
-interface HealthPanelProps {
-  healthMessage: string;
-  healthTone: NoticeKind;
-  motionClassName?: string;
-  status: string;
-}
-
-function HealthPanel({
-  healthMessage,
-  healthTone,
-  motionClassName = "",
-  status
-}: HealthPanelProps) {
-  return (
-    <div className={`health-panel health-dock ${healthTone} ${motionClassName}`}>
-      <div className="health-orb">
-        <Activity className="health-wave-track" size={22} strokeWidth={2.35} />
-        <Activity className="health-wave-signal" size={22} strokeWidth={2.35} />
-      </div>
-      <div className="health-copy">
-        <span>Health</span>
-        <strong>{healthMessage}</strong>
-      </div>
-      <span className="health-status" title={status}>{status}</span>
-    </div>
   );
 }
 
