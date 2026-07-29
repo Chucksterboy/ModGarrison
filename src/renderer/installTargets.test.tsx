@@ -2,7 +2,9 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InstallTargetOption } from "../shared/contracts";
 import {
+  InstallTargetChoices,
   InstallTargetPicker,
+  LegacyInstallTargetChoices,
   installTargetRefreshWarning,
   selectedInstallTargetOption,
   withSelectedInstallTarget
@@ -36,21 +38,19 @@ describe("selectedInstallTargetOption", () => {
     ).toEqual(serverTarget);
   });
 
-  it("falls back to the recommended target and then the first target", () => {
+  it("does not invent a selection when the persisted target is missing or invalid", () => {
     expect(
       selectedInstallTargetOption({
         installTargets: [serverTarget, clientTarget]
       })
-    ).toEqual(clientTarget);
+    ).toBeUndefined();
 
     expect(
       selectedInstallTargetOption({
-        installTargets: [
-          serverTarget,
-          { ...clientTarget, recommended: false }
-        ]
+        installTargets: [serverTarget, clientTarget],
+        selectedInstallTargetId: "missing"
       })
-    ).toEqual(serverTarget);
+    ).toBeUndefined();
   });
 });
 
@@ -166,5 +166,150 @@ describe("InstallTargetPicker", () => {
     );
 
     expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("stays visible with a disabled placeholder when no target is selected", () => {
+    const onChange = vi.fn();
+
+    render(
+      <InstallTargetPicker
+        busy={false}
+        modName="Example Mod"
+        onChange={onChange}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    const picker = screen.getByRole("combobox", {
+      name: "Install target for Example Mod"
+    }) as HTMLSelectElement;
+    const placeholder = screen.getByRole("option", {
+      name: "Choose target"
+    }) as HTMLOptionElement;
+
+    expect(picker.value).toBe("");
+    expect(picker.disabled).toBe(false);
+    expect(placeholder.disabled).toBe(true);
+
+    fireEvent.change(picker, { target: { value: serverTarget.id } });
+    expect(onChange).toHaveBeenCalledWith(serverTarget.id);
+  });
+});
+
+describe("InstallTargetChoices", () => {
+  it("renders radio-like choices and changes to an available target", () => {
+    const onChange = vi.fn();
+
+    render(
+      <InstallTargetChoices
+        busy={false}
+        modName="Example Mod"
+        onChange={onChange}
+        selectedTarget={clientTarget}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    const choices = screen.getByRole("radiogroup", {
+      name: "Install targets for Example Mod"
+    });
+    const client = screen.getByRole("radio", { name: /Client/ });
+    const server = screen.getByRole("radio", { name: /Server/ });
+
+    expect(choices.getAttribute("aria-busy")).toBe("false");
+    expect((client as HTMLInputElement).checked).toBe(true);
+    expect((client as HTMLInputElement).disabled).toBe(false);
+    expect((server as HTMLInputElement).checked).toBe(false);
+    expect((server as HTMLInputElement).disabled).toBe(false);
+    expect(screen.getByText("Installed")).toBeTruthy();
+    expect(screen.getByText("Select")).toBeTruthy();
+
+    fireEvent.click(server);
+    expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange).toHaveBeenCalledWith(serverTarget.id);
+  });
+
+  it("shows the multi-location note and recommended choice without inventing a selection", () => {
+    render(
+      <InstallTargetChoices
+        busy={false}
+        modName="Example Mod"
+        onChange={() => undefined}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        "This mod is in multiple locations. Choose one target to remove the other managed copies."
+      )
+    ).toBeTruthy();
+    expect(screen.getAllByRole("radio").every((choice) =>
+      !(choice as HTMLInputElement).checked
+    )).toBe(true);
+    expect(screen.getByText("Recommended")).toBeTruthy();
+    expect(screen.queryByText("Installed")).toBeNull();
+  });
+
+  it("locks every choice while this or another target change is pending", () => {
+    const { rerender } = render(
+      <InstallTargetChoices
+        busy
+        modName="Example Mod"
+        onChange={() => undefined}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    expect(screen.getAllByRole("radio").every((choice) =>
+      (choice as HTMLInputElement).disabled
+    )).toBe(true);
+    expect(
+      screen.getByRole("radiogroup").getAttribute("aria-busy")
+    ).toBe("true");
+
+    rerender(
+      <InstallTargetChoices
+        busy={false}
+        disabled
+        modName="Example Mod"
+        onChange={() => undefined}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    expect(screen.getAllByRole("radio").every((choice) =>
+      (choice as HTMLInputElement).disabled
+    )).toBe(true);
+    expect(
+      screen.getByRole("radiogroup").getAttribute("aria-busy")
+    ).toBe("false");
+  });
+});
+
+describe("LegacyInstallTargetChoices", () => {
+  it("shows every legacy copy as installed without claiming one is primary", () => {
+    render(
+      <LegacyInstallTargetChoices
+        targets={[
+          { id: "game", label: "Game Mods", path: "Content/Paks/~mods" },
+          {
+            id: "server",
+            label: "Local Server Mods",
+            path: "R5/Builds/WindowsServer/R5/Content/Paks/~mods"
+          }
+        ]}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        "This legacy install is in multiple locations. Target switching needs an automatic upgrade or reinstall."
+      )
+    ).toBeTruthy();
+    expect(screen.getAllByText("Installed")).toHaveLength(2);
+    expect(screen.queryByText("Primary")).toBeNull();
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

@@ -57,13 +57,14 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Detects Client, Hosted Server, and Dedicated Server archive layouts and exposes a per-mod install-target selector when a package offers real alternatives.
-            - Installs runtimes and nested Nexus, Thunderstore, GitHub release, and BepInBuilds dependencies into the same exact game-root family as the parent mod.
-            - Hardens BepInEx, UE4SS, REFramework, Unreal pak, and native-script routing by verifying archive contents before using provider installation instructions.
-            - Preserves selected provider variants and user-edited configuration files across updates, target switches, disable/enable cycles, and runtime repairs.
-            - Adds atomic recovery for installs, replacements, dependency graphs, target switches, profile imports, runtime cleanup, disable, and removal operations.
-            - Fails closed on ambiguous routes, incomplete companion files, unsafe collisions, missing backups, and tampered recovery data.
-            - Adds explicit RuneScape: Dragonwilds Steam and Nexus mapping while keeping unknown-game detection evidence-based.
+            - Makes genuine client and local-server install destinations selectable from both compact and expanded mod-library views.
+            - Moves a managed mod to the chosen destination transactionally and retires its previous managed copy, with rollback and recovery protection.
+            - Globally limits selectable destinations to canonical, filesystem-verified game routes; provider descriptions cannot invent install authority.
+            - Requires unknown Unreal games to prove a `Content/Paks` root with direct native `.pak`, `.ucas`, or `.utoc` payload, while known games use exact registered routes.
+            - Fixes Windrose so only `R5/Content/Paks/~mods` and `R5/Builds/WindowsServer/R5/Content/Paks/~mods` are offered.
+            - Automatically removes stale or generated target choices from existing installs while preserving the active receipt, selected valid route, files, hashes, backups, and configuration ownership.
+            - Rejects tampered target IDs and paths, prunes nested mod/cache/backup trees from route discovery, and fails closed when saved choices cannot be safely rebuilt.
+            - Preserves verified user-edited configuration files across target changes and strengthens target-specific dependency checks.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
             - Existing profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
           releaseDraft: true

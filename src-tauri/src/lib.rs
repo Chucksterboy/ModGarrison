@@ -6171,6 +6171,7 @@ fn apply_config_snapshots_to_target_plan(
     snapshots: &[ConfigSnapshot],
 ) -> Result<(), String> {
     let game_root = Path::new(&profile.game_path);
+    let mut target_configs = HashMap::<String, (PathBuf, Vec<u8>)>::new();
     for (index, snapshot) in snapshots.iter().enumerate() {
         validate_deployment_containment(game_root, &snapshot.path)?;
         let old_relative_path = snapshot
@@ -6199,12 +6200,28 @@ fn apply_config_snapshots_to_target_plan(
                 target_path.to_string_lossy()
             ));
         }
+        let target_identity = normalize_filesystem_identity(target_path.to_string_lossy().as_ref());
+        if let Some((previous_path, previous_bytes)) = target_configs.get(&target_identity) {
+            if previous_bytes != &snapshot.bytes {
+                return Err(format!(
+                    "{} has different saved settings in {} and {}. Mod Garrison left both files untouched instead of choosing which settings to discard.",
+                    display_record_name(original),
+                    previous_path.to_string_lossy(),
+                    snapshot.path.to_string_lossy()
+                ));
+            }
+            continue;
+        }
         let content = std::str::from_utf8(&snapshot.bytes).map_err(|_| {
             format!(
                 "Configuration is not UTF-8 and cannot be moved safely: {}",
                 snapshot.path.to_string_lossy()
             )
         })?;
+        target_configs.insert(
+            target_identity,
+            (snapshot.path.clone(), snapshot.bytes.clone()),
+        );
 
         if let Some(mapping) = selected_plan.mappings.iter_mut().find(|mapping| {
             mapping.target_root.eq_ignore_ascii_case("game")
@@ -6282,6 +6299,64 @@ fn snapshot_record_configs(
         });
     }
     Ok(snapshots)
+}
+
+fn verified_target_switch_config_paths(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+) -> Result<Vec<PathBuf>, String> {
+    let game_root = Path::new(&profile.game_path);
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+
+    for path in record.files_written.iter().map(PathBuf::from) {
+        if !is_user_editable_config_file(&path)
+            || validate_deployment_containment(game_root, &path).is_err()
+        {
+            continue;
+        }
+        let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+        if seen.insert(identity) {
+            paths.push(path);
+        }
+    }
+
+    for plan in record.plan.iter() {
+        for mapping in plan
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+        {
+            let path = safe_join(game_root, &mapping.target_relative_path)?;
+            validate_deployment_containment(game_root, &path)?;
+            if !is_user_editable_config_file(&path) {
+                continue;
+            }
+            let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+            if seen.insert(identity) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.sort_by_key(|path| normalize_filesystem_identity(path.to_string_lossy().as_ref()));
+    Ok(paths)
+}
+
+fn snapshot_verified_target_switch_configs(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+) -> Result<Vec<ConfigSnapshot>, String> {
+    verified_target_switch_config_paths(profile, record)?
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| {
+            Ok(ConfigSnapshot {
+                bytes: fs::read(&path).map_err(error_to_string)?,
+                path,
+            })
+        })
+        .collect()
 }
 
 fn restore_config_snapshots_to_record(
@@ -6814,6 +6889,38 @@ fn list_installed_mods_sync_locked(
         .iter_mut()
         .filter(|record| record.profile_id == profile_id)
     {
+        match repair_legacy_managed_source_path(&root, record) {
+            Ok(true) => changed = true,
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "Skipped legacy managed-source repair for {}: {error}",
+                display_record_name(record)
+            ),
+        }
+        let promoted = match promote_legacy_install_target_metadata(&root, &profile, record) {
+            Ok(true) => {
+                changed = true;
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                eprintln!(
+                    "Skipped legacy install-target promotion for {}: {error}",
+                    display_record_name(record)
+                );
+                false
+            }
+        };
+        if !promoted {
+            match reconcile_persisted_install_target_metadata(&root, &profile, record) {
+                Ok(true) => changed = true,
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Skipped persisted install-target reconciliation for {}: {error}",
+                    display_record_name(record)
+                ),
+            }
+        }
         let resolved = resolved_config_files_for_record(&profile, record, &discovered_config_files);
         if record.config_files != resolved {
             record.config_files = resolved;
@@ -6841,6 +6948,317 @@ fn list_installed_mods_sync_locked(
             record
         })
         .collect())
+}
+
+fn repair_legacy_managed_source_path(
+    store_root: &Path,
+    record: &mut InstalledModRecord,
+) -> Result<bool, String> {
+    let saved_path = Path::new(&record.archive_path);
+    if record.externally_managed
+        || saved_path.is_file()
+        || saved_path.is_dir()
+        || !is_safe_internal_storage_segment(&record.profile_id)
+        || !is_safe_internal_storage_segment(&record.id)
+    {
+        return Ok(false);
+    }
+
+    let components = saved_path
+        .iter()
+        .map(|component| component.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let Some(legacy_index) = components
+        .iter()
+        .position(|component| component.eq_ignore_ascii_case(LEGACY_APP_IDENTIFIER))
+    else {
+        return Ok(false);
+    };
+    let suffix = &components[legacy_index + 1..];
+    if suffix.len() != 5
+        || !suffix[0].eq_ignore_ascii_case("profiles")
+        || suffix[1] != record.profile_id
+        || !suffix[2].eq_ignore_ascii_case("packages")
+        || suffix[3] != record.id
+        || suffix[4].is_empty()
+    {
+        return Ok(false);
+    }
+
+    let package_root = profile_package_dir(store_root, &record.profile_id, &record.id);
+    let candidate = package_root.join(&suffix[4]);
+    if (!candidate.is_file() && !candidate.is_dir())
+        || validate_deployment_containment(&package_root, &candidate).is_err()
+    {
+        return Ok(false);
+    }
+
+    verify_managed_source_integrity(record, &candidate)?;
+    if record.source_archive_sha256.is_none() {
+        record.source_archive_sha256 = Some(sha256_managed_source(&candidate)?);
+    }
+    record.archive_path = candidate.to_string_lossy().to_string();
+    Ok(true)
+}
+
+fn promote_legacy_install_target_metadata(
+    store_root: &Path,
+    profile: &GameProfile,
+    record: &mut InstalledModRecord,
+) -> Result<bool, String> {
+    if record.externally_managed
+        || record.runtime_id.is_some()
+        || !record.install_targets.is_empty()
+        || record.install_target_plan.is_some()
+        || record.plan.is_none()
+        || !is_safe_internal_storage_segment(&record.profile_id)
+        || !is_safe_internal_storage_segment(&record.id)
+    {
+        return Ok(false);
+    }
+
+    let source_path = Path::new(&record.archive_path);
+    if !source_path.is_file() && !source_path.is_dir() {
+        return Ok(false);
+    }
+    let package_root = profile_package_dir(store_root, &record.profile_id, &record.id);
+    validate_deployment_containment(&package_root, source_path)?;
+    verify_managed_source_integrity(record, source_path)?;
+
+    let analysis = analyze_scanned_archive(scan_import_source(store_root, source_path)?, profile);
+    let Some(full_plan) = analysis.recommended_plan else {
+        return Ok(false);
+    };
+    if !full_plan
+        .adapter_id
+        .eq_ignore_ascii_case(&record.adapter_id)
+        || full_plan.requires_confirmation
+        || incompatible_install_plan_reason(profile, &full_plan).is_some()
+        || runtime_supplied_by_plan(profile, &full_plan).is_some()
+    {
+        return Ok(false);
+    }
+
+    let install_targets = plan_install_target_options(profile, &full_plan);
+    if install_targets.len() < 2
+        || install_targets
+            .iter()
+            .any(|target| validate_persisted_install_target(profile, &full_plan, target).is_err())
+    {
+        return Ok(false);
+    }
+
+    let installed_target_ids =
+        installed_install_target_ids(profile, record, &full_plan, &install_targets);
+    let selected_install_target_id = match installed_target_ids.as_slice() {
+        [selected] => Some(selected.clone()),
+        _ => None,
+    };
+
+    if let Some(selected_id) = selected_install_target_id.as_deref() {
+        let selected_target = install_targets
+            .iter()
+            .find(|target| target.id == selected_id)
+            .ok_or_else(|| {
+                "The verified legacy install target disappeared during migration.".to_string()
+            })?;
+        let mut effective_plan = full_plan.clone();
+        apply_install_target_option(&mut effective_plan, selected_target)?;
+        record.plan = Some(effective_plan);
+    }
+
+    if record.source_archive_sha256.is_none() {
+        record.source_archive_sha256 = Some(sha256_managed_source(source_path)?);
+    }
+    record.install_target_plan = Some(full_plan);
+    record.install_targets = install_targets;
+    record.selected_install_target_id = selected_install_target_id;
+    Ok(true)
+}
+
+fn reconcile_persisted_install_target_metadata(
+    store_root: &Path,
+    profile: &GameProfile,
+    record: &mut InstalledModRecord,
+) -> Result<bool, String> {
+    if record.externally_managed || record.runtime_id.is_some() {
+        return Ok(false);
+    }
+    let has_selector_metadata = record.install_target_plan.is_some()
+        || !record.install_targets.is_empty()
+        || record.selected_install_target_id.is_some();
+    if !has_selector_metadata {
+        return Ok(false);
+    }
+    if record.install_targets.is_empty()
+        || record.install_target_plan.is_none()
+        || !is_safe_internal_storage_segment(&record.profile_id)
+        || !is_safe_internal_storage_segment(&record.id)
+    {
+        return Ok(clear_install_target_metadata(record));
+    }
+
+    let saved_full_plan = record.install_target_plan.as_ref().ok_or_else(|| {
+        "Persisted install-target plan disappeared during validation.".to_string()
+    })?;
+    let currently_verified = plan_install_target_options(profile, saved_full_plan);
+    let selected_is_current = record
+        .selected_install_target_id
+        .as_ref()
+        .is_none_or(|selected| {
+            currently_verified
+                .iter()
+                .any(|target| target.id == *selected)
+        });
+    if selected_is_current
+        && install_target_options_match(&record.install_targets, &currently_verified)
+    {
+        return Ok(false);
+    }
+
+    let source_path = Path::new(&record.archive_path);
+    if !source_path.is_file() && !source_path.is_dir() {
+        return Ok(clear_install_target_metadata(record));
+    }
+    let package_root = profile_package_dir(store_root, &record.profile_id, &record.id);
+    if let Err(error) = validate_deployment_containment(&package_root, source_path) {
+        eprintln!(
+            "Cleared stale install targets for {} because its managed source is unsafe: {error}",
+            display_record_name(record)
+        );
+        return Ok(clear_install_target_metadata(record));
+    }
+    if let Err(error) = verify_managed_source_integrity(record, source_path) {
+        eprintln!(
+            "Cleared stale install targets for {} because its managed source could not be verified: {error}",
+            display_record_name(record)
+        );
+        return Ok(clear_install_target_metadata(record));
+    }
+
+    let scanned = match scan_import_source(store_root, source_path) {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            eprintln!(
+                "Cleared stale install targets for {} because its managed source could not be scanned: {error}",
+                display_record_name(record)
+            );
+            return Ok(clear_install_target_metadata(record));
+        }
+    };
+    let analysis = analyze_scanned_archive(scanned, profile);
+    let Some(fresh_full_plan) = analysis.recommended_plan else {
+        return Ok(clear_install_target_metadata(record));
+    };
+    if !fresh_full_plan
+        .adapter_id
+        .eq_ignore_ascii_case(&record.adapter_id)
+        || fresh_full_plan.requires_confirmation
+        || incompatible_install_plan_reason(profile, &fresh_full_plan).is_some()
+        || runtime_supplied_by_plan(profile, &fresh_full_plan).is_some()
+    {
+        return Ok(clear_install_target_metadata(record));
+    }
+
+    let fresh_targets = plan_install_target_options(profile, &fresh_full_plan);
+    if fresh_targets
+        .iter()
+        .any(|target| validate_persisted_install_target(profile, &fresh_full_plan, target).is_err())
+    {
+        return Ok(clear_install_target_metadata(record));
+    }
+    let selected_install_target_id = record
+        .selected_install_target_id
+        .as_ref()
+        .filter(|selected| {
+            fresh_targets
+                .iter()
+                .any(|target| target.id == selected.as_str())
+        })
+        .cloned()
+        .or_else(|| {
+            let installed =
+                installed_install_target_ids(profile, record, &fresh_full_plan, &fresh_targets);
+            match installed.as_slice() {
+                [selected] => Some(selected.clone()),
+                _ => None,
+            }
+        });
+
+    if record.source_archive_sha256.is_none() {
+        record.source_archive_sha256 = Some(sha256_managed_source(source_path)?);
+    }
+    if fresh_targets.len() < 2 {
+        record.install_target_plan = None;
+        record.install_targets.clear();
+        record.selected_install_target_id = None;
+    } else {
+        record.install_target_plan = Some(fresh_full_plan);
+        record.install_targets = fresh_targets;
+        record.selected_install_target_id = selected_install_target_id;
+    }
+    Ok(true)
+}
+
+fn clear_install_target_metadata(record: &mut InstalledModRecord) -> bool {
+    let changed = record.install_target_plan.is_some()
+        || !record.install_targets.is_empty()
+        || record.selected_install_target_id.is_some();
+    record.install_target_plan = None;
+    record.install_targets.clear();
+    record.selected_install_target_id = None;
+    changed
+}
+
+fn install_target_options_match(
+    left: &[InstallTargetOption],
+    right: &[InstallTargetOption],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left.label == right.label
+                && left.relative_path == right.relative_path
+                && left.scope == right.scope
+                && left.recommended == right.recommended
+        })
+}
+
+fn installed_install_target_ids(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    full_plan: &InstallPlan,
+    install_targets: &[InstallTargetOption],
+) -> Vec<String> {
+    let written_paths = record
+        .files_written
+        .iter()
+        .map(|path| normalize_filesystem_identity(path))
+        .collect::<HashSet<_>>();
+    let game_root = Path::new(&profile.game_path);
+
+    install_targets
+        .iter()
+        .filter_map(|target| {
+            let mut target_plan = full_plan.clone();
+            apply_install_target_option(&mut target_plan, target).ok()?;
+            let destinations = target_plan
+                .mappings
+                .iter()
+                .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+                .filter_map(|mapping| {
+                    safe_join(game_root, &mapping.target_relative_path)
+                        .ok()
+                        .map(|path| normalize_filesystem_identity(path.to_string_lossy().as_ref()))
+                })
+                .collect::<Vec<_>>();
+            (!destinations.is_empty()
+                && destinations
+                    .iter()
+                    .all(|destination| written_paths.contains(destination)))
+            .then(|| target.id.clone())
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -7283,6 +7701,17 @@ async fn set_mod_install_target(
     .map_err(error_to_string)?
 }
 
+fn recover_disabled_target_switch_after_commit_failure(store_root: &Path) -> Result<(), String> {
+    recover_store_transactions_once(store_root).map_err(|error| {
+        format!(
+            "Store recovery is still pending, so Mod Garrison retained both the store and configuration recovery records: {error}"
+        )
+    })?;
+    recover_deactivation_transactions(store_root).map_err(|error| {
+        format!("The previous configuration also could not be restored immediately: {error}")
+    })
+}
+
 fn set_mod_install_target_impl(
     store_root: &Path,
     profile: &GameProfile,
@@ -7291,7 +7720,7 @@ fn set_mod_install_target_impl(
 ) -> Result<ModActionResult, String> {
     let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
         .map_err(error_to_string)?;
-    let original = store
+    let mut original = store
         .items
         .iter()
         .find(|record| record.id == installed_mod_id && record.profile_id == profile.id)
@@ -7305,6 +7734,11 @@ fn set_mod_install_target_impl(
             "Externally managed mods cannot be moved by Mod Garrison. Reinstall this mod through Mod Garrison first."
                 .to_string(),
         );
+    }
+    let reconciled =
+        reconcile_persisted_install_target_metadata(store_root, profile, &mut original)?;
+    if reconciled {
+        commit_installed_mod_records(store_root, profile, std::slice::from_ref(&original), &[])?;
     }
     if original.selected_install_target_id.as_deref() == Some(install_target_id) {
         return Ok(ModActionResult {
@@ -7341,7 +7775,11 @@ fn set_mod_install_target_impl(
     ensure_target_switch_preserves_reverse_dependencies(profile, &store.items, &original, &target)?;
     verify_managed_source_integrity(&original, Path::new(&original.archive_path))?;
 
-    let config_snapshots = snapshot_record_configs(profile, &original)?;
+    let config_snapshots = snapshot_verified_target_switch_configs(profile, &original)?;
+    let config_snapshot_paths = config_snapshots
+        .iter()
+        .map(|snapshot| snapshot.path.clone())
+        .collect::<Vec<_>>();
     let previous_target = original
         .selected_install_target_id
         .as_deref()
@@ -7379,18 +7817,52 @@ fn set_mod_install_target_impl(
     updated.selected_install_target_id = Some(target.id.clone());
     updated.plan = Some(selected_plan.clone());
     if !original.enabled {
-        commit_installed_mod_records(store_root, profile, std::slice::from_ref(&updated), &[])?;
+        let retired_configs = if config_snapshots.is_empty() {
+            None
+        } else {
+            Some(deactivate_mod_files_with_policy_and_paths(
+                store_root,
+                profile,
+                &original,
+                ModifiedFilePolicy::RetireConfigsOnly,
+                &config_snapshot_paths,
+            )?)
+        };
+        if retired_configs.is_some() {
+            updated.config_files.clear();
+        }
+        if let Err(error) =
+            commit_installed_mod_records(store_root, profile, std::slice::from_ref(&updated), &[])
+        {
+            return match recover_disabled_target_switch_after_commit_failure(store_root) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(format!("{error} {recovery_error}")),
+            };
+        }
+        let mut files_changed = retired_configs
+            .as_ref()
+            .map(|outcome| outcome.files_changed.clone())
+            .unwrap_or_default();
+        files_changed.sort_by_key(|path| normalize_filesystem_identity(path));
+        files_changed.dedup_by(|first, second| {
+            normalize_filesystem_identity(first) == normalize_filesystem_identity(second)
+        });
+        let mut warnings = dependency_warnings;
+        if let Some(retired_configs) = retired_configs {
+            warnings.extend(retired_configs.warnings);
+        }
+        if let Err(error) = recover_deactivation_transactions(store_root) {
+            warnings.push(format!(
+                "The target changed, but retired configuration cleanup is waiting for the next app start: {error}"
+            ));
+        }
+        warnings.push("The target will be used the next time this mod is enabled.".to_string());
         return Ok(ModActionResult {
             profile_id: profile.id.clone(),
             installed_mod_id: original.id,
             status: updated.last_status,
-            files_changed: Vec::new(),
-            warnings: dependency_warnings
-                .into_iter()
-                .chain(std::iter::once(
-                    "The target will be used the next time this mod is enabled.".to_string(),
-                ))
-                .collect(),
+            files_changed,
+            warnings,
         });
     }
 
@@ -7408,11 +7880,12 @@ fn set_mod_install_target_impl(
     let backup_rotation_root =
         target_switch_backup_rotation_root(store_root, &profile.id, transaction_id);
 
-    let deactivated_files = match deactivate_mod_files_with_policy(
+    let deactivated_files = match deactivate_mod_files_with_policy_and_paths(
         store_root,
         profile,
         &original,
         ModifiedFilePolicy::AllowConfigChanges,
+        &config_snapshot_paths,
     ) {
         Ok(outcome) => outcome.files_changed,
         Err(error) => {
@@ -7546,10 +8019,20 @@ fn validate_persisted_install_target(
     {
         return Err("The saved install target is no longer safe for this profile.".to_string());
     }
+    if !verified_install_target_routes(profile, &full_plan.adapter_id)
+        .iter()
+        .any(|route| route.eq_ignore_ascii_case(&target.relative_path))
+    {
+        return Err(
+            "The saved install target is not a verified directory in this game build.".to_string(),
+        );
+    }
     let target_path = safe_join(Path::new(&profile.game_path), &target.relative_path)?;
     validate_deployment_containment(Path::new(&profile.game_path), &target_path)?;
     let anchor_exists = target_path.is_dir()
         || (basename(&target.relative_path).eq_ignore_ascii_case("~mods")
+            && target_path.parent().is_some_and(Path::is_dir))
+        || (matches!(full_plan.adapter_id.as_str(), "bepinex" | "reframework")
             && target_path.parent().is_some_and(Path::is_dir));
     if !anchor_exists {
         return Err(format!(
@@ -9749,7 +10232,7 @@ fn prepare_mod_routes(
     }
 
     if supports("unreal-pak") {
-        for pak_root in find_unreal_pak_roots(game_path) {
+        for pak_root in find_unreal_pak_roots(game_path, game_id) {
             push_unique_route(&mut routes, &format!("{}/~mods", pak_root));
         }
     }
@@ -12321,6 +12804,13 @@ fn install_archive_impl_with_metadata_inner(
         effective_plan.warnings.dedup();
     }
     let mut runtime_dependency_target = None;
+    if !metadata.install_targets.is_empty() {
+        metadata.install_targets = canonicalize_supplied_install_targets(
+            profile,
+            &effective_plan,
+            &metadata.install_targets,
+        )?;
+    }
     let install_target_plan = if supplies_runtime {
         if let Some(selected_target_id) = metadata.selected_install_target_id.as_deref() {
             let selected_target = metadata
@@ -12806,14 +13296,15 @@ fn supported_adapters_for_detection(
     loader: &str,
     entries: &[ProbeEntry],
 ) -> Vec<String> {
-    let mut adapters = game_id
-        .and_then(game_definition_by_id)
-        .map(|definition| definition.supported_adapters.clone())
-        .unwrap_or_default();
+    if let Some(definition) = game_id.and_then(game_definition_by_id) {
+        return definition.supported_adapters.clone();
+    }
+
+    let mut adapters = Vec::new();
     if engine.starts_with("unity") || loader.starts_with("bepinex") {
         push_unique_string_value(&mut adapters, "bepinex");
     }
-    if !find_unreal_pak_roots(game_path).is_empty() {
+    if !find_unreal_pak_roots(game_path, game_id).is_empty() {
         push_unique_string_value(&mut adapters, "unreal-pak");
     }
     if supports_native_script_mods(game_id, entries) {
@@ -15707,10 +16198,15 @@ fn provider_plan_install_target_options(
         return derived;
     }
 
+    let verified_route_ids = verified_install_target_routes(profile, &plan.adapter_id)
+        .into_iter()
+        .map(|route| install_route_key(&plan.adapter_id, &route))
+        .collect::<HashSet<_>>();
     let mut described = described
         .into_iter()
         .filter(|target| {
             target.id == install_route_key(&plan.adapter_id, &target.relative_path)
+                && verified_route_ids.contains(&target.id)
                 && install_target_has_mappings(plan, target)
         })
         .map(|mut target| {
@@ -15807,14 +16303,11 @@ fn plan_install_target_options(
     profile: &GameProfile,
     plan: &InstallPlan,
 ) -> Vec<InstallTargetOption> {
-    let mut routes = match plan.adapter_id.as_str() {
-        "unreal-pak" => unreal_pak_target_dirs(profile),
-        "ue4ss" => ue4ss_install_targets(profile).0,
-        "script-files" => native_script_target_dirs(profile),
-        "bepinex" => bepinex_target_roots(profile),
-        "reframework" => reframework_target_roots(profile),
-        _ => Vec::new(),
-    };
+    let mut routes = verified_install_target_routes(profile, &plan.adapter_id);
+    let verified_route_ids = routes
+        .iter()
+        .map(|route| install_route_key(&plan.adapter_id, route))
+        .collect::<HashSet<_>>();
     for mapping in plan
         .mappings
         .iter()
@@ -15832,6 +16325,9 @@ fn plan_install_target_options(
             _ => None,
         };
         if let Some(derived) = derived.filter(|route| !route.is_empty()) {
+            if !verified_route_ids.contains(&install_route_key(&plan.adapter_id, &derived)) {
+                continue;
+            }
             push_unique_route(&mut routes, &derived);
         }
     }
@@ -15868,6 +16364,109 @@ fn plan_install_target_options(
     }
     sort_install_target_options(&mut options);
     options
+}
+
+fn verified_install_target_routes(profile: &GameProfile, adapter_id: &str) -> Vec<String> {
+    if !(route_adapter_compatible(profile, adapter_id) || profile.engine == "unknown") {
+        return Vec::new();
+    }
+    let mut routes = match adapter_id {
+        "unreal-pak" => unreal_pak_target_dirs(profile),
+        "ue4ss" => ue4ss_install_targets(profile).0,
+        "script-files" => native_script_target_dirs(profile),
+        "bepinex" => bepinex_target_roots(profile),
+        "reframework" => reframework_target_roots(profile),
+        _ => Vec::new(),
+    };
+    routes = routes
+        .into_iter()
+        .map(|route| normalize_archive_path(&route))
+        .filter(|route| !route.is_empty())
+        .filter(|route| {
+            let Ok(target_path) = safe_join(Path::new(&profile.game_path), route) else {
+                return false;
+            };
+            if validate_deployment_containment(Path::new(&profile.game_path), &target_path).is_err()
+            {
+                return false;
+            }
+            target_path.is_dir()
+                || (adapter_id == "unreal-pak"
+                    && basename(route).eq_ignore_ascii_case("~mods")
+                    && target_path.parent().is_some_and(Path::is_dir))
+                || (adapter_id == "script-files"
+                    && basename(route).eq_ignore_ascii_case("mods")
+                    && target_path.parent().is_some_and(Path::is_dir))
+                || (matches!(adapter_id, "bepinex" | "reframework")
+                    && target_path.parent().is_some_and(Path::is_dir))
+        })
+        .collect();
+    routes.sort_by_key(|route| route.to_ascii_lowercase());
+    routes.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+    routes
+}
+
+fn canonicalize_supplied_install_targets(
+    profile: &GameProfile,
+    plan: &InstallPlan,
+    supplied: &[InstallTargetOption],
+) -> Result<Vec<InstallTargetOption>, String> {
+    let verified_routes = verified_install_target_routes(profile, &plan.adapter_id);
+    let mut canonical = Vec::new();
+    let mut seen = HashSet::new();
+
+    for supplied_target in supplied {
+        let route = verified_routes
+            .iter()
+            .find(|route| route.eq_ignore_ascii_case(&supplied_target.relative_path))
+            .ok_or_else(|| {
+                format!(
+                    "The requested install target is not a verified directory in this game build: {}.",
+                    supplied_target.relative_path
+                )
+            })?
+            .clone();
+        let id = install_route_key(&plan.adapter_id, &route);
+        if supplied_target.id != id {
+            return Err("The requested install target failed its integrity check.".to_string());
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let scope = install_target_scope_from_path(&route);
+        let target = InstallTargetOption {
+            id,
+            label: if supplied_target.label.trim().is_empty() {
+                format!(
+                    "{} ({})",
+                    install_target_scope_label(&scope),
+                    route.replace('/', "\\")
+                )
+            } else {
+                supplied_target.label.clone()
+            },
+            relative_path: route,
+            recommended: matches!(scope.as_str(), "client" | "general"),
+            scope,
+        };
+        if !install_target_has_mappings(plan, &target) {
+            return Err(format!(
+                "The requested install target has no verified payload mapping: {}.",
+                target.relative_path
+            ));
+        }
+        validate_persisted_install_target(profile, plan, &target)?;
+        canonical.push(target);
+    }
+
+    if canonical.len() > 1 && !install_target_options_are_exclusive(plan, &canonical) {
+        return Err(
+            "The requested install targets are not mutually exclusive package variants."
+                .to_string(),
+        );
+    }
+    sort_install_target_options(&mut canonical);
+    Ok(canonical)
 }
 
 fn install_target_options_are_exclusive(
@@ -16687,18 +17286,11 @@ fn compact_route_excerpt(context: &str) -> String {
 }
 
 fn route_adapter_compatible(profile: &GameProfile, adapter_id: &str) -> bool {
-    if profile
-        .game_id
-        .as_deref()
-        .and_then(game_definition_by_id)
-        .is_some_and(|definition| {
-            definition
-                .supported_adapters
-                .iter()
-                .any(|adapter| adapter.eq_ignore_ascii_case(adapter_id))
-        })
-    {
-        return true;
+    if let Some(definition) = profile.game_id.as_deref().and_then(game_definition_by_id) {
+        return definition
+            .supported_adapters
+            .iter()
+            .any(|adapter| adapter.eq_ignore_ascii_case(adapter_id));
     }
     match adapter_id {
         "bepinex" => profile.engine.starts_with("unity") || profile.loader.starts_with("bepinex"),
@@ -16861,9 +17453,11 @@ fn apply_verified_provider_routes_to_plan(
         return;
     }
 
-    // Real game roots always outrank prose. Provider routes are useful only when
-    // the archive was verified but the game has not created any pak root yet.
-    if !find_unreal_pak_roots(Path::new(&profile.game_path)).is_empty() {
+    // Provider prose may describe which verified root a package belongs to, but
+    // it can never create install authority for a path that the game does not
+    // actually expose.
+    let canonical_routes = verified_install_target_routes(profile, &plan.adapter_id);
+    if canonical_routes.is_empty() {
         return;
     }
 
@@ -16875,6 +17469,9 @@ fn apply_verified_provider_routes_to_plan(
             validate_learned_route_shape(&route.adapter_id, &route.relative_path)
                 && route_has_safe_internal_root(profile, &route.relative_path, &route.adapter_id)
                 && archive_supports_adapter(scanned, &route.adapter_id)
+                && canonical_routes
+                    .iter()
+                    .any(|canonical| canonical.eq_ignore_ascii_case(&route.relative_path))
         })
         .map(|route| route.relative_path.clone())
         .collect::<Vec<_>>();
@@ -16964,32 +17561,9 @@ fn package_route_has_strong_evidence(
         return false;
     }
 
-    let route = match safe_join(Path::new(&profile.game_path), &candidate.relative_path) {
-        Ok(route) => route,
-        Err(_) => return false,
-    };
-    if route.is_dir() {
-        return true;
-    }
-    let first_component_exists = normalize_archive_path(&candidate.relative_path)
-        .split('/')
-        .find(|component| !component.is_empty())
-        .is_some_and(|component| Path::new(&profile.game_path).join(component).exists());
-    if first_component_exists {
-        return true;
-    }
-
-    let supported_layouts = [
-        "unreal-pak",
-        "script-files",
-        "ue4ss",
-        "bepinex",
-        "reframework",
-    ]
-    .into_iter()
-    .filter(|adapter| archive_supports_adapter(scanned, adapter))
-    .count();
-    supported_layouts == 1
+    verified_install_target_routes(profile, &candidate.adapter_id)
+        .iter()
+        .any(|route| route.eq_ignore_ascii_case(&candidate.relative_path))
 }
 
 fn archive_supports_adapter(scanned: &ScannedArchive, adapter_id: &str) -> bool {
@@ -22765,6 +23339,7 @@ enum ModifiedFilePolicy {
     Preserve,
     AllowConfigChanges,
     PreserveConfigChanges,
+    RetireConfigsOnly,
 }
 
 fn deactivate_mod_files(
@@ -22816,6 +23391,53 @@ fn deactivate_mod_files_with_policy(
     record: &InstalledModRecord,
     modified_file_policy: ModifiedFilePolicy,
 ) -> Result<DeactivationOutcome, String> {
+    deactivate_mod_files_with_policy_and_paths(
+        store_root,
+        profile,
+        record,
+        modified_file_policy,
+        &[],
+    )
+}
+
+fn deactivate_mod_files_with_policy_and_paths(
+    store_root: &Path,
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    modified_file_policy: ModifiedFilePolicy,
+    additional_config_paths: &[PathBuf],
+) -> Result<DeactivationOutcome, String> {
+    if !additional_config_paths.is_empty()
+        && !matches!(
+            modified_file_policy,
+            ModifiedFilePolicy::AllowConfigChanges | ModifiedFilePolicy::RetireConfigsOnly
+        )
+    {
+        return Err(
+            "Additional configuration paths require a configuration-aware deactivation policy."
+                .to_string(),
+        );
+    }
+    let verified_config_identities = if additional_config_paths.is_empty() {
+        HashSet::new()
+    } else {
+        verified_target_switch_config_paths(profile, record)?
+            .into_iter()
+            .map(|path| normalize_filesystem_identity(path.to_string_lossy().as_ref()))
+            .collect::<HashSet<_>>()
+    };
+    for config_path in additional_config_paths {
+        let identity = normalize_filesystem_identity(config_path.to_string_lossy().as_ref());
+        if !is_user_editable_config_file(config_path)
+            || !verified_config_identities.contains(&identity)
+        {
+            return Err(format!(
+                "Refused to retire a configuration path that is not present in this mod's verified receipt or install plan: {}",
+                config_path.to_string_lossy()
+            ));
+        }
+    }
+
     let backup_root = profile_backup_dir(store_root, &profile.id, &record.id);
     let mut validated_backups = Vec::with_capacity(record.backups_written.len());
     for backup_path in &record.backups_written {
@@ -22868,13 +23490,23 @@ fn deactivate_mod_files_with_policy(
         .join(Uuid::new_v4().to_string());
     fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
 
-    let mut affected_paths = record
+    let mut managed_path_identities = HashSet::new();
+    let mut managed_paths_to_remove = Vec::new();
+    for path in record
         .files_written
         .iter()
         .map(PathBuf::from)
-        .collect::<Vec<_>>();
+        .chain(additional_config_paths.iter().cloned())
+    {
+        let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+        if managed_path_identities.insert(identity) {
+            managed_paths_to_remove.push(path);
+        }
+    }
+    let mut affected_paths = managed_paths_to_remove.clone();
     for (_, target, _) in &validated_backups {
-        if !affected_paths.iter().any(|path| path == target) {
+        let identity = normalize_filesystem_identity(target.to_string_lossy().as_ref());
+        if managed_path_identities.insert(identity) {
             affected_paths.push(target.clone());
         }
     }
@@ -22882,7 +23514,16 @@ fn deactivate_mod_files_with_policy(
         validate_managed_record_path(store_root, profile, path)?;
     }
 
-    let mut preserved_identities = HashSet::new();
+    let mut preserved_identities = if modified_file_policy == ModifiedFilePolicy::RetireConfigsOnly
+    {
+        affected_paths
+            .iter()
+            .filter(|path| !is_user_editable_config_file(path))
+            .map(|path| normalize_filesystem_identity(path.to_string_lossy().as_ref()))
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let mut preserved_files = Vec::new();
     let mut warnings = Vec::new();
     for file_path in &record.files_written {
@@ -22890,10 +23531,13 @@ fn deactivate_mod_files_with_policy(
         if !path.exists() {
             continue;
         }
+        let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+        if preserved_identities.contains(&identity) {
+            continue;
+        }
         if modified_file_policy == ModifiedFilePolicy::PreserveConfigChanges
             && is_user_editable_config_file(&path)
         {
-            let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
             if preserved_identities.insert(identity) {
                 preserved_files.push(path.to_string_lossy().to_string());
             }
@@ -22942,6 +23586,11 @@ fn deactivate_mod_files_with_policy(
                 return Err(message);
             }
             ModifiedFilePolicy::PreserveConfigChanges => {
+                let _ = fs::remove_dir_all(&transaction_root);
+                return Err(message);
+            }
+            ModifiedFilePolicy::RetireConfigsOnly if is_user_editable_config_file(&path) => {}
+            ModifiedFilePolicy::RetireConfigsOnly => {
                 let _ = fs::remove_dir_all(&transaction_root);
                 return Err(message);
             }
@@ -23007,14 +23656,13 @@ fn deactivate_mod_files_with_policy(
 
     let operation = (|| -> Result<Vec<String>, String> {
         let mut files_changed = Vec::new();
-        for file_path in &record.files_written {
-            let path = PathBuf::from(file_path);
+        for path in &managed_paths_to_remove {
             let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
             if preserved_identities.contains(&identity) {
                 continue;
             }
             if path.exists() {
-                fs::remove_file(&path).map_err(error_to_string)?;
+                fs::remove_file(path).map_err(error_to_string)?;
                 files_changed.push(path.to_string_lossy().to_string());
             }
         }
@@ -25942,7 +26590,7 @@ fn relative_after_native_script_mods(path: &str) -> Option<String> {
 
 fn unreal_pak_target_dirs(profile: &GameProfile) -> Vec<String> {
     let game_path = Path::new(&profile.game_path);
-    let mut pak_roots = find_unreal_pak_roots(game_path);
+    let mut pak_roots = find_unreal_pak_roots(game_path, profile.game_id.as_deref());
 
     pak_roots.sort();
     pak_roots.dedup();
@@ -25964,17 +26612,13 @@ fn unreal_pak_target_dirs(profile: &GameProfile) -> Vec<String> {
             .then(left.len().cmp(&right.len()))
     });
 
-    if pak_roots.is_empty() {
-        vec!["Content/Paks/~mods".to_string()]
-    } else {
-        pak_roots
-            .into_iter()
-            .map(|root| format!("{}/~mods", root))
-            .collect()
-    }
+    pak_roots
+        .into_iter()
+        .map(|root| format!("{}/~mods", root))
+        .collect()
 }
 
-fn find_unreal_pak_roots(game_path: &Path) -> Vec<String> {
+fn find_unreal_pak_roots(game_path: &Path, game_id: Option<&str>) -> Vec<String> {
     let mut pak_roots = Vec::new();
     let mut queue = VecDeque::from([(game_path.to_path_buf(), PathBuf::new(), 0usize)]);
 
@@ -26006,7 +26650,11 @@ fn find_unreal_pak_roots(game_path: &Path) -> Vec<String> {
             let portable_path = to_portable_path(&child_relative_path);
             let lower_path = portable_path.to_lowercase();
 
-            if lower_path.ends_with("content/paks") && is_valid_unreal_game_pak_root(&lower_path) {
+            if lower_path.ends_with("content/paks")
+                && is_valid_unreal_game_pak_root(&lower_path)
+                && (unreal_pak_root_is_declared(game_id, &portable_path)
+                    || unreal_pak_root_has_native_payload(&dirent.path()))
+            {
                 pak_roots.push(portable_path.clone());
             }
 
@@ -26017,6 +26665,43 @@ fn find_unreal_pak_roots(game_path: &Path) -> Vec<String> {
     }
 
     pak_roots
+}
+
+fn unreal_pak_root_is_declared(game_id: Option<&str>, relative_path: &str) -> bool {
+    let Some(definition) = game_id.and_then(game_definition_by_id) else {
+        return false;
+    };
+    let candidate = normalize_archive_path(relative_path);
+    definition
+        .path_markers
+        .iter()
+        .chain(&definition.config_roots)
+        .map(|route| normalize_archive_path(route))
+        .map(|route| {
+            route
+                .strip_suffix("/~mods")
+                .unwrap_or(route.as_str())
+                .to_string()
+        })
+        .any(|route| route.ends_with("content/paks") && route.eq_ignore_ascii_case(&candidate))
+}
+
+fn unreal_pak_root_has_native_payload(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "pak" | "ucas" | "utoc"
+                        )
+                    })
+        })
+    })
 }
 
 fn is_valid_unreal_game_pak_root(lower_path: &str) -> bool {
@@ -26036,7 +26721,25 @@ fn should_descend_for_unreal_pak_roots(relative_path: &str, name: &str, depth: u
 
     if matches!(
         lower_name.as_str(),
-        "node_modules" | ".git" | "screenshots" | "captures" | "logs" | "crash reports"
+        "node_modules"
+            | ".git"
+            | "~mods"
+            | "mods"
+            | "plugins"
+            | "bepinex"
+            | "ue4ss"
+            | "reframework"
+            | "backup"
+            | "backups"
+            | "cache"
+            | "downloads"
+            | "staging"
+            | "temp"
+            | "tmp"
+            | "screenshots"
+            | "captures"
+            | "logs"
+            | "crash reports"
     ) {
         return false;
     }
@@ -31781,12 +32484,30 @@ mod tests {
     }
 
     #[test]
-    fn unreal_pak_target_dirs_include_every_detected_game_pak_root() {
+    fn unreal_pak_target_dirs_require_native_payload_outside_generated_mod_folders() {
         let root = temp_game_dir("pak-roots");
-        fs::create_dir_all(root.join("Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("Content/Paks/~mods")).unwrap();
         fs::create_dir_all(root.join("R5/Content/Paks")).unwrap();
         fs::create_dir_all(root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
         fs::create_dir_all(root.join("Engine/Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("Content/Paks/~mods/StaleMod/Content/Paks")).unwrap();
+        fs::write(root.join("Content/Paks/~mods/StaleMod.pak"), b"mod").unwrap();
+        fs::write(
+            root.join("Content/Paks/~mods/StaleMod/Content/Paks/NestedMod.pak"),
+            b"nested mod payload",
+        )
+        .unwrap();
+        fs::write(root.join("R5/Content/Paks/global.utoc"), b"game").unwrap();
+        fs::write(
+            root.join("R5/Builds/WindowsServer/R5/Content/Paks/pakchunk0-WindowsServer.pak"),
+            b"server",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Engine/Content/Paks/pakchunk-engine.pak"),
+            b"engine",
+        )
+        .unwrap();
 
         let profile = GameProfile {
             id: "profile-1".to_string(),
@@ -31806,11 +32527,36 @@ mod tests {
 
         let targets = unreal_pak_target_dirs(&profile);
 
-        assert!(targets.contains(&"Content/Paks/~mods".to_string()));
+        assert_eq!(targets.len(), 2);
+        assert!(!targets.contains(&"Content/Paks/~mods".to_string()));
         assert!(targets.contains(&"R5/Content/Paks/~mods".to_string()));
         assert!(targets.contains(&"R5/Builds/WindowsServer/R5/Content/Paks/~mods".to_string()));
         assert!(!targets.contains(&"Engine/Content/Paks/~mods".to_string()));
+        assert!(!targets
+            .iter()
+            .any(|target| target.contains("StaleMod/Content/Paks")));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn known_game_definition_routes_are_valid_without_guessing_sibling_pak_folders() {
+        let root = temp_game_dir("declared-pak-roots");
+        fs::create_dir_all(root.join("Content/Paks/~mods")).unwrap();
+        fs::create_dir_all(root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+
+        let targets = unreal_pak_target_dirs(&profile);
+
+        assert_eq!(
+            targets,
+            vec![
+                "R5/Content/Paks/~mods".to_string(),
+                "R5/Builds/WindowsServer/R5/Content/Paks/~mods".to_string(),
+            ]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -32194,6 +32940,11 @@ mod tests {
         let root = temp_game_dir("mixed-ue4ss-pak");
         fs::create_dir_all(root.join("FutureGame/Binaries/Win64/ue4ss/Mods")).unwrap();
         fs::create_dir_all(root.join("FutureGame/Content/Paks")).unwrap();
+        fs::write(
+            root.join("FutureGame/Content/Paks/FutureGame-Windows.pak"),
+            b"base game payload",
+        )
+        .unwrap();
         let mut profile = test_profile(
             "future-unreal-game",
             "Future Unreal Game",
@@ -32357,7 +33108,8 @@ mod tests {
     fn selected_pak_mod_instructions_prepare_verified_plan_without_creating_routes() {
         let game_root = temp_game_dir("selected-pak-routes-game");
         let store_root = temp_game_dir("selected-pak-routes-store");
-        fs::create_dir_all(game_root.join("R5")).unwrap();
+        fs::create_dir_all(game_root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(game_root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
         fs::create_dir_all(&store_root).unwrap();
         let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
         profile.game_path = game_root.to_string_lossy().to_string();
@@ -34636,7 +35388,10 @@ mod tests {
 
     #[test]
     fn witchspire_blocks_windrose_pak_packages_even_though_both_are_unreal() {
-        let profile = test_profile("witchspire", "Witchspire", "unreal", "none");
+        let root = temp_game_dir("witchspire-pak-compatibility");
+        fs::create_dir_all(root.join("Hercules/Content/Paks")).unwrap();
+        let mut profile = test_profile("witchspire", "Witchspire", "unreal", "none");
+        profile.game_path = root.to_string_lossy().to_string();
         let analysis = analyze_scanned_archive(scanned_package("WindroseMod.pak", None), &profile);
 
         assert!(analysis.recommended_plan.is_none());
@@ -34644,6 +35399,8 @@ mod tests {
         assert!(analysis.compatibility.reason.contains("Witchspire"));
         assert!(analysis.compatibility.reason.contains("native script mods"));
         assert_eq!(analysis.package_identity.mod_types, vec!["unreal-pak"]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -34663,7 +35420,10 @@ mod tests {
 
     #[test]
     fn windrose_accepts_unreal_pak_packages() {
-        let profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        let root = temp_game_dir("windrose-pak-compatibility");
+        fs::create_dir_all(root.join("R5/Content/Paks")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
         let analysis = analyze_scanned_archive(scanned_package("FastTravel.pak", None), &profile);
 
         assert_eq!(analysis.compatibility.status, "compatible");
@@ -34674,6 +35434,8 @@ mod tests {
                 .map(|plan| plan.adapter_id.as_str()),
             Some("unreal-pak")
         );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -34731,9 +35493,14 @@ mod tests {
         assert!(analysis
             .compatibility
             .reason
-            .contains("safe mod installation route"));
+            .contains("verified automatic install route"));
 
         fs::create_dir_all(root.join("Project/Content/Paks")).unwrap();
+        fs::write(
+            root.join("Project/Content/Paks/Project-Windows.pak"),
+            b"base game payload",
+        )
+        .unwrap();
         let verified = analyze_scanned_archive(scanned_package("UnknownMod.pak", None), &profile);
         assert_eq!(verified.compatibility.status, "compatible");
         assert_eq!(
@@ -35756,6 +36523,16 @@ mod tests {
         let bundle_path = root.join("Windrose-share.uniloader-profile");
         fs::create_dir_all(source_game.join("R5/Content/Paks/~mods")).unwrap();
         fs::create_dir_all(target_game.join("R5/Content/Paks/~mods")).unwrap();
+        fs::write(
+            source_game.join("R5/Content/Paks/Windrose-Windows.pak"),
+            b"source base game payload",
+        )
+        .unwrap();
+        fs::write(
+            target_game.join("R5/Content/Paks/Windrose-Windows.pak"),
+            b"target base game payload",
+        )
+        .unwrap();
         fs::create_dir_all(runtime_source.as_path()).unwrap();
         fs::create_dir_all(mod_source.as_path()).unwrap();
         fs::write(runtime_source.join("UE4SS.dll"), b"shared runtime").unwrap();
@@ -37126,7 +37903,12 @@ mod tests {
         assert!(!package_route_has_strong_evidence(
             &profile, &ambiguous, &candidate
         ));
-        fs::create_dir_all(game_root.join("R5")).unwrap();
+        fs::create_dir_all(game_root.join("R5/Content/Paks")).unwrap();
+        fs::write(
+            game_root.join("R5/Content/Paks/Future-Windows.pak"),
+            b"base game payload",
+        )
+        .unwrap();
         assert!(package_route_has_strong_evidence(
             &profile, &ambiguous, &candidate
         ));
@@ -38435,6 +39217,846 @@ mod tests {
             disabled.selected_install_target_id.as_deref(),
             Some(client_target.as_str())
         );
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn migrated_legacy_multi_location_install_is_promoted_and_can_choose_one_target() {
+        let store_root = temp_game_dir("legacy-target-promotion");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        let client_file = game_root.join(client_route).join("Legacy.pak");
+        let server_file = game_root.join(server_route).join("Legacy.pak");
+        fs::create_dir_all(client_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(server_file.parent().unwrap()).unwrap();
+        fs::write(&client_file, b"legacy target payload").unwrap();
+        fs::write(&server_file, b"legacy target payload").unwrap();
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let install_id = Uuid::new_v4().to_string();
+        let managed_source =
+            profile_package_dir(&store_root, &profile.id, &install_id).join("source");
+        fs::create_dir_all(&managed_source).unwrap();
+        fs::write(managed_source.join("Legacy.pak"), b"legacy target payload").unwrap();
+        let stale_source = store_root
+            .join(LEGACY_APP_IDENTIFIER)
+            .join("profiles")
+            .join(&profile.id)
+            .join("packages")
+            .join(&install_id)
+            .join("source");
+        let legacy_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Legacy multi-location pak install.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Legacy.pak",
+                    "game",
+                    &format!("{client_route}/Legacy.pak"),
+                    "Legacy client copy.",
+                ),
+                mapping(
+                    "Legacy.pak",
+                    "game",
+                    &format!("{server_route}/Legacy.pak"),
+                    "Legacy server copy.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let mut legacy = InstalledModRecord {
+            id: install_id.clone(),
+            profile_id: profile.id.clone(),
+            archive_path: stale_source.to_string_lossy().to_string(),
+            archive_name: "Legacy Mod".to_string(),
+            display_name: Some("Legacy Mod".to_string()),
+            package_id: None,
+            dependency_string: None,
+            package_provider: None,
+            package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
+            source_archive_sha256: None,
+            icon_url: None,
+            adapter_id: "unreal-pak".to_string(),
+            summary: legacy_plan.summary.clone(),
+            installed_at: now_string(),
+            files_written: vec![
+                client_file.to_string_lossy().to_string(),
+                server_file.to_string_lossy().to_string(),
+            ],
+            backups_written: Vec::new(),
+            written_file_hashes: HashMap::new(),
+            dependencies: Vec::new(),
+            config_files: Vec::new(),
+            runtime_id: None,
+            externally_managed: false,
+            enabled: true,
+            last_status: "installed".to_string(),
+            plan: Some(legacy_plan),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
+        };
+
+        assert!(repair_legacy_managed_source_path(&store_root, &mut legacy).unwrap());
+        assert_eq!(Path::new(&legacy.archive_path), managed_source);
+        assert!(
+            promote_legacy_install_target_metadata(&store_root, &profile, &mut legacy).unwrap()
+        );
+        assert_eq!(legacy.install_targets.len(), 2);
+        assert!(legacy.install_target_plan.is_some());
+        assert!(legacy.selected_install_target_id.is_none());
+        assert!(legacy.source_archive_sha256.is_some());
+
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![legacy.clone()],
+            },
+        )
+        .unwrap();
+        let server_target = legacy
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "hosted-server")
+            .unwrap()
+            .id
+            .clone();
+
+        set_mod_install_target_impl(&store_root, &profile, &install_id, &server_target).unwrap();
+
+        assert!(!client_file.exists());
+        assert_eq!(fs::read(&server_file).unwrap(), b"legacy target payload");
+        let switched = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == install_id)
+            .unwrap();
+        assert_eq!(
+            switched.selected_install_target_id.as_deref(),
+            Some(server_target.as_str())
+        );
+        assert_eq!(switched.files_written.len(), 1);
+        assert_eq!(switched.plan.as_ref().unwrap().mappings.len(), 1);
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn persisted_unreal_targets_drop_unverified_routes_without_changing_the_receipt() {
+        let store_root = temp_game_dir("persisted-target-reconciliation");
+        let game_root = store_root.join("game");
+        let stale_route = "Content/Paks/~mods";
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join(stale_route)).unwrap();
+        fs::create_dir_all(game_root.join(client_route)).unwrap();
+        fs::create_dir_all(game_root.join(server_route)).unwrap();
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let install_id = Uuid::new_v4().to_string();
+        let managed_source =
+            profile_package_dir(&store_root, &profile.id, &install_id).join("source");
+        fs::create_dir_all(&managed_source).unwrap();
+        fs::write(managed_source.join("Example.pak"), b"managed payload").unwrap();
+        let server_file = game_root.join(server_route).join("Example.pak");
+        fs::write(&server_file, b"managed payload").unwrap();
+        let server_config = game_root.join(server_route).join("Example.ini");
+        fs::write(&server_config, b"value=user\n").unwrap();
+
+        let stale_full_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Stale three-route plan.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{stale_route}/Example.pak"),
+                    "Stale generic route.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client route.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Server route.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let actual_plan = InstallPlan {
+            mappings: vec![mapping(
+                "Example.pak",
+                "game",
+                &format!("{server_route}/Example.pak"),
+                "Installed server route.",
+            )],
+            summary: "Installed server route.".to_string(),
+            ..stale_full_plan.clone()
+        };
+        let stale_target = test_install_target("unreal-pak", stale_route, "client");
+        let client_target = test_install_target("unreal-pak", client_route, "client");
+        let server_target = test_install_target("unreal-pak", server_route, "hosted-server");
+        let mut record = test_installed_record(&profile.id, &install_id, None, true);
+        record.archive_path = managed_source.to_string_lossy().to_string();
+        record.archive_name = "Example".to_string();
+        record.adapter_id = "unreal-pak".to_string();
+        record.source_archive_sha256 = Some(sha256_managed_source(&managed_source).unwrap());
+        record.plan = Some(actual_plan);
+        record.install_target_plan = Some(stale_full_plan);
+        record.install_targets = vec![
+            stale_target.clone(),
+            client_target.clone(),
+            server_target.clone(),
+        ];
+        record.selected_install_target_id = Some(server_target.id.clone());
+        record.files_written = vec![server_file.to_string_lossy().to_string()];
+        record.backups_written = vec!["receipt-backup".to_string()];
+        record.written_file_hashes.insert(
+            server_file.to_string_lossy().to_string(),
+            sha256_file(&server_file).unwrap(),
+        );
+        record.config_files = vec![server_config.to_string_lossy().to_string()];
+
+        let actual_plan_before = serialize_json_line(record.plan.as_ref().unwrap()).unwrap();
+        let files_before = record.files_written.clone();
+        let backups_before = record.backups_written.clone();
+        let hashes_before = record.written_file_hashes.clone();
+        let configs_before = record.config_files.clone();
+
+        let mut stale_selected_record = record.clone();
+        stale_selected_record.selected_install_target_id = Some(stale_target.id.clone());
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![stale_selected_record],
+            },
+        )
+        .unwrap();
+        let stale_target_error =
+            set_mod_install_target_impl(&store_root, &profile, &install_id, &stale_target.id)
+                .unwrap_err();
+        assert!(stale_target_error.contains("no longer available"));
+        assert!(server_file.is_file());
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        assert!(!game_root.join(client_route).join("Example.pak").exists());
+        assert!(!game_root.join(stale_route).join("Example.pak").exists());
+        let healed = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|saved| saved.id == install_id)
+            .unwrap();
+        assert_eq!(healed.install_targets.len(), 2);
+        assert!(healed
+            .install_targets
+            .iter()
+            .all(|target| target.id != stale_target.id));
+        assert_eq!(
+            healed.selected_install_target_id.as_deref(),
+            Some(server_target.id.as_str())
+        );
+        assert_eq!(
+            serialize_json_line(healed.plan.as_ref().unwrap()).unwrap(),
+            actual_plan_before
+        );
+        assert_eq!(healed.files_written, files_before);
+        assert_eq!(healed.backups_written, backups_before);
+        assert_eq!(healed.written_file_hashes, hashes_before);
+        assert_eq!(healed.config_files, configs_before);
+
+        assert!(
+            reconcile_persisted_install_target_metadata(&store_root, &profile, &mut record)
+                .unwrap()
+        );
+        assert_eq!(record.install_targets.len(), 2);
+        assert!(record
+            .install_targets
+            .iter()
+            .all(|target| target.id != stale_target.id));
+        assert!(record
+            .install_targets
+            .iter()
+            .any(|target| { target.id == client_target.id }));
+        assert!(record
+            .install_targets
+            .iter()
+            .any(|target| { target.id == server_target.id }));
+        assert_eq!(
+            record.selected_install_target_id.as_deref(),
+            Some(server_target.id.as_str())
+        );
+        assert!(record
+            .install_target_plan
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .all(|mapping| !mapping.target_relative_path.starts_with(stale_route)));
+        assert_eq!(
+            serialize_json_line(record.plan.as_ref().unwrap()).unwrap(),
+            actual_plan_before
+        );
+        assert_eq!(record.files_written, files_before);
+        assert_eq!(record.backups_written, backups_before);
+        assert_eq!(record.written_file_hashes, hashes_before);
+        assert_eq!(record.config_files, configs_before);
+        assert!(
+            !reconcile_persisted_install_target_metadata(&store_root, &profile, &mut record)
+                .unwrap()
+        );
+
+        let corrupted_client_target = record
+            .install_targets
+            .iter_mut()
+            .find(|target| target.id == client_target.id)
+            .unwrap();
+        corrupted_client_target.label = "Random folder".to_string();
+        corrupted_client_target.relative_path = stale_route.to_string();
+        corrupted_client_target.scope = "hosted-server".to_string();
+        corrupted_client_target.recommended = false;
+
+        assert!(
+            reconcile_persisted_install_target_metadata(&store_root, &profile, &mut record)
+                .unwrap()
+        );
+        let recanonicalized_client_target = record
+            .install_targets
+            .iter()
+            .find(|target| target.id == client_target.id)
+            .unwrap();
+        assert_eq!(recanonicalized_client_target.relative_path, client_route);
+        assert_eq!(recanonicalized_client_target.scope, "client");
+        assert!(recanonicalized_client_target.recommended);
+        assert_ne!(recanonicalized_client_target.label, "Random folder");
+        assert_eq!(
+            serialize_json_line(record.plan.as_ref().unwrap()).unwrap(),
+            actual_plan_before
+        );
+        assert_eq!(record.files_written, files_before);
+        assert_eq!(record.backups_written, backups_before);
+        assert_eq!(record.written_file_hashes, hashes_before);
+        assert_eq!(record.config_files, configs_before);
+
+        record.install_targets[0].relative_path = stale_route.to_string();
+        record.archive_path = store_root
+            .join("missing-managed-source.zip")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            reconcile_persisted_install_target_metadata(&store_root, &profile, &mut record)
+                .unwrap()
+        );
+        assert!(record.install_target_plan.is_none());
+        assert!(record.install_targets.is_empty());
+        assert!(record.selected_install_target_id.is_none());
+        assert_eq!(
+            serialize_json_line(record.plan.as_ref().unwrap()).unwrap(),
+            actual_plan_before
+        );
+        assert_eq!(record.files_written, files_before);
+        assert_eq!(record.backups_written, backups_before);
+        assert_eq!(record.written_file_hashes, hashes_before);
+        assert_eq!(record.config_files, configs_before);
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn legacy_runtime_package_is_not_promoted_to_a_selectable_target() {
+        let store_root = temp_game_dir("legacy-runtime-target-exclusion");
+        let game_root = store_root.join("game");
+        let client_root = "R5/Binaries/Win64";
+        let server_root = "R5/Builds/WindowsServer/R5/Binaries/Win64";
+        touch(
+            &game_root,
+            &format!("{client_root}/Windrose-Win64-Shipping.exe"),
+        );
+        touch(
+            &game_root,
+            &format!("{server_root}/WindroseServer-Win64-Shipping.exe"),
+        );
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+
+        let install_id = Uuid::new_v4().to_string();
+        let managed_source =
+            profile_package_dir(&store_root, &profile.id, &install_id).join("source");
+        fs::create_dir_all(&managed_source).unwrap();
+        fs::write(managed_source.join("UE4SS.dll"), b"runtime core").unwrap();
+        fs::write(managed_source.join("dwmapi.dll"), b"runtime bootstrap").unwrap();
+        let analysis = analyze_scanned_archive(
+            scan_import_source(&store_root, &managed_source).unwrap(),
+            &profile,
+        );
+        let full_plan = analysis.recommended_plan.unwrap();
+        assert_eq!(
+            runtime_supplied_by_plan(&profile, &full_plan).as_deref(),
+            Some("ue4ss")
+        );
+        assert_eq!(plan_install_target_options(&profile, &full_plan).len(), 2);
+
+        let mut legacy = test_installed_record(&profile.id, &install_id, None, true);
+        legacy.archive_path = managed_source.to_string_lossy().to_string();
+        legacy.archive_name = "UE4SS".to_string();
+        legacy.adapter_id = full_plan.adapter_id.clone();
+        legacy.summary = full_plan.summary.clone();
+        legacy.plan = Some(full_plan);
+        legacy.source_archive_sha256 = Some(sha256_managed_source(&managed_source).unwrap());
+
+        assert!(
+            !promote_legacy_install_target_metadata(&store_root, &profile, &mut legacy).unwrap()
+        );
+        assert!(legacy.install_target_plan.is_none());
+        assert!(legacy.install_targets.is_empty());
+        assert!(legacy.selected_install_target_id.is_none());
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn legacy_source_repair_requires_the_exact_managed_package_suffix() {
+        let store_root = temp_game_dir("legacy-source-repair-shape");
+        let profile_id = "profile-id";
+        let install_id = Uuid::new_v4().to_string();
+        let managed_source =
+            profile_package_dir(&store_root, profile_id, &install_id).join("source");
+        fs::create_dir_all(&managed_source).unwrap();
+        fs::write(managed_source.join("Example.pak"), b"managed source").unwrap();
+
+        let mut record = test_installed_record(profile_id, &install_id, None, true);
+        let mismatched_legacy_path = store_root
+            .join(LEGACY_APP_IDENTIFIER)
+            .join("profiles")
+            .join("different-profile")
+            .join("packages")
+            .join(&install_id)
+            .join("source");
+        record.archive_path = mismatched_legacy_path.to_string_lossy().to_string();
+
+        assert!(!repair_legacy_managed_source_path(&store_root, &mut record).unwrap());
+        assert_eq!(
+            record.archive_path,
+            mismatched_legacy_path.to_string_lossy()
+        );
+        assert!(record.source_archive_sha256.is_none());
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn first_legacy_target_choice_rejects_divergent_config_copies() {
+        let store_root = temp_game_dir("legacy-target-config-conflict");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        let client_config = game_root.join(client_route).join("Settings.ini");
+        let server_config = game_root.join(server_route).join("Settings.ini");
+        fs::create_dir_all(client_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(server_config.parent().unwrap()).unwrap();
+        fs::write(&client_config, b"value=client\n").unwrap();
+        fs::write(&server_config, b"value=server\n").unwrap();
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let full_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Legacy target config conflict.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Settings.ini",
+                    "game",
+                    &format!("{client_route}/Settings.ini"),
+                    "Client config.",
+                ),
+                mapping(
+                    "Settings.ini",
+                    "game",
+                    &format!("{server_route}/Settings.ini"),
+                    "Server config.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let install_targets = plan_install_target_options(&profile, &full_plan);
+        let server_target = install_targets
+            .iter()
+            .find(|target| target.scope == "hosted-server")
+            .unwrap()
+            .clone();
+        let mut original =
+            test_installed_record(&profile.id, &Uuid::new_v4().to_string(), None, true);
+        original.adapter_id = full_plan.adapter_id.clone();
+        original.plan = Some(full_plan.clone());
+        original.install_target_plan = Some(full_plan.clone());
+        original.install_targets = install_targets;
+        original.files_written = vec![
+            client_config.to_string_lossy().to_string(),
+            server_config.to_string_lossy().to_string(),
+        ];
+
+        let mut selected_plan = full_plan;
+        apply_install_target_option(&mut selected_plan, &server_target).unwrap();
+        let error = apply_config_snapshots_to_target_plan(
+            &profile,
+            &original,
+            None,
+            &server_target,
+            &mut selected_plan,
+            &[
+                ConfigSnapshot {
+                    path: client_config.clone(),
+                    bytes: b"value=client\n".to_vec(),
+                },
+                ConfigSnapshot {
+                    path: server_config.clone(),
+                    bytes: b"value=server\n".to_vec(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("different saved settings"));
+        assert_eq!(fs::read(&client_config).unwrap(), b"value=client\n");
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=server\n");
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn disabled_target_switch_retires_old_config_and_deploys_it_to_the_new_target() {
+        let store_root = temp_game_dir("disabled-target-config-move");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join(client_route)).unwrap();
+        fs::create_dir_all(game_root.join(server_route)).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let source = store_root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Example.pak"), b"target payload").unwrap();
+        fs::write(source.join("Settings.ini"), b"value=default\n").unwrap();
+        let full_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Configurable target fixture.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client payload.",
+                ),
+                mapping(
+                    "Settings.ini",
+                    "game",
+                    &format!("{client_route}/Settings.ini"),
+                    "Client config.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Server payload.",
+                ),
+                mapping(
+                    "Settings.ini",
+                    "game",
+                    &format!("{server_route}/Settings.ini"),
+                    "Server config.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let installed = install_archive_impl(
+            &store_root,
+            &profile,
+            source.to_string_lossy().as_ref(),
+            Some("Configurable target"),
+            None,
+            &full_plan,
+        )
+        .unwrap();
+        let client_config = game_root.join(client_route).join("Settings.ini");
+        let client_pak = game_root.join(client_route).join("Example.pak");
+        let server_config = game_root.join(server_route).join("Settings.ini");
+        let server_pak = game_root.join(server_route).join("Example.pak");
+        let unrelated_config = game_root.join(client_route).join("ConfigurableTarget.ini");
+        let unrelated_server_config = game_root.join(server_route).join("ConfigurableTarget.ini");
+        fs::write(&client_config, b"value=user\n").unwrap();
+        fs::write(&server_config, b"value=user\n").unwrap();
+        fs::write(&unrelated_config, b"owner=other-mod\n").unwrap();
+
+        let installed_record = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        assert!(config_file_matches_record(
+            &profile,
+            &installed_record,
+            unrelated_config.to_string_lossy().as_ref()
+        ));
+        deactivate_mod_files_with_policy(
+            &store_root,
+            &profile,
+            &installed_record,
+            ModifiedFilePolicy::PreserveConfigChanges,
+        )
+        .unwrap();
+        let mut disabled = installed_record.clone();
+        disabled.enabled = false;
+        disabled.last_status = "disabled".to_string();
+        let client_config_identity =
+            normalize_filesystem_identity(client_config.to_string_lossy().as_ref());
+        disabled
+            .files_written
+            .retain(|path| normalize_filesystem_identity(path) != client_config_identity);
+        disabled
+            .written_file_hashes
+            .retain(|path, _| normalize_filesystem_identity(path) != client_config_identity);
+        assert!(disabled
+            .config_files
+            .iter()
+            .any(|path| { normalize_filesystem_identity(path) == client_config_identity }));
+        commit_installed_mod_records(&store_root, &profile, std::slice::from_ref(&disabled), &[])
+            .unwrap();
+        assert!(!client_pak.exists());
+        assert_eq!(fs::read(&client_config).unwrap(), b"value=user\n");
+
+        let server_target = disabled
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "hosted-server")
+            .unwrap()
+            .id
+            .clone();
+        set_mod_install_target_impl(
+            &store_root,
+            &profile,
+            &installed.installed_mod_id,
+            &server_target,
+        )
+        .unwrap();
+
+        assert!(!client_config.exists());
+        assert!(!client_pak.exists());
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        assert!(!server_pak.exists());
+        assert_eq!(fs::read(&unrelated_config).unwrap(), b"owner=other-mod\n");
+        assert!(!unrelated_server_config.exists());
+        let switched = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        assert!(!switched.enabled);
+        assert_eq!(
+            switched.selected_install_target_id.as_deref(),
+            Some(server_target.as_str())
+        );
+        assert!(switched.config_files.is_empty());
+        assert!(switched
+            .plan
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .any(|mapping| {
+                mapping.target_relative_path.ends_with("Settings.ini")
+                    && mapping.generated_content.as_deref() == Some("value=user\n")
+            }));
+
+        let mut enabling = switched.clone();
+        let selected_plan = enabling.plan.clone().unwrap();
+        let archive_path = enabling.archive_path.clone();
+        deploy_mod_files(
+            &store_root,
+            &profile,
+            &enabling.id.clone(),
+            &archive_path,
+            &selected_plan,
+            &mut enabling,
+        )
+        .unwrap();
+        assert!(!client_config.exists());
+        assert!(!client_pak.exists());
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        assert_eq!(fs::read(&server_pak).unwrap(), b"target payload");
+        assert_eq!(fs::read(&unrelated_config).unwrap(), b"owner=other-mod\n");
+        assert!(!unrelated_server_config.exists());
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn disabled_target_commit_recovery_keeps_config_journal_until_store_rollback_succeeds() {
+        let store_root = temp_game_dir("disabled-target-commit-recovery-order");
+        let game_root = store_root.join("game");
+        let config_relative_path = "Config/Settings.ini";
+        let config_path = game_root.join(config_relative_path);
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let install_id = Uuid::new_v4().to_string();
+        let mut original = test_installed_record(&profile.id, &install_id, None, false);
+        original.selected_install_target_id = Some("client-target".to_string());
+        original.config_files = vec![config_path.to_string_lossy().to_string()];
+        let mut partially_committed = original.clone();
+        partially_committed.selected_install_target_id = Some("server-target".to_string());
+        let old_store = StoreFile {
+            version: 1,
+            items: vec![original.clone()],
+        };
+        let new_store = StoreFile {
+            version: 1,
+            items: vec![partially_committed],
+        };
+        write_store(&installed_mods_path(&store_root), &new_store).unwrap();
+
+        let store_transaction_root =
+            store_transactions_dir(&store_root).join("prepared-target-switch");
+        fs::create_dir_all(&store_transaction_root).unwrap();
+        fs::write(
+            store_transaction_root.join("new-0.bin"),
+            serialize_json_line(&new_store).unwrap(),
+        )
+        .unwrap();
+        write_store_transaction_manifest_unlocked(
+            &store_transaction_root.join("manifest.json"),
+            &StoreTransactionManifest {
+                version: STORE_TRANSACTION_VERSION,
+                id: "prepared-target-switch".to_string(),
+                phase: StoreTransactionPhase::Prepared,
+                entries: vec![StoreTransactionEntry {
+                    target_relative_path: "installed-mods.json".to_string(),
+                    new_file: "new-0.bin".to_string(),
+                    old_file: Some("old-0.bin".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        let deactivation_id = Uuid::new_v4().to_string();
+        let deactivation_root = profile_dir(&store_root, &profile.id)
+            .join("transactions")
+            .join(&deactivation_id);
+        fs::create_dir_all(&deactivation_root).unwrap();
+        fs::write(deactivation_root.join("0.bin"), b"value=user\n").unwrap();
+        write_deactivation_journal(
+            &deactivation_root,
+            &DeactivationJournal {
+                version: DEACTIVATION_JOURNAL_VERSION,
+                id: deactivation_id,
+                profile_id: profile.id.clone(),
+                record_id: original.id.clone(),
+                game_path: profile.game_path.clone(),
+                original_record: original.clone(),
+                entries: vec![DeactivationJournalEntry {
+                    target_root: "game".to_string(),
+                    target_relative_path: config_relative_path.to_string(),
+                    snapshot_file: Some("0.bin".to_string()),
+                    expected_deactivated_sha256: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let error = recover_disabled_target_switch_after_commit_failure(&store_root).unwrap_err();
+        assert!(error.contains("Store recovery is still pending"));
+        assert!(store_transaction_root.exists());
+        assert!(deactivation_root.exists());
+        assert!(!config_path.exists());
+
+        fs::write(
+            store_transaction_root.join("old-0.bin"),
+            serialize_json_line(&old_store).unwrap(),
+        )
+        .unwrap();
+        recover_disabled_target_switch_after_commit_failure(&store_root).unwrap();
+
+        let recovered =
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert_eq!(
+            recovered.items[0].selected_install_target_id.as_deref(),
+            Some("client-target")
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), b"value=user\n");
+        assert!(!store_transaction_root.exists());
+        assert!(!deactivation_root.exists());
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn loader_target_validation_allows_dependency_provisioning_below_an_existing_root() {
+        let store_root = temp_game_dir("loader-target-provisioning");
+        let game_root = store_root.join("game");
+        fs::create_dir_all(game_root.join("Server/Server_Data")).unwrap();
+        touch(&game_root, "Server/Server.exe");
+        let mut profile = test_profile("unity-game", "Unity Game", "unity", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let target = test_install_target("bepinex", "Server/BepInEx", "hosted-server");
+        let plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: "Server BepInEx plugin.".to_string(),
+            mappings: vec![mapping(
+                "Example.dll",
+                "game",
+                "Server/BepInEx/plugins/Example.dll",
+                "Server plugin.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        assert!(!game_root.join("Server/BepInEx").exists());
+        validate_persisted_install_target(&profile, &plan, &target).unwrap();
         let _ = fs::remove_dir_all(store_root);
     }
 

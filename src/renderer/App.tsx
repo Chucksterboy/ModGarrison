@@ -38,6 +38,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState
@@ -5589,11 +5590,7 @@ export function selectedInstallTargetOption(
   mod: Pick<InstalledModRecord, "installTargets" | "selectedInstallTargetId">
 ): InstallTargetOption | undefined {
   const targets = mod.installTargets ?? [];
-  return (
-    targets.find((target) => target.id === mod.selectedInstallTargetId) ??
-    targets.find((target) => target.recommended) ??
-    targets[0]
-  );
+  return targets.find((target) => target.id === mod.selectedInstallTargetId);
 }
 
 interface InstallTargetPickerProps {
@@ -5613,7 +5610,7 @@ export function InstallTargetPicker({
   selectedTarget,
   targets
 }: InstallTargetPickerProps) {
-  if (targets.length < 2 || !selectedTarget) {
+  if (targets.length < 2) {
     return null;
   }
 
@@ -5623,7 +5620,11 @@ export function InstallTargetPicker({
     <label
       aria-busy={busy}
       className={busy ? "vault-mod-target-picker changing" : "vault-mod-target-picker"}
-      title={`${selectedTarget.label} — ${selectedTarget.relativePath}`}
+      title={
+        selectedTarget
+          ? `${selectedTarget.label} — ${selectedTarget.relativePath}`
+          : `Choose an install target for ${modName}`
+      }
     >
       {busy ? <RefreshCw aria-hidden="true" className="spin-icon" size={11} /> : <FolderOpen aria-hidden="true" size={11} />}
       <span>Target</span>
@@ -5631,12 +5632,13 @@ export function InstallTargetPicker({
         aria-label={`Install target for ${modName}`}
         disabled={unavailable}
         onChange={(event) => {
-          if (event.target.value !== selectedTarget.id) {
+          if (event.target.value !== selectedTarget?.id) {
             onChange(event.target.value);
           }
         }}
-        value={selectedTarget.id}
+        value={selectedTarget?.id ?? ""}
       >
+        {!selectedTarget ? <option disabled value="">Choose target</option> : null}
         {targets.map((target) => (
           <option key={target.id} value={target.id}>
             {target.label}
@@ -5644,6 +5646,104 @@ export function InstallTargetPicker({
         ))}
       </select>
     </label>
+  );
+}
+
+interface InstallTargetChoicesProps {
+  busy: boolean;
+  disabled?: boolean;
+  modName: string;
+  onChange(installTargetId: string): void;
+  selectedTarget?: InstallTargetOption;
+  targets: InstallTargetOption[];
+}
+
+export function InstallTargetChoices({
+  busy,
+  disabled = false,
+  modName,
+  onChange,
+  selectedTarget,
+  targets
+}: InstallTargetChoicesProps) {
+  const unavailable = busy || disabled;
+  const groupName = `install-target-${useId()}`;
+
+  return (
+    <>
+      {!selectedTarget ? (
+        <p className="vault-mod-target-note">
+          This mod is in multiple locations. Choose one target to remove the other managed copies.
+        </p>
+      ) : null}
+      <div
+        aria-busy={busy}
+        aria-label={`Install targets for ${modName}`}
+        className="vault-mod-targets"
+        role="radiogroup"
+      >
+        {targets.map((target) => {
+          const selected = target.id === selectedTarget?.id;
+          return (
+            <label
+              className={`vault-mod-target${selected ? " selected" : ""}${unavailable ? " unavailable" : ""}`}
+              key={target.id}
+              title={
+                selected
+                  ? `${target.label} is the installed target`
+                  : `Move ${modName} to ${target.label}`
+              }
+            >
+              <input
+                checked={selected}
+                className="vault-mod-target-input"
+                disabled={unavailable}
+                name={groupName}
+                onChange={() => {
+                  if (!selected) {
+                    onChange(target.id);
+                  }
+                }}
+                type="radio"
+                value={target.id}
+              />
+              {selected ? <CheckCircle2 aria-hidden="true" size={17} /> : <FolderOpen aria-hidden="true" size={17} />}
+              <span>
+                <strong>{target.label}</strong>
+                <small>{target.relativePath}</small>
+              </span>
+              <b>{selected ? "Installed" : target.recommended ? "Recommended" : "Select"}</b>
+            </label>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+export function LegacyInstallTargetChoices({
+  targets
+}: {
+  targets: InstalledModTarget[];
+}) {
+  return (
+    <>
+      <p className="vault-mod-target-note legacy">
+        This legacy install is in multiple locations. Target switching needs an automatic upgrade or reinstall.
+      </p>
+      <div className="vault-mod-targets">
+        {targets.map((target) => (
+          <div className="vault-mod-target legacy" key={target.id}>
+            <CheckCircle2 aria-hidden="true" size={17} />
+            <span>
+              <strong>{target.label}</strong>
+              <small>{target.path}</small>
+            </span>
+            <b>Installed</b>
+          </div>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -6183,40 +6283,19 @@ function ModCard({
           {installTargets.length > 1 ? (
             <section className="vault-mod-detail-section">
               <p className="vault-mod-detail-label">Install targets</p>
-              <div className="vault-mod-targets">
-                {installTargets.map((target) => {
-                  const selected = target.id === selectedInstallTarget?.id;
-                  return (
-                    <div
-                      className={selected ? "vault-mod-target selected" : "vault-mod-target"}
-                      key={target.id}
-                    >
-                      {selected ? <CheckCircle2 size={17} /> : <FolderOpen size={17} />}
-                      <span>
-                        <strong>{target.label}</strong>
-                        <small>{target.relativePath}</small>
-                      </span>
-                      <b>{selected ? "Active" : "Available"}</b>
-                    </div>
-                  );
-                })}
-              </div>
+              <InstallTargetChoices
+                busy={changingInstallTarget}
+                disabled={installTargetChangePending || !canChangeInstallTarget}
+                modName={modName}
+                onChange={onChangeInstallTarget}
+                selectedTarget={selectedInstallTarget}
+                targets={installTargets}
+              />
             </section>
           ) : legacyTargets.length > 1 ? (
             <section className="vault-mod-detail-section">
               <p className="vault-mod-detail-label">Install targets</p>
-              <div className="vault-mod-targets">
-                {legacyTargets.map((target, index) => (
-                  <div className="vault-mod-target legacy" key={target.id}>
-                    <CheckCircle2 size={17} />
-                    <span>
-                      <strong>{target.label}</strong>
-                      <small>{target.path}</small>
-                    </span>
-                    {index === 0 ? <b>Primary</b> : <b>Installed</b>}
-                  </div>
-                ))}
-              </div>
+              <LegacyInstallTargetChoices targets={legacyTargets} />
             </section>
           ) : null}
         </div>

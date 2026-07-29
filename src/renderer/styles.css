@@ -5836,6 +5836,19 @@ body {
   gap: 7px;
 }
 
+.vault-mod-target-note {
+  margin: 0;
+  border-left: 2px solid rgba(224, 178, 88, 0.5);
+  padding-left: 9px;
+  color: #bba56f;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.vault-mod-target-note.legacy {
+  color: #9ea59f;
+}
+
 .vault-mod-requirement,
 .vault-mod-target {
   display: grid;
@@ -5887,12 +5900,43 @@ body {
 }
 
 .vault-mod-target {
+  position: relative;
+  width: 100%;
   border-color: rgba(213, 166, 77, 0.26);
   color: #d6ad61;
+  font: inherit;
+  text-align: left;
 }
 
-.vault-mod-target.selected,
-.vault-mod-target.legacy:first-child {
+.vault-mod-target-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.vault-mod-target:not(.legacy) {
+  cursor: pointer;
+}
+
+.vault-mod-target:not(.legacy):not(.unavailable):hover,
+.vault-mod-target:not(.legacy):not(.unavailable):focus-within {
+  border-color: rgba(232, 190, 105, 0.68);
+  background: rgba(87, 63, 21, 0.18);
+  outline: none;
+}
+
+.vault-mod-target.unavailable {
+  cursor: default;
+}
+
+.vault-mod-target:not(.selected).unavailable {
+  opacity: 0.62;
+}
+
+.vault-mod-target.selected {
   border-color: rgba(82, 167, 210, 0.48);
   background: rgba(25, 80, 107, 0.16);
   color: #69b9df;

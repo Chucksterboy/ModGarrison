@@ -27,7 +27,10 @@
     "engine": "unreal",
     "steamAppIds": ["3041230"],
     "executableNames": ["windrose.exe"],
-    "pathMarkers": ["r5/content/paks"],
+    "pathMarkers": [
+      "r5/content/paks",
+      "r5/builds/windowsserver/r5/content/paks"
+    ],
     "supportedAdapters": ["unreal-pak", "ue4ss"],
     "bootstrapRuntimes": ["ue4ss"],
     "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
