@@ -129,6 +129,7 @@ export interface InstallMapping {
   targetRoot: "game" | "profile";
   targetRelativePath: string;
   reason: string;
+  generatedContent?: string | null;
 }
 
 export interface InstallPlan {
@@ -226,6 +227,8 @@ export interface InstalledModRecord {
   packageVersion?: string;
   providerFileId?: string;
   providerVariant?: string;
+  installTargets: InstallTargetOption[];
+  selectedInstallTargetId?: string;
   sourceArchiveSha256?: string;
   iconUrl?: string;
   adapterId: AdapterId;
@@ -543,6 +546,11 @@ export interface DesktopApi {
   updateModConfigValue(input: UpdateModConfigValueInput): Promise<ModConfigFile>;
   disableMod(profileId: string, installedModId: string): Promise<ModActionResult>;
   enableMod(profileId: string, installedModId: string): Promise<ModActionResult>;
+  setModInstallTarget(
+    profileId: string,
+    installedModId: string,
+    installTargetId: string
+  ): Promise<ModActionResult>;
   removeMod(
     profileId: string,
     installedModId: string,

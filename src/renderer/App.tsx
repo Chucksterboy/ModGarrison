@@ -54,6 +54,7 @@ import {
   InstalledModRecord,
   InstallPlan,
   InstallPreflightResult,
+  InstallTargetOption,
   OnlineInstallSelection,
   ModConfigEntry,
   ModConfigFile,
@@ -267,6 +268,7 @@ export function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isDiscoveringMods, setIsDiscoveringMods] = useState(false);
   const [installingOnlineModId, setInstallingOnlineModId] = useState<string>("");
+  const [changingInstallTargetModId, setChangingInstallTargetModId] = useState<string>("");
   const [onlineInstallCompletionId, setOnlineInstallCompletionId] = useState(0);
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [isDownloadingUpdate, setIsDownloadingUpdate] = useState(false);
@@ -2179,6 +2181,84 @@ export function App() {
     }
   }
 
+  async function changeModInstallTarget(mod: InstalledModRecord, installTargetId: string) {
+    if (
+      !selectedProfile ||
+      changingInstallTargetModId ||
+      installTargetId === mod.selectedInstallTargetId
+    ) {
+      return;
+    }
+
+    const target = (mod.installTargets ?? []).find(
+      (candidate) => candidate.id === installTargetId
+    );
+    if (!target) {
+      setStatus("Install target unavailable");
+      setNotice({
+        kind: "error",
+        title: "Install target unavailable",
+        detail: "Refresh the profile and try the target change again."
+      });
+      return;
+    }
+
+    setError("");
+    setChangingInstallTargetModId(mod.id);
+    setStatus("Changing install target");
+    try {
+      const result = await api.setModInstallTarget(selectedProfile.id, mod.id, target.id);
+      const profileId = selectedProfile.id;
+      const knownMods = installedModsByProfile.current.get(profileId) ?? installedMods;
+      const optimisticMods = withSelectedInstallTarget(
+        knownMods,
+        mod.id,
+        target.id
+      );
+      rememberInstalledMods(profileId, optimisticMods);
+      if (selectedProfileIdRef.current === profileId) {
+        setInstalledMods(optimisticMods);
+      }
+      if (discoverProfileIdRef.current === profileId) {
+        setDiscoverInstalledMods((current) =>
+          withSelectedInstallTarget(current, mod.id, target.id)
+        );
+      }
+
+      const refreshWarning = await installTargetRefreshWarning(() =>
+        refreshInstalledMods(profileId)
+      );
+      const warnings = result.warnings.filter((warning) => warning.trim());
+      if (refreshWarning) {
+        warnings.push(refreshWarning);
+      }
+      setStatus(
+        warnings.length > 0
+          ? "Install target changed with warnings"
+          : "Install target updated"
+      );
+      setNotice({
+        kind: warnings.length > 0 ? "warning" : "success",
+        title: "Install target updated",
+        detail: [
+          `${displayModName(mod)} now uses ${target.label}.`,
+          `${result.filesChanged.length} file(s) changed.`,
+          ...warnings
+        ].join(" ")
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setStatus("Target change failed");
+      setNotice({
+        kind: "error",
+        title: "Could not change install target",
+        detail: String(caughtError)
+      });
+    } finally {
+      setChangingInstallTargetModId("");
+    }
+  }
+
   async function removeDiscoverInstalledMod(
     mod: InstalledModRecord,
     forceForgetModified = false
@@ -2781,10 +2861,15 @@ export function App() {
               <div className="history-list">
                 {sortedInstalledMods.map((mod) => (
                   <ModCard
+                    changingInstallTarget={changingInstallTargetModId === mod.id}
                     expanded={expandedInstalledModId === mod.id}
+                    installTargetChangePending={Boolean(changingInstallTargetModId)}
                     key={mod.id}
                     mod={mod}
                     presentation={getStoredModPresentation(mod, modPresentations)}
+                    onChangeInstallTarget={(installTargetId) =>
+                      void changeModInstallTarget(mod, installTargetId)
+                    }
                     onConfigure={() => void openModConfig(mod)}
                     onEnable={() => void handleModAction("enable", mod)}
                     onDisable={() => void handleModAction("disable", mod)}
@@ -2841,7 +2926,7 @@ export function App() {
             }
             profiles={profiles}
             selectedProfileId={discoverProfileId}
-            onInstall={(mod, file) => void installOnlineMod(mod, file)}
+            onInstall={(mod, file, selection) => void installOnlineMod(mod, file, selection)}
             onLoadFiles={loadOnlineModFiles}
             onNeedsAuth={openNexusAuthSettings}
             onOpenPage={(url) => void openExternalUrl(url)}
@@ -3723,7 +3808,11 @@ interface DiscoverViewProps {
   providerWarning: string;
   profiles: GameProfile[];
   selectedProfileId: string;
-  onInstall(mod: OnlineModRecord, file?: OnlineModFileOption): void;
+  onInstall(
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption,
+    selection?: OnlineInstallSelection
+  ): void;
   onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
   onOpenPage(url: string): void;
@@ -3939,6 +4028,7 @@ export function DiscoverView({
             return (
               <OnlineModCard
                 expanded={expandedModId === mod.id}
+                installedMod={installedMod}
                 installing={installingModId === mod.id}
                 key={`${mod.provider}:${mod.id}:${mod.version}`}
                 mod={displayedMod}
@@ -4131,9 +4221,14 @@ function DiscoveryPagination({
 
 interface OnlineModCardProps {
   expanded: boolean;
+  installedMod?: InstalledModRecord;
   installing: boolean;
   mod: OnlineModRecord;
-  onInstall(mod: OnlineModRecord, file?: OnlineModFileOption): void;
+  onInstall(
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption,
+    selection?: OnlineInstallSelection
+  ): void;
   onLoadFiles(mod: OnlineModRecord): Promise<OnlineModFileOption[]>;
   onNeedsAuth(): void;
   onOpenPage(url: string): void;
@@ -4142,6 +4237,7 @@ interface OnlineModCardProps {
 
 function OnlineModCard({
   expanded,
+  installedMod,
   installing,
   mod,
   onInstall,
@@ -4157,8 +4253,17 @@ function OnlineModCard({
   const [fileLoadError, setFileLoadError] = useState("");
   const [selectedFileId, setSelectedFileId] = useState("");
   const fileRequestSequence = useRef(0);
+  const fileSelectionTouchedRef = useRef(false);
+  const installedModRef = useRef(installedMod);
+  installedModRef.current = installedMod;
   const needsAuth = !mod.installSupported && mod.provider === "nexus";
-  const installDisabled = mod.installed || installing || (!mod.installSupported && !needsAuth);
+  const installDisabled = installing || (!mod.installSupported && !needsAuth);
+  const replacementSelection: OnlineInstallSelection | undefined = installedMod
+    ? {
+        replaceInstalledModId: installedMod.id,
+        installTargetId: installedMod.selectedInstallTargetId
+      }
+    : undefined;
   const pageUrl = mod.packageUrl ?? mod.websiteUrl;
   const selectedFile = files.find((file) => file.id === selectedFileId);
   const installTitle = !mod.installSupported
@@ -4174,14 +4279,14 @@ function OnlineModCard({
           ? "Available"
           : "Unavailable";
   const installLabel = mod.installed
-    ? "Installed"
+    ? "Update"
     : installing
       ? "Installing"
       : mod.installSupported
         ? "Install"
         : "Needs Auth";
   const selectedActionLabel = mod.installed
-    ? "Installed"
+    ? "Update Selected"
     : installing
       ? "Installing"
       : selectedFile?.action === "browser"
@@ -4192,18 +4297,35 @@ function OnlineModCard({
             ? "Loading Files"
             : "Select a File";
   const selectedActionDisabled =
-    mod.installed ||
     installing ||
     !selectedFile ||
     selectedFile.action === "unsupported" ||
     selectedFile.action === "auth";
   useEffect(() => {
     fileRequestSequence.current += 1;
+    fileSelectionTouchedRef.current = false;
     setFiles([]);
     setSelectedFileId("");
     setFileLoadError("");
     setFileLoadState("idle");
   }, [mod.id]);
+
+  useEffect(() => {
+    if (
+      fileLoadState !== "ready" ||
+      files.length === 0 ||
+      !installedMod ||
+      fileSelectionTouchedRef.current
+    ) {
+      return;
+    }
+    setSelectedFileId(preferredOnlineModFileId(files, installedMod));
+  }, [
+    fileLoadState,
+    files,
+    installedMod?.providerFileId,
+    installedMod?.providerVariant
+  ]);
 
   useEffect(() => {
     if (!expanded || needsAuth || fileLoadState !== "idle") {
@@ -4218,7 +4340,9 @@ function OnlineModCard({
           return;
         }
         setFiles(options);
-        setSelectedFileId(options.find((option) => option.primary)?.id ?? options[0]?.id ?? "");
+        setSelectedFileId(
+          preferredOnlineModFileId(options, installedModRef.current)
+        );
         setFileLoadState("ready");
       })
       .catch((caughtError) => {
@@ -4241,7 +4365,7 @@ function OnlineModCard({
       }
       return;
     }
-    onInstall(mod);
+    onInstall(mod, undefined, replacementSelection);
   }
 
   return (
@@ -4282,7 +4406,7 @@ function OnlineModCard({
           }
           type="button"
         >
-          {needsAuth ? <Settings2 size={18} /> : mod.installed ? <CheckCircle2 size={18} /> : <Download size={18} />}
+          {needsAuth ? <Settings2 size={18} /> : mod.installed ? <RefreshCw size={18} /> : <Download size={18} />}
         </button>
         <button
           aria-expanded={expanded}
@@ -4369,6 +4493,8 @@ function OnlineModCard({
               <div className="online-mod-file-picker" role="radiogroup" aria-label="Mod file">
                 {files.map((file) => {
                   const selected = file.id === selectedFileId;
+                  const installed =
+                    file.id === installedMod?.providerFileId;
                   const fileMeta = [
                     file.version ? `v${file.version}` : "",
                     file.category ?? "",
@@ -4383,7 +4509,10 @@ function OnlineModCard({
                       <input
                         checked={selected}
                         name={`online-file-${mod.id}`}
-                        onChange={() => setSelectedFileId(file.id)}
+                        onChange={() => {
+                          fileSelectionTouchedRef.current = true;
+                          setSelectedFileId(file.id);
+                        }}
                         type="radio"
                         value={file.id}
                       />
@@ -4391,7 +4520,7 @@ function OnlineModCard({
                         <strong>{file.name}</strong>
                         <small>{fileMeta.join(" / ") || file.fileName || "Provider file"}</small>
                       </span>
-                      {file.primary ? <b>Recommended</b> : null}
+                      {installed ? <b>Installed</b> : file.primary ? <b>Recommended</b> : null}
                     </label>
                   );
                 })}
@@ -4430,7 +4559,11 @@ function OnlineModCard({
                 }
                 disabled={needsAuth ? false : selectedActionDisabled}
                 onClick={() =>
-                  needsAuth ? onNeedsAuth() : selectedFile ? onInstall(mod, selectedFile) : undefined
+                  needsAuth
+                    ? onNeedsAuth()
+                    : selectedFile
+                      ? onInstall(mod, selectedFile, replacementSelection)
+                      : undefined
                 }
                 title={installTitle}
                 type="button"
@@ -4440,7 +4573,7 @@ function OnlineModCard({
                 ) : selectedFile?.action === "browser" ? (
                   <ExternalLink size={15} />
                 ) : mod.installed ? (
-                  <CheckCircle2 size={15} />
+                  <RefreshCw size={15} />
                 ) : (
                   <Download size={15} />
                 )}
@@ -5001,12 +5134,81 @@ function getStoredModPresentation(
   };
 }
 
-function installedRecordMatchesOnlineMod(
-  installedMod: InstalledModRecord,
-  onlineMod: OnlineModRecord
+function providerVariantKey(value?: string): string {
+  return (value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+export function preferredOnlineModFileId(
+  files: OnlineModFileOption[],
+  installedMod?: Pick<InstalledModRecord, "providerFileId" | "providerVariant">
+): string {
+  const installedVariant = providerVariantKey(installedMod?.providerVariant);
+  if (installedVariant) {
+    const sameVariant = files.find((file) =>
+      [file.name, file.fileName].some(
+        (candidate) => providerVariantKey(candidate) === installedVariant
+      )
+    );
+    if (sameVariant) {
+      return sameVariant.id;
+    }
+  }
+
+  const installedFileId = installedMod?.providerFileId?.trim();
+  if (installedFileId) {
+    const sameFile = files.find((file) => file.id === installedFileId);
+    if (sameFile) {
+      return sameFile.id;
+    }
+  }
+
+  return files.find((file) => file.primary)?.id ?? files[0]?.id ?? "";
+}
+
+function dependencyStringMatchesOnlineMod(
+  dependencyString: string | undefined,
+  onlineModId: string
+): boolean {
+  const dependency = dependencyString?.trim().toLowerCase();
+  const onlineId = onlineModId.trim().toLowerCase();
+  if (!dependency || !onlineId) {
+    return false;
+  }
+  if (
+    dependency === onlineId ||
+    dependency.startsWith(`${onlineId}#`) ||
+    dependency.startsWith(`${onlineId}@`)
+  ) {
+    return true;
+  }
+  if (!onlineId.startsWith("thunderstore:")) {
+    return false;
+  }
+
+  const reference = onlineId.slice("thunderstore:".length);
+  const separator = reference.indexOf("/");
+  if (separator <= 0 || separator === reference.length - 1) {
+    return false;
+  }
+  const namespace = reference.slice(0, separator);
+  const packageName = reference.slice(separator + 1);
+  const legacyPrefix = `${namespace}-${packageName}-`;
+  return dependency.startsWith(legacyPrefix);
+}
+
+export function installedRecordMatchesOnlineMod(
+  installedMod: Pick<InstalledModRecord, "packageId" | "dependencyString">,
+  onlineMod: Pick<OnlineModRecord, "id">
 ): boolean {
   const packageId = installedMod.packageId?.trim().toLowerCase();
-  return Boolean(packageId && packageId === onlineMod.id.trim().toLowerCase());
+  const onlineModId = onlineMod.id.trim().toLowerCase();
+  return Boolean(
+    (packageId && packageId === onlineModId) ||
+    dependencyStringMatchesOnlineMod(installedMod.dependencyString, onlineModId)
+  );
 }
 
 function findStoredPresentationByName(
@@ -5264,10 +5466,20 @@ interface NoticeBannerProps {
   notice: Notice;
 }
 
-function NoticeBanner({ motionClassName = "", notice }: NoticeBannerProps) {
+export function NoticeBanner({ motionClassName = "", notice }: NoticeBannerProps) {
+  const isError = notice.kind === "error";
   return (
-    <div className={`notice-banner ${notice.kind} ${motionClassName}`}>
-      {notice.kind === "success" ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
+    <div
+      aria-atomic="true"
+      aria-live={isError ? "assertive" : "polite"}
+      className={`notice-banner ${notice.kind} ${motionClassName}`}
+      role={isError ? "alert" : "status"}
+    >
+      {notice.kind === "success" ? (
+        <CheckCircle2 aria-hidden="true" size={18} />
+      ) : (
+        <AlertTriangle aria-hidden="true" size={18} />
+      )}
       <div>
         <strong>{notice.title}</strong>
         <span>{notice.detail}</span>
@@ -5326,9 +5538,12 @@ function DropZone({
 }
 
 interface ModCardProps {
+  changingInstallTarget: boolean;
   expanded: boolean;
+  installTargetChangePending: boolean;
   mod: InstalledModRecord;
   presentation: StoredModPresentation;
+  onChangeInstallTarget(installTargetId: string): void;
   onConfigure(): void;
   onEnable(): void;
   onDisable(): void;
@@ -5340,6 +5555,96 @@ interface InstalledModTarget {
   id: string;
   label: string;
   path: string;
+}
+
+export function withSelectedInstallTarget<
+  T extends { id: string; selectedInstallTargetId?: string }
+>(mods: T[], installedModId: string, installTargetId: string): T[] {
+  let changed = false;
+  const next = mods.map((mod) => {
+    if (
+      mod.id !== installedModId ||
+      mod.selectedInstallTargetId === installTargetId
+    ) {
+      return mod;
+    }
+    changed = true;
+    return { ...mod, selectedInstallTargetId: installTargetId };
+  });
+  return changed ? next : mods;
+}
+
+export async function installTargetRefreshWarning(
+  refresh: () => Promise<void>
+): Promise<string | undefined> {
+  try {
+    await refresh();
+    return undefined;
+  } catch (caughtError) {
+    return `The target changed, but the library could not refresh: ${String(caughtError)}`;
+  }
+}
+
+export function selectedInstallTargetOption(
+  mod: Pick<InstalledModRecord, "installTargets" | "selectedInstallTargetId">
+): InstallTargetOption | undefined {
+  const targets = mod.installTargets ?? [];
+  return (
+    targets.find((target) => target.id === mod.selectedInstallTargetId) ??
+    targets.find((target) => target.recommended) ??
+    targets[0]
+  );
+}
+
+interface InstallTargetPickerProps {
+  busy: boolean;
+  disabled?: boolean;
+  modName: string;
+  onChange(installTargetId: string): void;
+  selectedTarget?: InstallTargetOption;
+  targets: InstallTargetOption[];
+}
+
+export function InstallTargetPicker({
+  busy,
+  disabled = false,
+  modName,
+  onChange,
+  selectedTarget,
+  targets
+}: InstallTargetPickerProps) {
+  if (targets.length < 2 || !selectedTarget) {
+    return null;
+  }
+
+  const unavailable = busy || disabled;
+
+  return (
+    <label
+      aria-busy={busy}
+      className={busy ? "vault-mod-target-picker changing" : "vault-mod-target-picker"}
+      title={`${selectedTarget.label} — ${selectedTarget.relativePath}`}
+    >
+      {busy ? <RefreshCw aria-hidden="true" className="spin-icon" size={11} /> : <FolderOpen aria-hidden="true" size={11} />}
+      <span>Target</span>
+      <select
+        aria-label={`Install target for ${modName}`}
+        disabled={unavailable}
+        onChange={(event) => {
+          if (event.target.value !== selectedTarget.id) {
+            onChange(event.target.value);
+          }
+        }}
+        value={selectedTarget.id}
+      >
+        {targets.map((target) => (
+          <option key={target.id} value={target.id}>
+            {target.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 function normalizedInstallPath(value: string): string {
@@ -5736,9 +6041,12 @@ function isTruthyConfigValue(value: string): boolean {
 }
 
 function ModCard({
+  changingInstallTarget,
   expanded,
+  installTargetChangePending,
   mod,
   presentation,
+  onChangeInstallTarget,
   onConfigure,
   onEnable,
   onDisable,
@@ -5749,7 +6057,11 @@ function ModCard({
   const dependencies = mod.dependencies ?? [];
   const modName = displayModName(mod);
   const isRuntime = Boolean(mod.runtimeId);
-  const targets = installedModTargets(mod);
+  const installTargets = mod.installTargets ?? [];
+  const selectedInstallTarget = selectedInstallTargetOption(mod);
+  const legacyTargets = installTargets.length === 0 ? installedModTargets(mod) : [];
+  const canChangeInstallTarget =
+    !isRuntime && !mod.externallyManaged && installTargets.length > 1;
   const description =
     presentation.description?.trim() ||
     mod.summary?.trim() ||
@@ -5768,13 +6080,24 @@ function ModCard({
             {presentation.version ? <span>v{presentation.version}</span> : null}
             <span>{presentation.providerLabel ?? adapterDisplayName(mod.adapterId)}</span>
           </div>
-          <small title={mod.summary}>
-            {isRuntime
-              ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
-              : dependencies.length > 0
-                ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
-                : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
-          </small>
+          {canChangeInstallTarget ? (
+            <InstallTargetPicker
+              busy={changingInstallTarget}
+              disabled={installTargetChangePending}
+              modName={modName}
+              onChange={onChangeInstallTarget}
+              selectedTarget={selectedInstallTarget}
+              targets={installTargets}
+            />
+          ) : (
+            <small title={mod.summary}>
+              {isRuntime
+                ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
+                : dependencies.length > 0
+                  ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
+                  : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
+            </small>
+          )}
         </div>
         <label
           className="vault-mod-toggle"
@@ -5784,7 +6107,7 @@ function ModCard({
           <input
             aria-label={`${mod.enabled ? "Disable" : "Enable"} ${modName}`}
             checked={mod.enabled}
-            disabled={isRuntime}
+            disabled={isRuntime || changingInstallTarget}
             onChange={(event) => event.currentTarget.checked ? onEnable() : onDisable()}
             type="checkbox"
           />
@@ -5796,12 +6119,12 @@ function ModCard({
               <ShieldCheck size={17} />
             </span>
           ) : (
-            <button aria-label={`Remove ${modName}`} className="vault-mod-remove" onClick={onRemove} title="Remove mod" type="button">
+            <button aria-label={`Remove ${modName}`} className="vault-mod-remove" disabled={changingInstallTarget} onClick={onRemove} title="Remove mod" type="button">
               <X size={18} />
             </button>
           )}
           {configFiles.length > 0 ? (
-            <button aria-label={`Configure ${modName}`} className="vault-mod-config" onClick={onConfigure} title="Configure mod" type="button">
+            <button aria-label={`Configure ${modName}`} className="vault-mod-config" disabled={changingInstallTarget} onClick={onConfigure} title="Configure mod" type="button">
               <Settings2 size={18} />
             </button>
           ) : null}
@@ -5857,12 +6180,34 @@ function ModCard({
             </div>
           </section>
 
-          {targets.length > 1 ? (
+          {installTargets.length > 1 ? (
             <section className="vault-mod-detail-section">
               <p className="vault-mod-detail-label">Install targets</p>
               <div className="vault-mod-targets">
-                {targets.map((target, index) => (
-                  <div className="vault-mod-target" key={target.id}>
+                {installTargets.map((target) => {
+                  const selected = target.id === selectedInstallTarget?.id;
+                  return (
+                    <div
+                      className={selected ? "vault-mod-target selected" : "vault-mod-target"}
+                      key={target.id}
+                    >
+                      {selected ? <CheckCircle2 size={17} /> : <FolderOpen size={17} />}
+                      <span>
+                        <strong>{target.label}</strong>
+                        <small>{target.relativePath}</small>
+                      </span>
+                      <b>{selected ? "Active" : "Available"}</b>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          ) : legacyTargets.length > 1 ? (
+            <section className="vault-mod-detail-section">
+              <p className="vault-mod-detail-label">Install targets</p>
+              <div className="vault-mod-targets">
+                {legacyTargets.map((target, index) => (
+                  <div className="vault-mod-target legacy" key={target.id}>
                     <CheckCircle2 size={17} />
                     <span>
                       <strong>{target.label}</strong>

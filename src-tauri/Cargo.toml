@@ -1,6 +1,6 @@
 [package]
 name = "mod-garrison"
-version = "0.10.3"
+version = "0.11.0"
 description = "Mod Garrison cross-game mod manager"
 authors = ["Chucksterboy"]
 license = "MIT"

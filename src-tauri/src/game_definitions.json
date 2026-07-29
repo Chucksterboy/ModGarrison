@@ -33,6 +33,27 @@
     "configRoots": ["Binaries/Win64/Mods", "R5/Binaries/Win64/Mods"]
   },
   {
+    "id": "runescape-dragonwilds",
+    "displayName": "RuneScape: Dragonwilds",
+    "engine": "unreal",
+    "steamAppIds": ["1374490"],
+    "executableNames": [
+      "rsdragonwilds.exe",
+      "rsdragonwilds-win64-shipping.exe"
+    ],
+    "pathMarkers": [
+      "rsdragonwilds/content/paks",
+      "rsdragonwilds/binaries/win64"
+    ],
+    "supportedAdapters": ["unreal-pak", "ue4ss"],
+    "bootstrapRuntimes": ["ue4ss"],
+    "configRoots": [
+      "RSDragonwilds/Content/Paks/~mods",
+      "RSDragonwilds/Binaries/Win64/ue4ss/Mods"
+    ],
+    "nexusGameDomain": "runescapedragonwilds"
+  },
+  {
     "id": "the-mound",
     "displayName": "The Mound: Omen of Cthulhu",
     "engine": "unreal",

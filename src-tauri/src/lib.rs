@@ -9,6 +9,7 @@ use semver::{Version, VersionReq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
@@ -25,7 +26,7 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-const MAX_SCAN_DEPTH: usize = 6;
+const MAX_SCAN_DEPTH: usize = 7;
 const MAX_SCAN_ENTRIES: usize = 3000;
 const MAX_UNREAL_PAK_ROOT_SCAN_DEPTH: usize = 9;
 const MAX_UNREAL_PAK_ROOTS: usize = 64;
@@ -85,7 +86,11 @@ const PROVIDER_MAPPING_CACHE_HOURS: u64 = 12;
 const PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES: u64 = 10;
 const STORE_TRANSACTION_VERSION: u32 = 1;
 const DEPLOYMENT_JOURNAL_VERSION: u32 = 1;
+const DEACTIVATION_JOURNAL_VERSION: u32 = 1;
 const REPLACEMENT_JOURNAL_VERSION: u32 = 1;
+const TARGET_SWITCH_JOURNAL_VERSION: u32 = 1;
+const INSTALL_GRAPH_JOURNAL_VERSION: u32 = 1;
+const TARGET_SWITCH_BACKUP_ROTATION_MARKER: &str = "rotation-ready";
 const GITHUB_API_BASE: &str = "https://api.github.com/repos";
 const APP_UPDATE_REPOSITORY: &str = "Chucksterboy/ModGarrison";
 const BEPINBUILDS_BASE: &str = "https://builds.bepinex.dev";
@@ -121,11 +126,13 @@ static DISCOVERY_PROVIDER_CACHE: OnceLock<Mutex<HashMap<String, DiscoveryProvide
 static STEAM_GAMES_CACHE: OnceLock<Mutex<Option<SteamGamesCacheEntry>>> = OnceLock::new();
 static NEXUS_KEY_VALIDATION_CACHE: OnceLock<Mutex<Option<NexusKeyValidationCacheEntry>>> =
     OnceLock::new();
-static RECOVERED_STORE_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-static RECOVERED_DEPLOYMENT_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-static RECOVERED_REPLACEMENT_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static RUNTIME_REGISTRY: OnceLock<Vec<RuntimeDefinition>> = OnceLock::new();
 static DEPENDENCY_PROVIDER_REGISTRY: OnceLock<Vec<DependencyProviderDefinition>> = OnceLock::new();
+
+thread_local! {
+    static INSTALL_GRAPH_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static INSTALL_GRAPH_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 struct ThunderstoreCacheEntry {
@@ -870,6 +877,8 @@ pub struct InstallMapping {
     target_root: String,
     target_relative_path: String,
     reason: String,
+    #[serde(default)]
+    generated_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -964,6 +973,10 @@ pub struct InstalledModRecord {
     #[serde(default)]
     package_version: Option<String>,
     #[serde(default)]
+    provider_file_id: Option<String>,
+    #[serde(default)]
+    provider_variant: Option<String>,
+    #[serde(default)]
     source_archive_sha256: Option<String>,
     #[serde(default)]
     icon_url: Option<String>,
@@ -987,6 +1000,12 @@ pub struct InstalledModRecord {
     last_status: String,
     #[serde(default)]
     plan: Option<InstallPlan>,
+    #[serde(default)]
+    install_target_plan: Option<InstallPlan>,
+    #[serde(default)]
+    install_targets: Vec<InstallTargetOption>,
+    #[serde(default)]
+    selected_install_target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1343,6 +1362,79 @@ struct ReplacementJournal {
     old_record_id: String,
     expected_package_id: String,
     checkpoint: StoreFile<InstalledModRecord>,
+    #[serde(default = "default_replacement_journal_phase")]
+    phase: ReplacementJournalPhase,
+    #[serde(default)]
+    replacement_record_id: Option<String>,
+    #[serde(default)]
+    install_graph_id: Option<String>,
+    #[serde(default)]
+    config_snapshots: Vec<ReplacementConfigSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ReplacementJournalPhase {
+    Preparing,
+    Ready,
+    Validated,
+}
+
+fn default_replacement_journal_phase() -> ReplacementJournalPhase {
+    ReplacementJournalPhase::Preparing
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplacementConfigSnapshot {
+    target_relative_path: String,
+    snapshot_relative_path: String,
+}
+
+#[derive(Debug)]
+struct InstallGraphTransaction {
+    id: String,
+    journal_path: PathBuf,
+    checkpoint: StoreFile<InstalledModRecord>,
+}
+
+struct InstallGraphGuard;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallGraphJournal {
+    version: u32,
+    id: String,
+    profile_id: String,
+    phase: InstallGraphJournalPhase,
+    checkpoint: StoreFile<InstalledModRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum InstallGraphJournalPhase {
+    Applying,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetSwitchConfigSnapshot {
+    target_relative_path: String,
+    snapshot_relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetSwitchJournal {
+    version: u32,
+    id: String,
+    profile_id: String,
+    mod_id: String,
+    selected_install_target_id: String,
+    original_record: InstalledModRecord,
+    #[serde(default)]
+    config_snapshots: Vec<TargetSwitchConfigSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -2025,6 +2117,7 @@ async fn set_profile_mod_launch_mode(
             let _profile_operation = operation::lock_profile(&profile_operation)?;
             let root = store_root(&task_app)?;
             let profile = get_profile(&root, &profile_id)?;
+            ensure_game_files_mutable(&profile, "change the clean-launch mod state")?;
             let changed_components = prepare_profile_mod_launch(&root, &profile, mods_enabled)?;
             persist_profile_launch_mode(&root, &profile_id, mods_enabled)?;
             Ok(ProfileLaunchModeResult {
@@ -2145,6 +2238,32 @@ fn process_executable_path(process_id: u32) -> Option<PathBuf> {
 #[cfg(not(target_os = "windows"))]
 fn game_process_running(_game_path: &Path) -> Result<bool, String> {
     Ok(false)
+}
+
+fn ensure_game_files_mutable(profile: &GameProfile, action: &str) -> Result<(), String> {
+    ensure_game_path_files_mutable(
+        Path::new(&profile.game_path),
+        &profile_game_label(profile),
+        action,
+    )
+}
+
+fn ensure_game_path_files_mutable(
+    game_path: &Path,
+    game_label: &str,
+    action: &str,
+) -> Result<(), String> {
+    match game_process_running(game_path) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(format!(
+            "Close {} before Mod Garrison can {}. No files were changed.",
+            game_label, action
+        )),
+        Err(error) => Err(format!(
+            "Mod Garrison could not verify whether {} is running, so it refused to {}: {error}",
+            game_label, action
+        )),
+    }
 }
 
 fn path_is_within_directory(path: &Path, directory: &Path) -> bool {
@@ -2512,6 +2631,7 @@ fn remove_profile(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
+    ensure_game_files_mutable(&profile, "remove this profile")?;
 
     let installed_mods =
         read_store::<InstalledModRecord>(&installed_mods_path(&root)).map_err(error_to_string)?;
@@ -2708,7 +2828,12 @@ fn refresh_profile_sync(
 
     for dependency in profile_bootstrap_dependencies(&profile) {
         let dependency = refresh_dependency_status(&root, &profile, &dependency);
-        push_missing_dependency(&mut missing_dependencies, &mut dependency_keys, dependency);
+        push_missing_dependency(
+            &mut missing_dependencies,
+            &mut dependency_keys,
+            dependency,
+            None,
+        );
     }
 
     for record in installed_store
@@ -2722,10 +2847,18 @@ fn refresh_profile_sync(
             .map(humanize_mod_display_name);
         record.config_files =
             resolved_config_files_for_record(&profile, record, &discovered_config_files);
+        let selected_target = installed_record_selected_target(record).cloned();
         record.dependencies = record
             .dependencies
             .iter()
-            .map(|dependency| refresh_dependency_status(&root, &profile, dependency))
+            .map(|dependency| {
+                refresh_dependency_status_for_target(
+                    &root,
+                    &profile,
+                    dependency,
+                    selected_target.as_ref(),
+                )
+            })
             .collect();
 
         for dependency in &record.dependencies {
@@ -2733,6 +2866,7 @@ fn refresh_profile_sync(
                 &mut missing_dependencies,
                 &mut dependency_keys,
                 dependency.clone(),
+                selected_target.as_ref(),
             );
         }
 
@@ -2832,8 +2966,8 @@ fn bootstrap_profile_dependencies_sync(
     let mut warnings = Vec::new();
     let mut seen_dependencies = HashSet::new();
 
-    for dependency in profile_dependency_candidates(&root, &profile)? {
-        if !seen_dependencies.insert(dependency_key(&dependency)) {
+    for (dependency, target) in profile_dependency_candidates(&root, &profile)? {
+        if !seen_dependencies.insert(dependency_key_for_target(&dependency, target.as_ref())) {
             continue;
         }
         if dependency.status == "already-installed" {
@@ -2841,17 +2975,23 @@ fn bootstrap_profile_dependencies_sync(
             continue;
         }
 
-        let install_result = install_dependency_by_provider(
+        let install_result = install_dependency_by_provider_for_target(
             &root,
             &profile,
             &dependency,
             &mut visited_dependencies,
             0,
+            target.as_ref(),
         );
 
         match install_result {
             Ok(mut dependency_warnings) => {
-                let verified = refresh_dependency_status(&root, &profile, &dependency);
+                let verified = refresh_dependency_status_for_target(
+                    &root,
+                    &profile,
+                    &dependency,
+                    target.as_ref(),
+                );
                 if verified.status == "already-installed" {
                     installed_dependencies.push(dependency.name.clone());
                     warnings.append(&mut dependency_warnings);
@@ -2916,10 +3056,11 @@ async fn import_profile_bundle(
 fn profile_dependency_candidates(
     root: &Path,
     profile: &GameProfile,
-) -> Result<Vec<DependencySpec>, String> {
+) -> Result<Vec<(DependencySpec, Option<InstallTargetOption>)>, String> {
     let mut dependencies = profile_bootstrap_dependencies(profile)
         .into_iter()
         .map(|dependency| refresh_dependency_status(root, profile, &dependency))
+        .map(|dependency| (dependency, None))
         .collect::<Vec<_>>();
 
     let installed_store =
@@ -2929,12 +3070,13 @@ fn profile_dependency_candidates(
         .iter()
         .filter(|record| record.profile_id == profile.id)
     {
-        dependencies.extend(
-            record
-                .dependencies
-                .iter()
-                .map(|dependency| refresh_dependency_status(root, profile, dependency)),
-        );
+        let target = installed_record_selected_target(record).cloned();
+        dependencies.extend(record.dependencies.iter().map(|dependency| {
+            (
+                refresh_dependency_status_for_target(root, profile, dependency, target.as_ref()),
+                target.clone(),
+            )
+        }));
     }
 
     Ok(dependencies)
@@ -3010,8 +3152,13 @@ fn update_profile_game_folder_impl(
     let mut deactivated = Vec::new();
     for record in &enabled_originals {
         if let Err(error) = deactivate_mod_files(root, &old_profile, record) {
-            restore_deactivated_mods(root, &old_profile, &deactivated);
-            return Err(format!("Game-folder migration was cancelled: {error}"));
+            let restore_error = restore_deactivated_mods(root, &old_profile, &deactivated).err();
+            return Err(format!(
+                "Game-folder migration was cancelled: {error}{}",
+                restore_error
+                    .map(|restore_error| format!(" {restore_error}"))
+                    .unwrap_or_default()
+            ));
         }
         deactivated.push(record.clone());
         let _ = fs::remove_dir_all(profile_backup_dir(root, profile_id, &record.id));
@@ -3264,12 +3411,7 @@ fn resolve_profile_bundle_steam_game(
     let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
     validate_zip_archive_safety(&mut zip)?;
     let manifest = read_bundle_manifest(&mut zip)?;
-    if manifest.schema_version != 1 {
-        return Err(format!(
-            "Unsupported profile bundle version: {}",
-            manifest.schema_version
-        ));
-    }
+    validate_profile_bundle_manifest(&manifest, None)?;
     let steam_app_id = manifest
         .profile
         .steam_app_id
@@ -3292,6 +3434,144 @@ fn resolve_profile_bundle_steam_game(
         })
 }
 
+fn order_self_contained_bundle_mods(
+    profile: &GameProfile,
+    bundle_mods: Vec<ProfileBundleMod>,
+) -> Result<Vec<ProfileBundleMod>, String> {
+    let count = bundle_mods.len();
+    let mut outgoing = vec![Vec::<usize>::new(); count];
+    let mut incoming = vec![0_usize; count];
+
+    for (dependent_index, dependent) in bundle_mods.iter().enumerate() {
+        for dependency in dependent
+            .record
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.required)
+        {
+            let mut providers = bundle_mods
+                .iter()
+                .enumerate()
+                .filter(|(provider_index, provider)| {
+                    *provider_index != dependent_index
+                        && installed_record_matches_dependency_package(
+                            profile,
+                            &provider.record,
+                            dependency,
+                        )
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if installed_record_selected_target(&dependent.record).is_some() {
+                providers.retain(|provider_index| {
+                    record_payload_covers_dependent_target(
+                        &bundle_mods[*provider_index].record,
+                        &dependent.record,
+                    )
+                });
+            }
+            let provider_index = match providers.as_slice() {
+                [provider_index] => *provider_index,
+                [] => {
+                    return Err(format!(
+                        "The self-contained profile is missing the bundled provider for required component {}.",
+                        dependency.name
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "The self-contained profile contains multiple possible providers for {} and Mod Garrison refused to guess.",
+                        dependency.name
+                    ));
+                }
+            };
+            if !outgoing[provider_index].contains(&dependent_index) {
+                outgoing[provider_index].push(dependent_index);
+                incoming[dependent_index] = incoming[dependent_index].saturating_add(1);
+            }
+        }
+    }
+
+    let mut ready = (0..count)
+        .filter(|index| incoming[*index] == 0)
+        .collect::<VecDeque<_>>();
+    let mut ordered_indices = Vec::with_capacity(count);
+    while let Some(index) = ready.pop_front() {
+        ordered_indices.push(index);
+        for dependent in &outgoing[index] {
+            incoming[*dependent] = incoming[*dependent].saturating_sub(1);
+            if incoming[*dependent] == 0 {
+                ready.push_back(*dependent);
+            }
+        }
+    }
+    if ordered_indices.len() != count {
+        return Err(
+            "The self-contained profile contains a circular dependency graph and was not imported."
+                .to_string(),
+        );
+    }
+
+    let mut slots = bundle_mods.into_iter().map(Some).collect::<Vec<_>>();
+    Ok(ordered_indices
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_verified_bundle_provider_identity(
+    record: &mut InstalledModRecord,
+    verified_identity: &PackageIdentity,
+    verified_manifest: Option<&ThunderstoreManifest>,
+    transported_package_id: Option<&str>,
+    transported_dependency_string: Option<&str>,
+    transported_package_provider: Option<&str>,
+    transported_package_version: Option<&str>,
+) {
+    if verified_identity
+        .provider
+        .eq_ignore_ascii_case("thunderstore")
+    {
+        let Some(manifest) = verified_manifest else {
+            return;
+        };
+        let Some(package_id) = transported_package_id else {
+            return;
+        };
+        let Some(package_path) = package_id.strip_prefix("thunderstore:") else {
+            return;
+        };
+        let Some((_, transported_name)) = package_path.split_once('/') else {
+            return;
+        };
+        if !transported_name.eq_ignore_ascii_case(&manifest.name)
+            || transported_package_provider
+                .is_some_and(|provider| !provider.eq_ignore_ascii_case("thunderstore"))
+            || transported_package_version
+                .is_some_and(|version| !version.eq_ignore_ascii_case(&manifest.version_number))
+        {
+            return;
+        }
+        record.package_id = Some(package_id.to_string());
+        record.package_provider = Some("thunderstore".to_string());
+        record.package_version = Some(manifest.version_number.clone());
+        record.dependency_string = transported_dependency_string
+            .and_then(|value| parse_thunderstore_token(value, None).map(|_| value.to_string()));
+        return;
+    }
+
+    let embedded_manifest_evidence = verified_identity
+        .evidence
+        .iter()
+        .any(|evidence| evidence.to_ascii_lowercase().contains("manifest.json"));
+    if embedded_manifest_evidence {
+        record.package_id = verified_identity.package_id.clone();
+        record.package_provider = Some(verified_identity.provider.clone());
+        record.package_version = verified_identity.version.clone();
+    }
+}
+
 #[allow(dead_code)]
 fn import_profile_bundle_impl(
     root: &Path,
@@ -3299,7 +3579,6 @@ fn import_profile_bundle_impl(
     game_path: &Path,
 ) -> Result<ProfileImportResult, String> {
     let profiles_file = profiles_path(root);
-    let installed_mods_file = installed_mods_path(root);
     let profiles_before = {
         let _commit = lock_mutations()?;
         read_store::<GameProfile>(&profiles_file).map_err(error_to_string)?
@@ -3309,16 +3588,16 @@ fn import_profile_bundle_impl(
         .iter()
         .map(|profile| profile.id.clone())
         .collect::<HashSet<_>>();
-    let transaction_root = root
-        .join("transactions")
-        .join(format!("profile-import-{}", Uuid::new_v4()));
-    fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
-
     let bundle_file = File::open(bundle_path).map_err(error_to_string)?;
     let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
     validate_zip_archive_safety(&mut zip)?;
     let manifest = read_bundle_manifest(&mut zip)?;
-    let self_contained = manifest.self_contained;
+    validate_profile_bundle_manifest(&manifest, Some(game_path))?;
+    ensure_game_path_files_mutable(game_path, &manifest.profile.name, "import a profile bundle")?;
+    let transaction_root = root
+        .join("transactions")
+        .join(format!("profile-import-{}", Uuid::new_v4()));
+    fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
     let mut config_snapshots = Vec::new();
     for (index, config) in manifest.config_files.iter().enumerate() {
         let destination = safe_join(game_path, &config.target_relative_path)?;
@@ -3341,47 +3620,219 @@ fn import_profile_bundle_impl(
         let _ = fs::remove_dir_all(transaction_root);
         return result;
     }
+    let import_error = result
+        .err()
+        .unwrap_or_else(|| "Profile import failed.".to_string());
+    Err(rollback_failed_profile_import(
+        root,
+        &existing_profile_ids,
+        &transaction_root,
+        &config_snapshots,
+        &import_error,
+    ))
+}
 
-    let profiles_after = read_store::<GameProfile>(&profiles_file).unwrap_or(StoreFile {
-        version: profiles_before.version,
-        items: Vec::new(),
-    });
-    let mods_after =
-        read_store::<InstalledModRecord>(&installed_mods_file).unwrap_or_else(|_| StoreFile {
-            version: 1,
-            items: Vec::new(),
-        });
+fn rollback_failed_profile_import(
+    root: &Path,
+    existing_profile_ids: &HashSet<String>,
+    transaction_root: &Path,
+    config_snapshots: &[DeploymentRollbackEntry],
+    import_error: &str,
+) -> String {
+    let profiles_after = match read_store::<GameProfile>(&profiles_path(root)) {
+        Ok(store) => store,
+        Err(error) => {
+            let mut rollback_errors = vec![format!(
+                "Could not inspect imported profiles during rollback: {error}"
+            )];
+            rollback_errors.extend(restore_profile_import_config_snapshots(config_snapshots));
+            return retained_profile_import_rollback_error(
+                import_error,
+                transaction_root,
+                rollback_errors,
+            );
+        }
+    };
+    let mods_after = match read_store::<InstalledModRecord>(&installed_mods_path(root)) {
+        Ok(store) => store,
+        Err(error) => {
+            let mut rollback_errors = vec![format!(
+                "Could not inspect imported mod records during rollback: {error}"
+            )];
+            rollback_errors.extend(restore_profile_import_config_snapshots(config_snapshots));
+            return retained_profile_import_rollback_error(
+                import_error,
+                transaction_root,
+                rollback_errors,
+            );
+        }
+    };
     let added_profiles = profiles_after
         .items
         .iter()
         .filter(|profile| !existing_profile_ids.contains(&profile.id))
         .cloned()
         .collect::<Vec<_>>();
+    if added_profiles.len() > 1 {
+        let mut rollback_errors = vec![
+            "Rollback found more than one newly added profile and refused to guess which profile data could be removed."
+                .to_string(),
+        ];
+        rollback_errors.extend(restore_profile_import_config_snapshots(config_snapshots));
+        return retained_profile_import_rollback_error(
+            import_error,
+            transaction_root,
+            rollback_errors,
+        );
+    }
+
+    let mut deactivated = Vec::<(GameProfile, InstalledModRecord)>::new();
+    let mut rollback_errors = Vec::new();
     for profile in &added_profiles {
-        for record in mods_after.items.iter().filter(|record| {
-            record.profile_id == profile.id
-                && record.enabled
-                && !record.externally_managed
-                && (record.runtime_id.is_none() || self_contained)
-        }) {
-            let _ = deactivate_mod_files(root, profile, record);
+        let mut records = mods_after
+            .items
+            .iter()
+            .filter(|record| {
+                record.profile_id == profile.id && record.enabled && !record.externally_managed
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.reverse();
+        for record in records {
+            match deactivate_mod_files_with_policy(
+                root,
+                profile,
+                &record,
+                ModifiedFilePolicy::AllowConfigChanges,
+            ) {
+                Ok(_) => deactivated.push((profile.clone(), record)),
+                Err(error) => rollback_errors.push(format!(
+                    "Could not remove imported files for {}: {error}",
+                    display_record_name(&record)
+                )),
+            }
         }
     }
+
+    // Imported records can overlap bundle-level config files. Deactivate the
+    // records first, then make the pre-import snapshots the authoritative final
+    // bytes regardless of what a managed backup restored.
+    rollback_errors.extend(restore_profile_import_config_snapshots(config_snapshots));
+    if !rollback_errors.is_empty() {
+        restore_incomplete_profile_import(
+            root,
+            &deactivated,
+            config_snapshots,
+            &mut rollback_errors,
+        );
+        return retained_profile_import_rollback_error(
+            import_error,
+            transaction_root,
+            rollback_errors,
+        );
+    }
+
+    for profile in &added_profiles {
+        if let Err(error) = commit_removed_profile_state(root, &profile.id) {
+            rollback_errors.push(format!(
+                "Could not remove the imported profile record {}: {error}",
+                profile.name
+            ));
+        }
+    }
+    if !rollback_errors.is_empty() {
+        restore_incomplete_profile_import(
+            root,
+            &deactivated,
+            config_snapshots,
+            &mut rollback_errors,
+        );
+        return retained_profile_import_rollback_error(
+            import_error,
+            transaction_root,
+            rollback_errors,
+        );
+    }
+
+    for profile in &added_profiles {
+        let profile_data = profile_dir(root, &profile.id);
+        if profile_data.exists() {
+            if let Err(error) = fs::remove_dir_all(&profile_data) {
+                rollback_errors.push(format!(
+                    "Could not remove imported profile data {}: {error}",
+                    profile_data.to_string_lossy()
+                ));
+            }
+        }
+    }
+    if !rollback_errors.is_empty() {
+        return retained_profile_import_rollback_error(
+            import_error,
+            transaction_root,
+            rollback_errors,
+        );
+    }
+
+    if transaction_root.exists() {
+        if let Err(error) = fs::remove_dir_all(transaction_root) {
+            return format!(
+                "{import_error} The imported game files and profile state were rolled back, but temporary recovery data could not be removed from {}: {error}",
+                transaction_root.to_string_lossy()
+            );
+        }
+    }
+    import_error.to_string()
+}
+
+fn restore_profile_import_config_snapshots(
+    config_snapshots: &[DeploymentRollbackEntry],
+) -> Vec<String> {
+    let mut errors = Vec::new();
     for snapshot in config_snapshots.iter().rev() {
-        if let Some(source) = &snapshot.immediate_backup {
-            let _ = replace_file_from_path(source, &snapshot.destination);
+        let result = if let Some(source) = &snapshot.immediate_backup {
+            replace_file_from_path(source, &snapshot.destination)
         } else if snapshot.destination.exists() {
-            let _ = fs::remove_file(&snapshot.destination);
+            fs::remove_file(&snapshot.destination).map_err(error_to_string)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            errors.push(format!(
+                "Could not restore imported config {}: {error}",
+                snapshot.destination.to_string_lossy()
+            ));
         }
     }
-    for profile in &added_profiles {
-        let _ = commit_removed_profile_state(root, &profile.id);
+    errors
+}
+
+fn restore_incomplete_profile_import(
+    root: &Path,
+    deactivated: &[(GameProfile, InstalledModRecord)],
+    config_snapshots: &[DeploymentRollbackEntry],
+    rollback_errors: &mut Vec<String>,
+) {
+    for (profile, record) in deactivated.iter().rev() {
+        if let Err(error) = restore_deactivated_mods(root, profile, std::slice::from_ref(record)) {
+            rollback_errors.push(format!(
+                "Could not restore {} after the import rollback stopped: {error}",
+                display_record_name(record)
+            ));
+        }
     }
-    for profile in added_profiles {
-        let _ = fs::remove_dir_all(profile_dir(root, &profile.id));
-    }
-    let _ = fs::remove_dir_all(transaction_root);
-    result
+    rollback_errors.extend(restore_profile_import_config_snapshots(config_snapshots));
+}
+
+fn retained_profile_import_rollback_error(
+    import_error: &str,
+    transaction_root: &Path,
+    rollback_errors: Vec<String>,
+) -> String {
+    format!(
+        "{import_error} Import rollback also reported: {} Recovery data and imported profile backups were retained at {}.",
+        rollback_errors.join(" "),
+        transaction_root.to_string_lossy()
+    )
 }
 
 #[allow(dead_code)]
@@ -3407,18 +3858,10 @@ fn import_profile_bundle_impl_unchecked(
     let mut zip = ZipArchive::new(bundle_file).map_err(error_to_string)?;
     validate_zip_archive_safety(&mut zip)?;
     let manifest = read_bundle_manifest(&mut zip)?;
-    if manifest.schema_version != 1 {
-        return Err(format!(
-            "Unsupported profile bundle version: {}",
-            manifest.schema_version
-        ));
-    }
+    validate_profile_bundle_manifest(&manifest, Some(game_path))?;
     let exported_profile = manifest.profile.clone();
     let self_contained = manifest.self_contained;
-    let mut bundle_mods = manifest.mods;
-    if self_contained {
-        bundle_mods.sort_by_key(|bundle_mod| bundle_mod.record.runtime_id.is_none());
-    }
+    let bundle_mods = manifest.mods;
     let bundle_config_files = manifest.config_files;
 
     let steam_app_id = infer_steam_app_id_for_game_path(game_path);
@@ -3434,7 +3877,6 @@ fn import_profile_bundle_impl_unchecked(
     profile.loader = detection.loader.clone();
     profile.created_at = imported_at.clone();
     profile.updated_at = imported_at;
-
     let profiles_file = profiles_path(root);
     {
         let _commit = lock_mutations()?;
@@ -3477,8 +3919,16 @@ fn import_profile_bundle_impl_unchecked(
             root,
             &bundle_mod,
         )?;
+        let verified_analysis =
+            analyze_scanned_archive(scan_import_source(root, &package_source)?, &profile);
+        let verified_block_reason = verified_analysis.compatibility.reason.clone();
+        let verified_plan = verified_analysis.recommended_plan;
 
         let mut record = bundle_mod.record;
+        let transported_package_id = record.package_id.clone();
+        let transported_dependency_string = record.dependency_string.clone();
+        let transported_package_provider = record.package_provider.clone();
+        let transported_package_version = record.package_version.clone();
         record.id = new_mod_id.clone();
         record.profile_id = profile.id.clone();
         record.archive_path = package_source.to_string_lossy().to_string();
@@ -3486,11 +3936,114 @@ fn import_profile_bundle_impl_unchecked(
         record.files_written = Vec::new();
         record.backups_written = Vec::new();
         record.config_files = Vec::new();
-        record.dependencies = record
-            .dependencies
-            .iter()
-            .map(|dependency| refresh_dependency_status(root, &profile, dependency))
-            .collect();
+        // A bundle manifest is transport metadata, not an authority for ownership or
+        // provider identity. Extracted packages become Mod Garrison-managed installs,
+        // and only their rescanned payload/plan may grant special behavior.
+        record.externally_managed = false;
+        record.package_id = None;
+        record.dependency_string = None;
+        record.package_provider = None;
+        record.package_version = None;
+        record.provider_file_id = None;
+        record.provider_variant = None;
+        record.icon_url = None;
+        record.source_archive_sha256 = Some(sha256_managed_source(&package_source)?);
+        restore_verified_bundle_provider_identity(
+            &mut record,
+            &verified_analysis.package_identity,
+            verified_analysis.manifest.as_ref(),
+            transported_package_id.as_deref(),
+            transported_dependency_string.as_deref(),
+            transported_package_provider.as_deref(),
+            transported_package_version.as_deref(),
+        );
+        if let Some(full_plan) = verified_plan.as_ref() {
+            let mut effective_plan = full_plan.clone();
+            let supplied_runtime = runtime_supplied_by_plan(&profile, full_plan);
+            let requested_runtime = record.runtime_id.clone();
+            record.runtime_id = supplied_runtime.clone();
+            if let Some(runtime) = supplied_runtime.as_deref() {
+                effective_plan.dependencies.retain(|dependency| {
+                    runtime_id_for_dependency(&profile, dependency)
+                        .map(|required| !required.eq_ignore_ascii_case(runtime))
+                        .unwrap_or(true)
+                });
+                let mut preservation_warnings = preserve_runtime_bootstrap_alternatives(
+                    &profile,
+                    runtime,
+                    &mut effective_plan,
+                )?;
+                effective_plan.warnings.append(&mut preservation_warnings);
+                effective_plan.warnings.sort();
+                effective_plan.warnings.dedup();
+            }
+            if requested_runtime.is_some()
+                && requested_runtime
+                    .as_deref()
+                    .zip(supplied_runtime.as_deref())
+                    .is_none_or(|(requested, supplied)| !requested.eq_ignore_ascii_case(supplied))
+            {
+                warnings.push(format!(
+                    "{} was marked as a protected runtime in the bundle, but its verified payload does not supply that runtime. It was imported using only the capabilities proven by its package.",
+                    display_record_name(&record)
+                ));
+            }
+
+            if supplied_runtime.is_some() {
+                // Runtime payloads cover every verified executable root and are not
+                // user-switchable client/server variants.
+                record.install_target_plan = None;
+                record.install_targets.clear();
+                record.selected_install_target_id = None;
+            } else {
+                let install_targets = plan_install_target_options(&profile, full_plan);
+                let bundled_target_id =
+                    record.selected_install_target_id.as_deref().and_then(|id| {
+                        install_targets
+                            .iter()
+                            .find(|target| target.id.eq_ignore_ascii_case(id))
+                            .map(|target| target.id.clone())
+                    });
+                if record.selected_install_target_id.is_some() && bundled_target_id.is_none() {
+                    warnings.push(format!(
+                        "{} referenced an install target that is not valid for this game. Mod Garrison selected the safest verified target instead.",
+                        display_record_name(&record)
+                    ));
+                }
+                let selected_install_target_id =
+                    select_install_target_id(&install_targets, bundled_target_id.as_deref())?;
+                if let Some(selected_target_id) = selected_install_target_id.as_deref() {
+                    let selected_target = install_targets
+                        .iter()
+                        .find(|target| target.id == selected_target_id)
+                        .ok_or_else(|| {
+                            "The verified install target disappeared while importing the profile."
+                                .to_string()
+                        })?;
+                    apply_install_target_option(&mut effective_plan, selected_target)?;
+                }
+                record.install_target_plan = selected_install_target_id
+                    .as_ref()
+                    .map(|_| full_plan.clone());
+                record.install_targets = install_targets;
+                record.selected_install_target_id = selected_install_target_id;
+            }
+            record.plan = Some(effective_plan.clone());
+            record.adapter_id = effective_plan.adapter_id.clone();
+            record.summary = effective_plan.summary.clone();
+            record.dependencies = effective_plan
+                .dependencies
+                .iter()
+                .map(|dependency| refresh_dependency_status(root, &profile, dependency))
+                .collect();
+        } else {
+            record.plan = None;
+            record.install_target_plan = None;
+            record.install_targets.clear();
+            record.selected_install_target_id = None;
+            record.dependencies.clear();
+            record.runtime_id = None;
+        }
 
         if record.enabled {
             if let Some(plan) = record.plan.clone() {
@@ -3515,19 +4068,51 @@ fn import_profile_bundle_impl_unchecked(
 
                 if !self_contained {
                     let mut visited_dependencies = HashSet::new();
-                    match install_dependencies_for_plan(
+                    let mut dependency_warnings = install_dependencies_for_plan(
                         root,
                         &profile,
                         &plan,
                         &mut visited_dependencies,
                         0,
-                    ) {
-                        Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
-                        Err(error) => warnings.push(format!(
+                    )
+                    .map_err(|error| {
+                        format!(
                             "Could not install dependencies for {}: {}",
                             display_record_name(&record),
                             error
-                        )),
+                        )
+                    })?;
+                    warnings.append(&mut dependency_warnings);
+                }
+                if !self_contained {
+                    ensure_required_plan_dependencies_available(root, &profile, &plan).map_err(
+                        |error| {
+                            format!(
+                                "Could not verify dependencies for {}: {}",
+                                display_record_name(&record),
+                                error
+                            )
+                        },
+                    )?;
+                    if let Some(target) =
+                        record
+                            .selected_install_target_id
+                            .as_deref()
+                            .and_then(|selected| {
+                                record
+                                    .install_targets
+                                    .iter()
+                                    .find(|target| target.id == selected)
+                            })
+                    {
+                        ensure_install_target_dependencies_available(root, &profile, &plan, target)
+                            .map_err(|error| {
+                                format!(
+                                    "Could not verify target-specific dependencies for {}: {}",
+                                    display_record_name(&record),
+                                    error
+                                )
+                            })?;
                     }
                 }
 
@@ -3550,10 +4135,14 @@ fn import_profile_bundle_impl_unchecked(
                             std::slice::from_ref(&record),
                             &[&deployment],
                         ) {
-                            deployment.rollback();
+                            let _ = deployment.rollback();
                             return Err(error);
                         }
-                        deployment.commit();
+                        if let Err(error) = deployment.commit() {
+                            warnings.push(format!(
+                                "The imported mod was committed, but deployment cleanup is pending: {error}"
+                            ));
+                        }
                     }
                     Err(error) => {
                         record.enabled = false;
@@ -3569,8 +4158,9 @@ fn import_profile_bundle_impl_unchecked(
                 record.enabled = false;
                 record.last_status = "failed".to_string();
                 warnings.push(format!(
-                    "Could not deploy {} because no install plan was stored.",
-                    display_record_name(&record)
+                    "Could not deploy {} because its extracted package did not produce a verified install plan: {}",
+                    display_record_name(&record),
+                    verified_block_reason
                 ));
             }
         } else {
@@ -3584,11 +4174,91 @@ fn import_profile_bundle_impl_unchecked(
         installed_mods.push(record);
     }
 
+    if self_contained {
+        // Transported dependency metadata is not authoritative. Every package has
+        // now been rescanned and deployed, so validate the graph and availability
+        // from the verified records. This also lets older bundles whose dependency
+        // metadata was incomplete install providers that appeared later in the
+        // archive without ever launching the game in a partially valid state.
+        let verified_bundle_mods = installed_mods
+            .iter()
+            .filter(|record| record.enabled && record.last_status == "installed")
+            .cloned()
+            .map(|record| ProfileBundleMod {
+                record,
+                source_relative_path: String::new(),
+                source_is_directory: false,
+            })
+            .collect::<Vec<_>>();
+        let _verified_order = order_self_contained_bundle_mods(&profile, verified_bundle_mods)?;
+
+        for record in installed_mods
+            .iter()
+            .filter(|record| record.enabled && record.last_status == "installed")
+        {
+            let Some(plan) = record.plan.as_ref() else {
+                continue;
+            };
+            ensure_required_plan_dependencies_available(root, &profile, plan).map_err(|error| {
+                format!(
+                    "Could not verify dependencies for {}: {}",
+                    display_record_name(record),
+                    error
+                )
+            })?;
+            if let Some(target) = installed_record_selected_target(record) {
+                ensure_install_target_dependencies_available(root, &profile, plan, target)
+                    .map_err(|error| {
+                        format!(
+                            "Could not verify target-specific dependencies for {}: {}",
+                            display_record_name(record),
+                            error
+                        )
+                    })?;
+            }
+        }
+
+        for record in &mut installed_mods {
+            let Some(plan) = record.plan.clone() else {
+                continue;
+            };
+            let target = installed_record_selected_target(record).cloned();
+            record.dependencies = plan
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    refresh_dependency_status_for_target(
+                        root,
+                        &profile,
+                        dependency,
+                        target.as_ref(),
+                    )
+                })
+                .collect();
+        }
+        commit_installed_mod_records(root, &profile, &installed_mods, &[])?;
+    }
+
     let mut config_files_written = Vec::new();
     for config_file in bundle_config_files {
         let Some(new_mod_id) = id_map.get(&config_file.mod_id) else {
             continue;
         };
+        let Some(record) = installed_mods
+            .iter_mut()
+            .find(|record| record.id == *new_mod_id && record.last_status != "failed")
+        else {
+            continue;
+        };
+        if !verified_record_owns_bundle_config(&profile, record, &config_file.target_relative_path)
+        {
+            warnings.push(format!(
+                "Skipped an unverified configuration target for {}: {}",
+                display_record_name(record),
+                config_file.target_relative_path
+            ));
+            continue;
+        }
         let destination_path = safe_join(game_path, &config_file.target_relative_path)?;
         validate_deployment_containment(game_path, &destination_path)?;
         if let Some(parent) = destination_path.parent() {
@@ -3597,12 +4267,12 @@ fn import_profile_bundle_impl_unchecked(
         extract_zip_file(&mut zip, &config_file.bundle_path, &destination_path)?;
         let written_config_path = destination_path.to_string_lossy().to_string();
         config_files_written.push(written_config_path.clone());
-
-        for record in &mut installed_mods {
-            if record.id == *new_mod_id && !record.config_files.contains(&written_config_path) {
-                record.config_files.push(written_config_path.clone());
-            }
+        if !record.config_files.contains(&written_config_path) {
+            record.config_files.push(written_config_path.clone());
         }
+        record
+            .written_file_hashes
+            .insert(written_config_path, sha256_file(&destination_path)?);
     }
 
     if !config_files_written.is_empty() {
@@ -3616,6 +4286,85 @@ fn import_profile_bundle_impl_unchecked(
         config_files_written,
         warnings,
     })
+}
+
+fn verified_record_owns_bundle_config(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    target_relative_path: &str,
+) -> bool {
+    let normalized_target = normalize_archive_path(target_relative_path);
+    let target_path = match safe_join(Path::new(&profile.game_path), &normalized_target) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if !is_user_editable_config_file(&target_path) {
+        return false;
+    }
+
+    let Some(plan) = record.plan.as_ref() else {
+        return false;
+    };
+    if plan.mappings.iter().any(|mapping| {
+        mapping.target_root.eq_ignore_ascii_case("game")
+            && normalize_archive_path(&mapping.target_relative_path)
+                .eq_ignore_ascii_case(&normalized_target)
+    }) {
+        return true;
+    }
+
+    let inside_verified_config_root = profile_config_roots(profile)
+        .iter()
+        .any(|root| target_path == *root || target_path.starts_with(root));
+    if !inside_verified_config_root {
+        return false;
+    }
+
+    let file_name = basename(&normalized_target);
+    let config_key = config_match_key(&file_stem_from_path(&file_name));
+    if config_key.len() < 4 {
+        return false;
+    }
+    if record.runtime_id.as_deref().is_some_and(|runtime| {
+        let lower_name = file_name.to_ascii_lowercase();
+        match runtime {
+            "bepinex" | "bepinex-il2cpp" => {
+                matches!(lower_name.as_str(), "bepinex.cfg" | "doorstop_config.ini")
+            }
+            "ue4ss" => lower_name == "ue4ss-settings.ini",
+            "reframework" => matches!(lower_name.as_str(), "reframework.ini" | "dinput8.ini"),
+            _ => false,
+        }
+    }) {
+        return true;
+    }
+
+    plan.mappings.iter().any(|mapping| {
+        [&mapping.source_path, &mapping.target_relative_path]
+            .into_iter()
+            .filter_map(|path| bundle_config_identity_key(path))
+            .any(|identity| bundle_config_key_matches_identity(&config_key, &identity))
+    })
+}
+
+fn bundle_config_identity_key(path: &str) -> Option<String> {
+    let mut stem = file_stem_from_path(path);
+    let lower_stem = stem.to_ascii_lowercase();
+    for suffix in ["_p", "-p", ".p"] {
+        if lower_stem.ends_with(suffix) && stem.len() > suffix.len() {
+            stem.truncate(stem.len() - suffix.len());
+            break;
+        }
+    }
+    let identity = config_match_key(&stem);
+    (identity.len() >= 4 && !is_generic_config_needle(&identity)).then_some(identity)
+}
+
+fn bundle_config_key_matches_identity(config_key: &str, identity: &str) -> bool {
+    config_key == identity
+        || ["config", "settings", "options"]
+            .into_iter()
+            .any(|suffix| config_key == format!("{identity}{suffix}"))
 }
 
 fn install_profile_bootstrap_dependencies(root: &Path, profile: &GameProfile) -> Vec<String> {
@@ -4031,6 +4780,31 @@ fn update_runtime_from_archive(
     release: &ReleaseDependencyRef,
     archive_path: &Path,
 ) -> Result<(RuntimeUpdateResult, Vec<String>), String> {
+    let ((result, mut warnings), graph_warnings) =
+        run_install_graph_transaction(root, profile, || {
+            update_runtime_from_archive_inner(
+                root,
+                profile,
+                runtime,
+                dependency,
+                record,
+                release,
+                archive_path,
+            )
+        })?;
+    warnings.extend(graph_warnings);
+    Ok((result, warnings))
+}
+
+fn update_runtime_from_archive_inner(
+    root: &Path,
+    profile: &GameProfile,
+    runtime: &str,
+    dependency: &DependencySpec,
+    record: &InstalledModRecord,
+    release: &ReleaseDependencyRef,
+    archive_path: &Path,
+) -> Result<(RuntimeUpdateResult, Vec<String>), String> {
     let (plan, preserved_configs, plan_warnings) =
         runtime_plan_from_source(root, profile, runtime, record, archive_path)?;
     if plan.mappings.is_empty() {
@@ -4073,7 +4847,7 @@ fn update_runtime_from_archive(
     let stale_cleanup = match cleanup_stale_runtime_files(root, profile, record, &deployment) {
         Ok(cleanup) => cleanup,
         Err(error) => {
-            deployment.rollback();
+            let _ = deployment.rollback();
             cleanup_runtime_update_source(&managed_source);
             let _ = rollback_install_graph(root, profile, &checkpoint);
             return Err(error);
@@ -4120,10 +4894,9 @@ fn update_runtime_from_archive(
             dependency_string: Some(format!("{}@{}", release.source_key, release.version)),
             package_provider: Some(dependency.provider.clone()),
             package_version: Some(release.version.clone()),
-            source_archive_sha256: managed_source
-                .is_file()
-                .then(|| sha256_file(&managed_source))
-                .transpose()?,
+            provider_file_id: previous_record.provider_file_id.clone(),
+            provider_variant: Some(release.display_name.clone()),
+            source_archive_sha256: Some(sha256_managed_source(&managed_source)?),
             icon_url: previous_record.icon_url.clone(),
             adapter_id: plan.adapter_id.clone(),
             summary: format!(
@@ -4141,6 +4914,9 @@ fn update_runtime_from_archive(
             enabled: true,
             last_status: "installed".to_string(),
             plan: Some(plan.clone()),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
 
         let deployment_refs = [&deployment];
@@ -4159,7 +4935,11 @@ fn update_runtime_from_archive(
             let mut warnings = stale_cleanup.warnings.clone();
             warnings.extend(plan_warnings);
             stale_cleanup.commit();
-            deployment.commit();
+            if let Err(error) = deployment.commit() {
+                warnings.push(format!(
+                    "The runtime update was committed, but deployment cleanup is pending: {error}"
+                ));
+            }
             remove_replaced_runtime_source(root, profile, record, &updated_record);
             Ok((
                 RuntimeUpdateResult {
@@ -4173,7 +4953,7 @@ fn update_runtime_from_archive(
         }
         Err(error) => {
             stale_cleanup.rollback();
-            deployment.rollback();
+            let _ = deployment.rollback();
             cleanup_runtime_update_source(&managed_source);
             let rollback_error = rollback_install_graph(root, profile, &checkpoint).err();
             if let Some(rollback_error) = rollback_error {
@@ -4413,12 +5193,22 @@ fn cleanup_stale_runtime_files(
         .map(|path| normalize_filesystem_identity(path))
         .collect::<HashSet<_>>();
     let game_root = Path::new(&profile.game_path);
+    let transaction_id = Uuid::new_v4().to_string();
     let transaction_root = profile_dir(root, &profile.id)
         .join("transactions")
-        .join(format!("runtime-stale-{}", Uuid::new_v4()));
+        .join(&transaction_id);
     let rollback_root = transaction_root.join("rollback");
     let backup_root = profile_backup_dir(root, &profile.id, &previous.id);
     let mut cleanup = RuntimeStaleCleanup::default();
+    let mut journal = DeactivationJournal {
+        version: DEACTIVATION_JOURNAL_VERSION,
+        id: transaction_id,
+        profile_id: profile.id.clone(),
+        record_id: previous.id.clone(),
+        game_path: profile.game_path.clone(),
+        original_record: previous.clone(),
+        entries: Vec::new(),
+    };
 
     for stale in &previous.files_written {
         if current_paths.contains(&normalize_filesystem_identity(stale)) {
@@ -4457,13 +5247,32 @@ fn cleanup_stale_runtime_files(
         }
         let immediate_backup =
             rollback_root.join(format!("{}.bin", cleanup.rollback_entries.len()));
-        fs::copy(&destination, &immediate_backup).map_err(error_to_string)?;
+        copy_file_synced(&destination, &immediate_backup)?;
         cleanup.rollback_entries.push(DeploymentRollbackEntry {
             destination: destination.clone(),
-            immediate_backup: Some(immediate_backup),
+            immediate_backup: Some(immediate_backup.clone()),
         });
 
         let original_backup = safe_join(&backup_root, &to_portable_path(relative))?;
+        let snapshot_file = immediate_backup
+            .strip_prefix(&transaction_root)
+            .map(to_portable_path)
+            .map_err(|_| "Runtime cleanup snapshot escaped its transaction folder.".to_string())?;
+        journal.entries.push(DeactivationJournalEntry {
+            target_root: "game".to_string(),
+            target_relative_path: to_portable_path(relative),
+            snapshot_file: Some(snapshot_file),
+            expected_deactivated_sha256: original_backup
+                .is_file()
+                .then(|| sha256_file(&original_backup))
+                .transpose()?,
+        });
+        if let Err(error) = write_deactivation_journal(&transaction_root, &journal) {
+            cleanup.rollback();
+            return Err(format!(
+                "could not checkpoint obsolete runtime cleanup: {error}"
+            ));
+        }
         let change_result = if original_backup.is_file() {
             replace_file_from_path(&original_backup, &destination)
         } else {
@@ -4517,6 +5326,105 @@ fn read_bundle_manifest(zip: &mut ZipArchive<File>) -> Result<ProfileBundleManif
         .by_name("manifest.json")
         .map_err(|_| "Profile bundle is missing manifest.json.".to_string())?;
     serde_json::from_reader(manifest_file).map_err(error_to_string)
+}
+
+fn validate_profile_bundle_manifest(
+    manifest: &ProfileBundleManifest,
+    game_path: Option<&Path>,
+) -> Result<(), String> {
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "Unsupported profile bundle version: {}",
+            manifest.schema_version
+        ));
+    }
+    if manifest.mods.len() > MAX_ARCHIVE_ENTRIES
+        || manifest.config_files.len() > MAX_PROFILE_CONFIG_FILES
+    {
+        return Err("Profile bundle contains too many managed entries.".to_string());
+    }
+
+    let mut mod_ids = HashSet::new();
+    let mut records = HashMap::new();
+    for bundle_mod in &manifest.mods {
+        let mod_id = bundle_mod.record.id.trim();
+        if mod_id.is_empty() || !mod_ids.insert(mod_id.to_ascii_lowercase()) {
+            return Err("Profile bundle contains a missing or duplicate mod identity.".to_string());
+        }
+        let source_relative_path = sanitize_bundle_relative_path(&bundle_mod.source_relative_path)?;
+        if source_relative_path.is_empty() {
+            return Err(format!(
+                "Profile bundle source path is missing for {}.",
+                display_record_name(&bundle_mod.record)
+            ));
+        }
+        records.insert(mod_id.to_ascii_lowercase(), &bundle_mod.record);
+    }
+
+    let exported_game_path = Path::new(&manifest.profile.game_path);
+    let mut target_paths = HashSet::new();
+    let mut bundle_paths = HashSet::new();
+    for config in &manifest.config_files {
+        let mod_key = config.mod_id.trim().to_ascii_lowercase();
+        let record = records.get(&mod_key).ok_or_else(|| {
+            format!(
+                "Profile bundle config references an unknown mod: {}",
+                config.mod_id
+            )
+        })?;
+        let target_relative_path = sanitize_bundle_relative_path(&config.target_relative_path)?;
+        let bundle_path = sanitize_bundle_relative_path(&config.bundle_path)?;
+        let expected_bundle_path = normalize_archive_path(&format!(
+            "configs/{}/{}",
+            sanitize_file_segment(&config.mod_id),
+            target_relative_path
+        ));
+        if !bundle_path.eq_ignore_ascii_case(&expected_bundle_path) {
+            return Err(format!(
+                "Profile bundle config is outside its owning namespace: {}",
+                config.bundle_path
+            ));
+        }
+        if !bundle_paths.insert(bundle_path.to_ascii_lowercase())
+            || !target_paths.insert(target_relative_path.to_ascii_lowercase())
+        {
+            return Err(format!(
+                "Profile bundle contains a duplicate config destination: {}",
+                config.target_relative_path
+            ));
+        }
+
+        let target_shape = Path::new(&target_relative_path);
+        if !is_user_editable_config_file(target_shape) {
+            return Err(format!(
+                "Profile bundle refused a non-config or localization target: {}",
+                config.target_relative_path
+            ));
+        }
+        if let Some(game_path) = game_path {
+            let destination = safe_join(game_path, &target_relative_path)?;
+            validate_deployment_containment(game_path, &destination)?;
+        }
+
+        let owned_target = record.config_files.iter().any(|owned_path| {
+            Path::new(owned_path)
+                .strip_prefix(exported_game_path)
+                .ok()
+                .map(to_portable_path)
+                .is_some_and(|relative| {
+                    normalize_archive_path(&relative).eq_ignore_ascii_case(&target_relative_path)
+                })
+        });
+        if !owned_target {
+            return Err(format!(
+                "Profile bundle config target is not owned by {}: {}",
+                display_record_name(record),
+                config.target_relative_path
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -4821,13 +5729,23 @@ async fn install_archive(app: AppHandle, request: InstallRequest) -> Result<Inst
         let root = store_root(&app)?;
         let profile = get_profile(&root, &request.profile_id)?;
         ensure_verified_steam_profile(&profile)?;
+        ensure_game_files_mutable(&profile, "install mods")?;
+        let scanned = scan_import_source(&root, Path::new(&request.archive_path))?;
+        let verified_archive_name = scanned.archive_name.clone();
+        let analysis = analyze_scanned_archive(scanned, &profile);
+        let verified_plan = analysis.recommended_plan.ok_or_else(|| {
+            format!(
+                "{} No files were changed.",
+                analysis.compatibility.reason.trim()
+            )
+        })?;
         install_archive_impl(
             &root,
             &profile,
             &request.archive_path,
-            request.archive_name.as_deref(),
-            request.package_identity,
-            &request.plan,
+            Some(&verified_archive_name),
+            Some(analysis.package_identity),
+            &verified_plan,
         )
     })
     .await
@@ -4898,7 +5816,14 @@ async fn install_discovered_mod(
         let root = store_root(&app)?;
         let profile = get_profile(&root, &profile_id)?;
         ensure_verified_steam_profile(&profile)?;
+        ensure_game_files_mutable(&profile, "install or update mods")?;
         let settings = read_app_settings(&root)?;
+        let install_target_id = carried_forward_install_target_id(
+            &root,
+            &profile,
+            replace_installed_mod_id.as_deref(),
+            install_target_id,
+        )?;
 
         replace_installed_mod_transaction(
             &root,
@@ -4933,6 +5858,31 @@ async fn install_discovered_mod(
     })
     .await
     .map_err(error_to_string)?
+}
+
+fn carried_forward_install_target_id(
+    store_root: &Path,
+    profile: &GameProfile,
+    replace_installed_mod_id: Option<&str>,
+    supplied_install_target_id: Option<String>,
+) -> Result<Option<String>, String> {
+    if supplied_install_target_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(supplied_install_target_id);
+    }
+    let Some(replace_id) = replace_installed_mod_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    Ok(
+        read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+            .map_err(error_to_string)?
+            .items
+            .into_iter()
+            .find(|record| record.profile_id == profile.id && record.id == replace_id)
+            .and_then(|record| record.selected_install_target_id),
+    )
 }
 
 fn replace_installed_mod_transaction<F>(
@@ -4970,6 +5920,7 @@ where
     {
         return Err("The selected update does not match the installed provider package. No files were changed.".to_string());
     }
+    let preserved_configs = snapshot_record_configs(profile, &record)?;
 
     let replacement_journal = begin_replacement_journal(
         store_root,
@@ -4977,6 +5928,7 @@ where
         &record.id,
         expected_package_id,
         checkpoint.clone(),
+        &preserved_configs,
     )?;
     if record.enabled {
         if let Err(error) = deactivate_mod_files(store_root, profile, &record) {
@@ -4993,7 +5945,9 @@ where
             content: serialize_json_line(&without_previous)?,
         }],
     ) {
-        let restore = restore_checkpoint_record(store_root, profile, &record);
+        let restore = restore_checkpoint_record(store_root, profile, &record).and_then(|_| {
+            restore_config_snapshots_to_record(store_root, profile, &record.id, &preserved_configs)
+        });
         if restore.is_ok() {
             let _ = finish_replacement_journal(&replacement_journal);
         }
@@ -5038,13 +5992,37 @@ where
                         Ok(replacement)
                     }
                 });
-            if let Err(error) = replacement {
-                return match recover_previous_replacement_version(
+            let replacement = match replacement {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    return match recover_previous_replacement_version_with_configs(
+                        store_root,
+                        profile,
+                        &checkpoint,
+                        &record,
+                        &replacement_journal,
+                        &preserved_configs,
+                    ) {
+                        Ok(()) => Err(format!("{error} The previous version was restored.")),
+                        Err(recovery_error) => Err(format!(
+                            "{error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
+                        )),
+                    };
+                }
+            };
+            if let Err(error) = ensure_replacement_preserves_reverse_dependencies(
+                profile,
+                &checkpoint.items,
+                &record,
+                &replacement,
+            ) {
+                return match recover_previous_replacement_version_with_configs(
                     store_root,
                     profile,
                     &checkpoint,
                     &record,
                     &replacement_journal,
+                    &preserved_configs,
                 ) {
                     Ok(()) => Err(format!("{error} The previous version was restored.")),
                     Err(recovery_error) => Err(format!(
@@ -5052,16 +6030,123 @@ where
                     )),
                 };
             }
-            cleanup_install_data(store_root, &profile.id, &record.id);
-            finish_replacement_journal(&replacement_journal)?;
+            if let Err(error) =
+                restore_config_snapshots_to_record(store_root, profile, &replacement.id, &preserved_configs)
+            {
+                return match recover_previous_replacement_version_with_configs(
+                    store_root,
+                    profile,
+                    &checkpoint,
+                    &record,
+                    &replacement_journal,
+                    &preserved_configs,
+                ) {
+                    Ok(()) => Err(format!(
+                        "The replacement installed, but its saved configuration could not be restored: {error} The previous version was restored."
+                    )),
+                    Err(recovery_error) => Err(format!(
+                        "The replacement installed, but its saved configuration could not be restored: {error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
+                    )),
+                };
+            }
+            if !record.enabled {
+                let disabled_replacement =
+                    read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+                        .map_err(error_to_string)
+                        .and_then(|store| {
+                            store
+                                .items
+                                .into_iter()
+                                .find(|candidate| {
+                                    candidate.profile_id == profile.id
+                                        && candidate.id == replacement.id
+                                })
+                                .ok_or_else(|| {
+                                    "The replacement disappeared before its disabled state could be restored."
+                                        .to_string()
+                                })
+                        })
+                        .and_then(|replacement| {
+                            let deactivated =
+                                deactivate_mod_files(store_root, profile, &replacement)?;
+                            let mut updated = replacement.clone();
+                            updated.enabled = false;
+                            updated.last_status = "disabled".to_string();
+                            if let Err(error) = commit_installed_mod_records(
+                                store_root,
+                                profile,
+                                std::slice::from_ref(&updated),
+                                &[],
+                            ) {
+                                return match restore_deactivated_mods(
+                                    store_root,
+                                    profile,
+                                    std::slice::from_ref(&replacement),
+                                ) {
+                                    Ok(()) => Err(error),
+                                    Err(restore_error) => {
+                                        Err(format!("{error} {restore_error}"))
+                                    }
+                                };
+                            }
+                            Ok(deactivated)
+                        });
+                if let Err(error) = disabled_replacement {
+                    return match recover_previous_replacement_version_with_configs(
+                        store_root,
+                        profile,
+                        &checkpoint,
+                        &record,
+                        &replacement_journal,
+                        &preserved_configs,
+                    ) {
+                        Ok(()) => Err(format!(
+                            "The replacement installed, but the mod's disabled state could not be preserved: {error} The previous version was restored."
+                        )),
+                        Err(recovery_error) => Err(format!(
+                            "The replacement installed, but the mod's disabled state could not be preserved: {error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
+                        )),
+                    };
+                }
+            }
+            if let Err(error) = mark_replacement_journal_ready(
+                &replacement_journal,
+                &replacement.id,
+            ) {
+                return match recover_previous_replacement_version_with_configs(
+                    store_root,
+                    profile,
+                    &checkpoint,
+                    &record,
+                    &replacement_journal,
+                    &preserved_configs,
+                ) {
+                    Ok(()) => Err(format!(
+                        "The replacement was validated, but its recovery checkpoint could not be committed: {error} The previous version was restored."
+                    )),
+                    Err(recovery_error) => Err(format!(
+                        "The replacement was validated, but its recovery checkpoint could not be committed: {error} Mod Garrison also could not fully restore the previous version: {recovery_error}"
+                    )),
+                };
+            }
+            if !install_graph_active() {
+                commit_replacement_journals(
+                    store_root,
+                    profile,
+                    std::slice::from_ref(&replacement_journal),
+                )?;
+                finish_replacement_journal(&replacement_journal)?;
+                cleanup_install_data(store_root, &profile.id, &record.id);
+            }
             Ok(result)
         }
-        Err(error) => match recover_previous_replacement_version(
+        Err(error) => match recover_previous_replacement_version_with_configs(
             store_root,
             profile,
             &checkpoint,
             &record,
             &replacement_journal,
+            &preserved_configs,
         ) {
             Ok(()) => Err(format!("{error} The previous version was restored.")),
             Err(recovery_error) => Err(format!(
@@ -5071,15 +6156,235 @@ where
     }
 }
 
-fn recover_previous_replacement_version(
+#[derive(Debug, Clone)]
+struct ConfigSnapshot {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn apply_config_snapshots_to_target_plan(
+    profile: &GameProfile,
+    original: &InstalledModRecord,
+    previous_target: Option<&InstallTargetOption>,
+    selected_target: &InstallTargetOption,
+    selected_plan: &mut InstallPlan,
+    snapshots: &[ConfigSnapshot],
+) -> Result<(), String> {
+    let game_root = Path::new(&profile.game_path);
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        validate_deployment_containment(game_root, &snapshot.path)?;
+        let old_relative_path = snapshot
+            .path
+            .strip_prefix(game_root)
+            .map(to_portable_path)
+            .map_err(|_| {
+                format!(
+                    "Configuration is outside the game folder: {}",
+                    snapshot.path.to_string_lossy()
+                )
+            })?;
+        let target_relative_path = remap_target_config_path(
+            original,
+            selected_plan,
+            previous_target,
+            selected_target,
+            &old_relative_path,
+        );
+        validate_archive_relative_path(&target_relative_path)?;
+        let target_path = safe_join(game_root, &target_relative_path)?;
+        validate_deployment_containment(game_root, &target_path)?;
+        if !is_user_editable_config_file(&target_path) {
+            return Err(format!(
+                "Configuration cannot be moved to a non-config target: {}",
+                target_path.to_string_lossy()
+            ));
+        }
+        let content = std::str::from_utf8(&snapshot.bytes).map_err(|_| {
+            format!(
+                "Configuration is not UTF-8 and cannot be moved safely: {}",
+                snapshot.path.to_string_lossy()
+            )
+        })?;
+
+        if let Some(mapping) = selected_plan.mappings.iter_mut().find(|mapping| {
+            mapping.target_root.eq_ignore_ascii_case("game")
+                && normalize_archive_path(&mapping.target_relative_path)
+                    .eq_ignore_ascii_case(&target_relative_path)
+        }) {
+            mapping.generated_content = Some(content.to_string());
+            mapping.reason =
+                "Preserved user configuration moved with the selected install target.".to_string();
+        } else {
+            push_unique_mapping(
+                &mut selected_plan.mappings,
+                generated_mapping(
+                    &format!("target-config-{index}"),
+                    "game",
+                    &target_relative_path,
+                    "Preserved user configuration moved with the selected install target.",
+                    content,
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remap_target_config_path(
+    original: &InstalledModRecord,
+    selected_plan: &InstallPlan,
+    previous_target: Option<&InstallTargetOption>,
+    selected_target: &InstallTargetOption,
+    old_relative_path: &str,
+) -> String {
+    if let Some(original_plan) = original.plan.as_ref() {
+        if let Some(original_mapping) = original_plan.mappings.iter().find(|mapping| {
+            mapping.target_root.eq_ignore_ascii_case("game")
+                && normalize_archive_path(&mapping.target_relative_path)
+                    .eq_ignore_ascii_case(old_relative_path)
+        }) {
+            if let Some(selected_mapping) = selected_plan.mappings.iter().find(|mapping| {
+                mapping.target_root.eq_ignore_ascii_case("game")
+                    && mapping
+                        .source_path
+                        .eq_ignore_ascii_case(&original_mapping.source_path)
+                    && is_user_editable_config_file(Path::new(&mapping.target_relative_path))
+            }) {
+                return normalize_archive_path(&selected_mapping.target_relative_path);
+            }
+        }
+    }
+
+    if let Some(previous_target) = previous_target {
+        let previous_prefix = normalize_archive_path(&previous_target.relative_path);
+        if let Some(suffix) = archive_path_relative_to(old_relative_path, &previous_prefix) {
+            return join_install_route(&selected_target.relative_path, &suffix);
+        }
+    }
+    normalize_archive_path(old_relative_path)
+}
+
+fn snapshot_record_configs(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+) -> Result<Vec<ConfigSnapshot>, String> {
+    let discovered = discover_profile_config_files(profile);
+    let mut snapshots = Vec::new();
+    for config_path in resolved_config_files_for_record(profile, record, &discovered) {
+        let path = PathBuf::from(config_path);
+        if !path.is_file() {
+            continue;
+        }
+        validate_deployment_containment(Path::new(&profile.game_path), &path)?;
+        snapshots.push(ConfigSnapshot {
+            bytes: fs::read(&path).map_err(error_to_string)?,
+            path,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn restore_config_snapshots_to_record(
+    store_root: &Path,
+    profile: &GameProfile,
+    installed_mod_id: &str,
+    snapshots: &[ConfigSnapshot],
+) -> Result<(), String> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let mut store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let mut record = store
+        .items
+        .drain(..)
+        .find(|record| record.profile_id == profile.id && record.id == installed_mod_id)
+        .ok_or_else(|| {
+            "Could not find the installed record while restoring saved configuration.".to_string()
+        })?;
+
+    restore_config_snapshots_into_record(profile, &mut record, snapshots)?;
+    commit_installed_mod_records(store_root, profile, std::slice::from_ref(&record), &[])
+}
+
+fn restore_config_snapshots_into_record(
+    profile: &GameProfile,
+    record: &mut InstalledModRecord,
+    snapshots: &[ConfigSnapshot],
+) -> Result<(), String> {
+    for snapshot in snapshots {
+        validate_deployment_containment(Path::new(&profile.game_path), &snapshot.path)?;
+        if !is_user_editable_config_file(&snapshot.path) {
+            return Err(format!(
+                "Saved configuration target is no longer a supported config file: {}",
+                snapshot.path.to_string_lossy()
+            ));
+        }
+        if let Some(parent) = snapshot.path.parent() {
+            fs::create_dir_all(parent).map_err(error_to_string)?;
+        }
+        atomic_write(&snapshot.path, &snapshot.bytes).map_err(error_to_string)?;
+        let hash = sha256_file(&snapshot.path)?;
+        upsert_written_file_hash(record, &snapshot.path, &hash);
+        merge_config_path(&mut record.config_files, &snapshot.path);
+    }
+    Ok(())
+}
+
+fn restore_config_snapshots_into_deployment(
+    profile: &GameProfile,
+    deployment: &mut DeploymentOutcome,
+    snapshots: &[ConfigSnapshot],
+) -> Result<(), String> {
+    let managed_paths = deployment
+        .files_written
+        .iter()
+        .map(|path| normalize_filesystem_identity(path))
+        .collect::<HashSet<_>>();
+    for snapshot in snapshots {
+        validate_deployment_containment(Path::new(&profile.game_path), &snapshot.path)?;
+        if !is_user_editable_config_file(&snapshot.path) {
+            return Err(format!(
+                "Saved configuration target is no longer a supported config file: {}",
+                snapshot.path.to_string_lossy()
+            ));
+        }
+        let identity = normalize_filesystem_identity(snapshot.path.to_string_lossy().as_ref());
+        if !managed_paths.contains(&identity) {
+            continue;
+        }
+        let _guard = lock_store_io().map_err(error_to_string)?;
+        atomic_write_unlocked_with_backup(&snapshot.path, &snapshot.bytes, false)
+            .map_err(error_to_string)?;
+        drop(_guard);
+        let hash = sha256_file(&snapshot.path)?;
+        if let Some(existing) = deployment
+            .written_file_hashes
+            .iter_mut()
+            .find(|(path, _)| normalize_filesystem_identity(path) == identity)
+            .map(|(_, hash)| hash)
+        {
+            *existing = hash;
+        } else {
+            deployment
+                .written_file_hashes
+                .insert(snapshot.path.to_string_lossy().to_string(), hash);
+        }
+    }
+    Ok(())
+}
+
+fn recover_previous_replacement_version_with_configs(
     store_root: &Path,
     profile: &GameProfile,
     checkpoint: &StoreFile<InstalledModRecord>,
     record: &InstalledModRecord,
     replacement_journal: &Path,
+    snapshots: &[ConfigSnapshot],
 ) -> Result<(), String> {
     rollback_install_graph(store_root, profile, checkpoint)?;
     restore_checkpoint_record(store_root, profile, record)?;
+    restore_config_snapshots_to_record(store_root, profile, &record.id, snapshots)?;
     finish_replacement_journal(replacement_journal)
 }
 
@@ -5363,6 +6668,12 @@ async fn begin_nexus_browser_download(
         let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
         let file = choose_requested_nexus_file(&files, Some(&selected_file_id))?
             .ok_or_else(|| "The selected Nexus file is no longer available.".to_string())?;
+        let install_target_id = carried_forward_install_target_id(
+            &root,
+            &profile,
+            replace_installed_mod_id.as_deref(),
+            install_target_id,
+        )?;
         let now = Utc::now().timestamp();
         let pending = PendingNexusDownload {
             profile_id,
@@ -5407,6 +6718,7 @@ async fn install_nexus_nxm_link(
         let pending = find_pending_nexus_download(&root, &nxm)?;
         let profile = get_profile(&root, &pending.profile_id)?;
         ensure_verified_steam_profile(&profile)?;
+        ensure_game_files_mutable(&profile, "install or update mods")?;
         let provider_game_id = verified_discovery_provider_game(
             &root,
             &profile,
@@ -5444,6 +6756,7 @@ async fn install_nexus_nxm_link(
                     pending.version.clone(),
                     provider_game_id.clone(),
                     pending.install_target_id.as_deref(),
+                    None,
                     &mut visited_dependencies,
                     0,
                 )
@@ -5643,35 +6956,36 @@ fn update_mod_config_value(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &input.profile_id)?;
+    ensure_game_files_mutable(&profile, "edit mod configuration")?;
+    update_mod_config_value_impl(&root, &profile, &input)
+}
+
+fn update_mod_config_value_impl(
+    root: &Path,
+    profile: &GameProfile,
+    input: &UpdateModConfigValueInput,
+) -> Result<ModConfigFile, String> {
     let path = PathBuf::from(&input.file_path);
 
-    validate_config_file_for_edit(&root, &profile, &path)?;
-    let content = fs::read_to_string(&path).map_err(error_to_string)?;
+    validate_config_file_for_edit(root, profile, &path)?;
+    let original_bytes = fs::read(&path).map_err(error_to_string)?;
+    let content = std::str::from_utf8(&original_bytes).map_err(error_to_string)?;
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_lowercase());
     let next_content = match extension.as_deref() {
-        Some("json") => update_json_config_content(
-            &content,
-            input.section.as_deref(),
-            &input.key,
-            &input.value,
-        )?,
-        Some("toml") => update_toml_config_content(
-            &content,
-            input.section.as_deref(),
-            &input.key,
-            &input.value,
-        )?,
-        Some("yaml") | Some("yml") => update_yaml_config_content(
-            &content,
-            input.section.as_deref(),
-            &input.key,
-            &input.value,
-        )?,
+        Some("json") => {
+            update_json_config_content(content, input.section.as_deref(), &input.key, &input.value)?
+        }
+        Some("toml") => {
+            update_toml_config_content(content, input.section.as_deref(), &input.key, &input.value)?
+        }
+        Some("yaml") | Some("yml") => {
+            update_yaml_config_content(content, input.section.as_deref(), &input.key, &input.value)?
+        }
         _ => update_key_value_config_content(
-            &content,
+            content,
             input.section.as_deref(),
             &input.key,
             &input.value,
@@ -5680,7 +6994,99 @@ fn update_mod_config_value(
 
     validate_structured_config_content(extension.as_deref(), &next_content)?;
     atomic_write(&path, next_content.as_bytes()).map_err(error_to_string)?;
-    read_mod_config_file(&root, &profile, &input.file_path)
+
+    let updated_hash = match sha256_file(&path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return Err(restore_config_after_failed_edit(
+                &path,
+                &original_bytes,
+                format!("Could not verify the updated config file: {error}"),
+            ));
+        }
+    };
+    let store = match read_store::<InstalledModRecord>(&installed_mods_path(root)) {
+        Ok(store) => store,
+        Err(error) => {
+            return Err(restore_config_after_failed_edit(
+                &path,
+                &original_bytes,
+                format!("Could not load installed mod records: {error}"),
+            ));
+        }
+    };
+    let mut owning_records = store
+        .items
+        .into_iter()
+        .filter(|record| installed_record_owns_config_path(profile, record, &path))
+        .collect::<Vec<_>>();
+    for record in &mut owning_records {
+        upsert_written_file_hash(record, &path, &updated_hash);
+        merge_config_path(&mut record.config_files, &path);
+    }
+
+    if let Err(error) = commit_installed_mod_records(root, profile, &owning_records, &[]) {
+        return Err(restore_config_after_failed_edit(
+            &path,
+            &original_bytes,
+            format!("Could not save the updated config receipt: {error}"),
+        ));
+    }
+
+    read_mod_config_file(root, profile, &input.file_path)
+}
+
+fn installed_record_owns_config_path(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    path: &Path,
+) -> bool {
+    if record.profile_id != profile.id {
+        return false;
+    }
+    let path_identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+    record
+        .files_written
+        .iter()
+        .chain(record.config_files.iter())
+        .any(|candidate| normalize_filesystem_identity(candidate) == path_identity)
+        || config_file_matches_record(profile, record, path.to_string_lossy().as_ref())
+}
+
+fn upsert_written_file_hash(record: &mut InstalledModRecord, path: &Path, hash: &str) {
+    let path_identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+    if let Some((_, existing_hash)) = record
+        .written_file_hashes
+        .iter_mut()
+        .find(|(candidate, _)| normalize_filesystem_identity(candidate) == path_identity)
+    {
+        *existing_hash = hash.to_string();
+    } else {
+        record
+            .written_file_hashes
+            .insert(path.to_string_lossy().to_string(), hash.to_string());
+    }
+}
+
+fn merge_config_path(config_files: &mut Vec<String>, path: &Path) {
+    let mut seen = config_files
+        .iter()
+        .map(|path| normalize_filesystem_identity(path))
+        .collect::<HashSet<_>>();
+    let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+    if seen.insert(identity) {
+        config_files.push(path.to_string_lossy().to_string());
+    }
+}
+
+fn restore_config_after_failed_edit(path: &Path, original_bytes: &[u8], error: String) -> String {
+    match atomic_write(path, original_bytes) {
+        Ok(()) => format!("{error} The config edit was rolled back."),
+        Err(rollback_error) => format!(
+            "{error} Restoring the original config also failed: {}",
+            error_to_string(rollback_error)
+        ),
+    }
 }
 
 #[tauri::command]
@@ -5705,6 +7111,7 @@ fn disable_mod_sync(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
+    ensure_game_files_mutable(&profile, "disable mods")?;
     let path = installed_mods_path(&root);
     let store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
     let record_index = store
@@ -5727,16 +7134,25 @@ fn disable_mod_sync(
             warnings: vec!["Mod is already disabled.".to_string()],
         });
     }
+    ensure_mod_has_no_active_reverse_dependencies(&profile, &store.items, &original)?;
 
-    let files_changed = deactivate_mod_files(&root, &profile, &original)?;
+    let deactivation = deactivate_mod_files_with_policy(
+        &root,
+        &profile,
+        &original,
+        ModifiedFilePolicy::PreserveConfigChanges,
+    )?;
+    let files_changed = deactivation.files_changed;
     let mut updated = original.clone();
     updated.enabled = false;
     updated.last_status = "disabled".to_string();
     if let Err(error) =
         commit_installed_mod_records(&root, &profile, std::slice::from_ref(&updated), &[])
     {
-        restore_deactivated_mods(&root, &profile, std::slice::from_ref(&original));
-        return Err(error);
+        return match restore_deactivated_mods(&root, &profile, std::slice::from_ref(&original)) {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!("{error} {restore_error}")),
+        };
     }
 
     Ok(ModActionResult {
@@ -5768,6 +7184,7 @@ fn enable_mod_sync(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
+    ensure_game_files_mutable(&profile, "enable mods")?;
     let path = installed_mods_path(&root);
     let store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
     let record_index = store
@@ -5793,7 +7210,8 @@ fn enable_mod_sync(
         "This older install record cannot be re-enabled because it has no install plan.".to_string()
     })?;
     verify_managed_source_integrity(&original, Path::new(&original.archive_path))?;
-    let deployment = deploy_plan_transaction(
+    let config_snapshots = snapshot_record_configs(&profile, &original)?;
+    let mut deployment = deploy_plan_transaction(
         &root,
         &profile,
         &original.id,
@@ -5801,13 +7219,24 @@ fn enable_mod_sync(
         &plan,
         Some(&original.id),
     )?;
+    if let Err(error) =
+        restore_config_snapshots_into_deployment(&profile, &mut deployment, &config_snapshots)
+    {
+        let rollback_error = deployment.rollback().err();
+        return Err(format!(
+            "Could not restore the saved mod configuration while enabling it: {error}{}",
+            rollback_error
+                .map(|rollback_error| format!(" {rollback_error}"))
+                .unwrap_or_default()
+        ));
+    }
     let mut updated = original.clone();
     updated.enabled = true;
     updated.last_status = "installed".to_string();
     updated.files_written = deployment.files_written.clone();
     updated.backups_written = deployment.backups_written.clone();
     updated.written_file_hashes = deployment.written_file_hashes.clone();
-    updated.config_files = config_files_from_paths(&updated.files_written);
+    updated.config_files = merged_config_files(&original.config_files, &updated.files_written);
     let deployment_refs = [&deployment];
     if let Err(error) = commit_installed_mod_records(
         &root,
@@ -5815,19 +7244,740 @@ fn enable_mod_sync(
         std::slice::from_ref(&updated),
         &deployment_refs,
     ) {
-        deployment.rollback();
+        let _ = deployment.rollback();
         return Err(error);
     }
     let files_changed = deployment.files_written.clone();
-    deployment.commit();
+    let warnings = deployment
+        .commit()
+        .err()
+        .map(|error| format!("The mod was enabled, but deployment cleanup is pending: {error}"))
+        .into_iter()
+        .collect();
 
     Ok(ModActionResult {
         profile_id,
         installed_mod_id,
         status: "installed".to_string(),
         files_changed,
-        warnings: Vec::new(),
+        warnings,
     })
+}
+
+#[tauri::command]
+async fn set_mod_install_target(
+    app: AppHandle,
+    profile_id: String,
+    installed_mod_id: String,
+    install_target_id: String,
+) -> Result<ModActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_operation = operation::profile_lock(&profile_id)?;
+        let _profile_operation = operation::lock_profile(&profile_operation)?;
+        let root = store_root(&app)?;
+        let profile = get_profile(&root, &profile_id)?;
+        ensure_game_files_mutable(&profile, "change a mod install target")?;
+        set_mod_install_target_impl(&root, &profile, &installed_mod_id, &install_target_id)
+    })
+    .await
+    .map_err(error_to_string)?
+}
+
+fn set_mod_install_target_impl(
+    store_root: &Path,
+    profile: &GameProfile,
+    installed_mod_id: &str,
+    install_target_id: &str,
+) -> Result<ModActionResult, String> {
+    let store = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let original = store
+        .items
+        .iter()
+        .find(|record| record.id == installed_mod_id && record.profile_id == profile.id)
+        .cloned()
+        .ok_or_else(|| format!("Installed mod not found: {installed_mod_id}"))?;
+    if original.runtime_id.is_some() {
+        return Err("System runtimes do not have selectable install targets.".to_string());
+    }
+    if original.externally_managed {
+        return Err(
+            "Externally managed mods cannot be moved by Mod Garrison. Reinstall this mod through Mod Garrison first."
+                .to_string(),
+        );
+    }
+    if original.selected_install_target_id.as_deref() == Some(install_target_id) {
+        return Ok(ModActionResult {
+            profile_id: profile.id.clone(),
+            installed_mod_id: original.id,
+            status: original.last_status,
+            files_changed: Vec::new(),
+            warnings: vec!["That install target is already active.".to_string()],
+        });
+    }
+    if !profile.mods_enabled {
+        return Err(
+            "Turn Mods ON before changing an install target. Mod Garrison will not rewrite target ownership while clean-launch suspension is active."
+                .to_string(),
+        );
+    }
+
+    let full_plan = original.install_target_plan.clone().ok_or_else(|| {
+        "This install does not retain a verified multi-target plan. Reinstall the mod before changing its target."
+            .to_string()
+    })?;
+    if original.install_targets.len() < 2 {
+        return Err("This mod does not have multiple verified install targets.".to_string());
+    }
+    let target = original
+        .install_targets
+        .iter()
+        .find(|target| target.id == install_target_id)
+        .cloned()
+        .ok_or_else(|| {
+            "The selected install target is no longer available for this mod.".to_string()
+        })?;
+    validate_persisted_install_target(profile, &full_plan, &target)?;
+    ensure_target_switch_preserves_reverse_dependencies(profile, &store.items, &original, &target)?;
+    verify_managed_source_integrity(&original, Path::new(&original.archive_path))?;
+
+    let config_snapshots = snapshot_record_configs(profile, &original)?;
+    let previous_target = original
+        .selected_install_target_id
+        .as_deref()
+        .and_then(|selected| {
+            original
+                .install_targets
+                .iter()
+                .find(|target| target.id == selected)
+        });
+    let mut selected_plan = full_plan;
+    apply_install_target_option(&mut selected_plan, &target)?;
+    apply_config_snapshots_to_target_plan(
+        profile,
+        &original,
+        previous_target,
+        &target,
+        &mut selected_plan,
+        &config_snapshots,
+    )?;
+    if let Some(reason) = incompatible_install_plan_reason(profile, &selected_plan) {
+        return Err(reason);
+    }
+    let mut visited_dependencies = HashSet::new();
+    let dependency_warnings = install_dependencies_for_plan_for_target(
+        store_root,
+        profile,
+        &selected_plan,
+        &mut visited_dependencies,
+        0,
+        Some(&target),
+    )?;
+    ensure_install_target_dependencies_available(store_root, profile, &selected_plan, &target)?;
+
+    let mut updated = original.clone();
+    updated.selected_install_target_id = Some(target.id.clone());
+    updated.plan = Some(selected_plan.clone());
+    if !original.enabled {
+        commit_installed_mod_records(store_root, profile, std::slice::from_ref(&updated), &[])?;
+        return Ok(ModActionResult {
+            profile_id: profile.id.clone(),
+            installed_mod_id: original.id,
+            status: updated.last_status,
+            files_changed: Vec::new(),
+            warnings: dependency_warnings
+                .into_iter()
+                .chain(std::iter::once(
+                    "The target will be used the next time this mod is enabled.".to_string(),
+                ))
+                .collect(),
+        });
+    }
+
+    let target_switch_journal = begin_target_switch_journal(
+        store_root,
+        profile,
+        &original,
+        &target.id,
+        &config_snapshots,
+    )?;
+    let transaction_id = target_switch_journal
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Could not create a valid target-switch transaction id.".to_string())?;
+    let backup_rotation_root =
+        target_switch_backup_rotation_root(store_root, &profile.id, transaction_id);
+
+    let deactivated_files = match deactivate_mod_files_with_policy(
+        store_root,
+        profile,
+        &original,
+        ModifiedFilePolicy::AllowConfigChanges,
+    ) {
+        Ok(outcome) => outcome.files_changed,
+        Err(error) => {
+            let cleanup_error = finish_target_switch_journal(&target_switch_journal).err();
+            return Err(target_switch_rollback_error(error, cleanup_error));
+        }
+    };
+    let backup_rotation = match InstallTargetBackupRotation::begin(
+        store_root,
+        profile,
+        &original.id,
+        backup_rotation_root,
+    ) {
+        Ok(rotation) => rotation,
+        Err(error) => {
+            let restore_error = recover_previous_target_after_failure(
+                store_root,
+                profile,
+                &original,
+                &target_switch_journal,
+                None,
+                &config_snapshots,
+            )
+            .err();
+            return Err(target_switch_rollback_error(error, restore_error));
+        }
+    };
+    let deployment = match deploy_plan_transaction(
+        store_root,
+        profile,
+        &original.id,
+        Path::new(&original.archive_path),
+        &selected_plan,
+        Some(&original.id),
+    ) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            let restore_error = recover_previous_target_after_failure(
+                store_root,
+                profile,
+                &original,
+                &target_switch_journal,
+                Some(&backup_rotation),
+                &config_snapshots,
+            )
+            .err();
+            return Err(target_switch_rollback_error(error, restore_error));
+        }
+    };
+
+    updated.enabled = true;
+    updated.last_status = "installed".to_string();
+    updated.files_written = deployment.files_written.clone();
+    updated.backups_written = deployment.backups_written.clone();
+    updated.written_file_hashes = deployment.written_file_hashes.clone();
+    updated.config_files = config_files_from_paths(&updated.files_written);
+    if let Err(error) = commit_installed_mod_records(
+        store_root,
+        profile,
+        std::slice::from_ref(&updated),
+        &[&deployment],
+    ) {
+        let mut recovery_errors = Vec::new();
+        if let Err(rollback_error) = deployment.rollback() {
+            recovery_errors.push(rollback_error);
+        }
+        if let Err(restore_error) = recover_previous_target_after_failure(
+            store_root,
+            profile,
+            &original,
+            &target_switch_journal,
+            Some(&backup_rotation),
+            &config_snapshots,
+        ) {
+            recovery_errors.push(restore_error);
+        }
+        return Err(target_switch_rollback_error(
+            error,
+            (!recovery_errors.is_empty()).then(|| recovery_errors.join(" ")),
+        ));
+    }
+    let mut files_changed = deactivated_files;
+    files_changed.extend(deployment.files_written.clone());
+    files_changed.sort_by_key(|path| normalize_filesystem_identity(path));
+    files_changed.dedup_by(|first, second| {
+        normalize_filesystem_identity(first) == normalize_filesystem_identity(second)
+    });
+    let mut warnings = dependency_warnings;
+    if let Err(error) = deployment.commit() {
+        warnings.push(format!(
+            "The target changed successfully, but deployment cleanup is pending: {error}"
+        ));
+    }
+    if let Err(error) = backup_rotation.commit() {
+        warnings.push(format!(
+            "The target changed successfully, but the previous backup set is waiting for startup cleanup: {error}"
+        ));
+    } else if let Err(error) = finish_target_switch_journal(&target_switch_journal) {
+        warnings.push(format!(
+            "The target changed successfully, but its completed recovery journal could not be removed: {error}"
+        ));
+    }
+
+    Ok(ModActionResult {
+        profile_id: profile.id.clone(),
+        installed_mod_id: original.id,
+        status: "installed".to_string(),
+        files_changed,
+        warnings,
+    })
+}
+
+fn validate_persisted_install_target(
+    profile: &GameProfile,
+    full_plan: &InstallPlan,
+    target: &InstallTargetOption,
+) -> Result<(), String> {
+    if target.id != install_route_key(&full_plan.adapter_id, &target.relative_path) {
+        return Err("The saved install target failed its integrity check.".to_string());
+    }
+    let route_shape_valid =
+        validate_learned_route_shape(&full_plan.adapter_id, &target.relative_path)
+            || matches!(
+                full_plan.adapter_id.as_str(),
+                "ue4ss" | "bepinex" | "reframework"
+            ) && install_target_has_mappings(full_plan, target);
+    if !route_shape_valid
+        || !route_has_safe_internal_root(profile, &target.relative_path, &full_plan.adapter_id)
+        || !(route_adapter_compatible(profile, &full_plan.adapter_id)
+            || profile.engine == "unknown")
+    {
+        return Err("The saved install target is no longer safe for this profile.".to_string());
+    }
+    let target_path = safe_join(Path::new(&profile.game_path), &target.relative_path)?;
+    validate_deployment_containment(Path::new(&profile.game_path), &target_path)?;
+    let anchor_exists = target_path.is_dir()
+        || (basename(&target.relative_path).eq_ignore_ascii_case("~mods")
+            && target_path.parent().is_some_and(Path::is_dir));
+    if !anchor_exists {
+        return Err(format!(
+            "The saved install target no longer exists in this game build: {}. Refresh the profile before switching.",
+            target.relative_path
+        ));
+    }
+    Ok(())
+}
+
+fn install_target_scopes_match(first: &str, second: &str) -> bool {
+    first == second
+        || (matches!(first, "client" | "general") && matches!(second, "client" | "general"))
+}
+
+fn route_family_prefix_before_known_anchor(path: &str) -> Option<String> {
+    let normalized = normalize_archive_path(path);
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let anchors: &[&[&str]] = &[
+        &["content", "paks"],
+        &["binaries", "win64"],
+        &["script", "mods"],
+        &["scripts", "mods"],
+        &["bepinex"],
+        &["reframework"],
+    ];
+    let anchor_index = anchors
+        .iter()
+        .filter_map(|anchor| {
+            parts.windows(anchor.len()).position(|window| {
+                window
+                    .iter()
+                    .zip(anchor.iter())
+                    .all(|(part, expected)| part.eq_ignore_ascii_case(expected))
+            })
+        })
+        .min()?;
+    Some(parts[..anchor_index].join("/").to_ascii_lowercase())
+}
+
+fn install_target_route_family(relative_path: &str) -> String {
+    route_family_prefix_before_known_anchor(relative_path).unwrap_or_else(|| {
+        normalize_archive_path(relative_path)
+            .trim_matches('/')
+            .to_ascii_lowercase()
+    })
+}
+
+fn payload_route_family(relative_path: &str) -> String {
+    route_family_prefix_before_known_anchor(relative_path).unwrap_or_else(|| {
+        archive_path_parent(&normalize_archive_path(relative_path)).to_ascii_lowercase()
+    })
+}
+
+fn plan_payload_route_families(plan: &InstallPlan) -> HashSet<String> {
+    plan.mappings
+        .iter()
+        .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+        .map(|mapping| payload_route_family(&mapping.target_relative_path))
+        .collect()
+}
+
+fn installed_record_route_families(record: &InstalledModRecord) -> HashSet<String> {
+    if let Some(selected) = record.selected_install_target_id.as_deref() {
+        if let Some(target) = record
+            .install_targets
+            .iter()
+            .find(|target| target.id == selected)
+        {
+            return HashSet::from([install_target_route_family(&target.relative_path)]);
+        }
+    }
+    record
+        .plan
+        .as_ref()
+        .map(plan_payload_route_families)
+        .unwrap_or_default()
+}
+
+fn record_payload_covers_install_target(
+    record: &InstalledModRecord,
+    target: &InstallTargetOption,
+) -> bool {
+    let target_family = install_target_route_family(&target.relative_path);
+    installed_record_route_families(record).contains(&target_family)
+}
+
+fn record_payload_covers_dependent_target(
+    record: &InstalledModRecord,
+    dependent: &InstalledModRecord,
+) -> bool {
+    installed_record_selected_target(dependent)
+        .map(|target| record_payload_covers_install_target(record, target))
+        .unwrap_or(true)
+}
+
+fn plan_payload_covers_install_target(plan: &InstallPlan, target: &InstallTargetOption) -> bool {
+    let target_family = install_target_route_family(&target.relative_path);
+    plan_payload_route_families(plan).contains(&target_family)
+}
+
+fn installed_record_target_scope(record: &InstalledModRecord) -> Option<&str> {
+    installed_record_selected_target(record).map(|target| target.scope.as_str())
+}
+
+fn installed_record_selected_target(record: &InstalledModRecord) -> Option<&InstallTargetOption> {
+    let selected = record.selected_install_target_id.as_deref()?;
+    record
+        .install_targets
+        .iter()
+        .find(|target| target.id == selected)
+}
+
+fn record_payload_covers_target_scope(record: &InstalledModRecord, scope: &str) -> bool {
+    if let Some(record_scope) = installed_record_target_scope(record) {
+        return install_target_scopes_match(record_scope, scope);
+    }
+    let mapping_scopes = record
+        .plan
+        .as_ref()
+        .into_iter()
+        .flat_map(|plan| plan.mappings.iter())
+        .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+        .map(|mapping| install_target_scope_from_path(&mapping.target_relative_path))
+        .collect::<HashSet<_>>();
+    if mapping_scopes.is_empty() {
+        return matches!(scope, "client" | "general");
+    }
+    mapping_scopes
+        .iter()
+        .any(|candidate| install_target_scopes_match(candidate, scope))
+}
+
+fn runtime_installed_for_target(
+    profile: &GameProfile,
+    runtime: &str,
+    target: &InstallTargetOption,
+) -> bool {
+    let target_family = install_target_route_family(&target.relative_path);
+    let entries = walk_game_folder(Path::new(&profile.game_path))
+        .into_iter()
+        .filter(|entry| payload_route_family(&entry.relative_path) == target_family)
+        .collect::<Vec<_>>();
+    runtime_layout_matches(profile, &entries, runtime)
+}
+
+fn ensure_required_plan_dependencies_available(
+    store_root: &Path,
+    profile: &GameProfile,
+    plan: &InstallPlan,
+) -> Result<(), String> {
+    let missing = plan
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.required)
+        .map(|dependency| refresh_dependency_status(store_root, profile, dependency))
+        .filter(|dependency| dependency.status != "already-installed")
+        .map(|dependency| dependency.name)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Required component{} still missing: {}.",
+            if missing.len() == 1 { " is" } else { "s are" },
+            join_human_list(&missing)
+        ))
+    }
+}
+
+fn ensure_install_target_dependencies_available(
+    store_root: &Path,
+    profile: &GameProfile,
+    plan: &InstallPlan,
+    target: &InstallTargetOption,
+) -> Result<(), String> {
+    let records = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?
+        .items;
+    for dependency in plan
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.required)
+    {
+        if let Some(runtime) = runtime_id_for_dependency(profile, dependency) {
+            if !runtime_installed_for_target(profile, &runtime, target) {
+                return Err(format!(
+                    "{} is not installed in {}. Refresh the profile so Mod Garrison can provision the runtime there before switching this mod.",
+                    dependency.name, target.label
+                ));
+            }
+            continue;
+        }
+        let available = records.iter().any(|record| {
+            record.profile_id == profile.id
+                && record.enabled
+                && record.last_status != "removed"
+                && installed_record_satisfies_dependency(profile, record, dependency)
+                && record_payload_covers_install_target(record, target)
+        });
+        if !available {
+            return Err(format!(
+                "{} is not available in {}. Move or install that dependency for the same target first.",
+                dependency.name, target.label
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_target_switch_preserves_reverse_dependencies(
+    profile: &GameProfile,
+    records: &[InstalledModRecord],
+    original: &InstalledModRecord,
+    target: &InstallTargetOption,
+) -> Result<(), String> {
+    let mut blocked = Vec::new();
+    for dependent in records.iter().filter(|record| {
+        record.profile_id == profile.id
+            && record.id != original.id
+            && record.enabled
+            && record.last_status != "removed"
+    }) {
+        let dependent_target = installed_record_selected_target(dependent);
+        let dependent_scope = dependent_target
+            .map(|target| target.scope.as_str())
+            .unwrap_or("client");
+        let remains_in_dependent_family = dependent_target
+            .map(|dependent_target| {
+                install_target_route_family(&dependent_target.relative_path)
+                    == install_target_route_family(&target.relative_path)
+            })
+            .unwrap_or_else(|| install_target_scopes_match(dependent_scope, &target.scope));
+        if remains_in_dependent_family {
+            continue;
+        }
+        for dependency in dependent.dependencies.iter().filter(|dependency| {
+            dependency.required
+                && installed_record_satisfies_dependency(profile, original, dependency)
+        }) {
+            let alternative = records.iter().any(|candidate| {
+                candidate.id != original.id
+                    && candidate.id != dependent.id
+                    && candidate.profile_id == profile.id
+                    && candidate.enabled
+                    && candidate.last_status != "removed"
+                    && installed_record_definitely_satisfies_dependency(
+                        profile, candidate, dependency,
+                    )
+                    && dependent_target
+                        .map(|target| record_payload_covers_install_target(candidate, target))
+                        .unwrap_or_else(|| {
+                            record_payload_covers_target_scope(candidate, dependent_scope)
+                        })
+            });
+            if !alternative {
+                blocked.push(format!(
+                    "{} ({})",
+                    display_record_name(dependent),
+                    dependency.name
+                ));
+            }
+        }
+    }
+    blocked.sort_by_key(|value| value.to_ascii_lowercase());
+    blocked.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} cannot move to {} because it is still required in its current target by: {}.",
+            display_record_name(original),
+            target.label,
+            blocked.join(", ")
+        ))
+    }
+}
+
+struct InstallTargetBackupRotation {
+    active_root: PathBuf,
+    previous_root: Option<PathBuf>,
+    transaction_root: PathBuf,
+}
+
+impl InstallTargetBackupRotation {
+    fn begin(
+        store_root: &Path,
+        profile: &GameProfile,
+        installed_mod_id: &str,
+        transaction_root: PathBuf,
+    ) -> Result<Self, String> {
+        let active_root = profile_backup_dir(store_root, &profile.id, installed_mod_id);
+        fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
+        let previous_root = active_root
+            .exists()
+            .then(|| transaction_root.join("previous"));
+        if let Some(previous_root) = &previous_root {
+            if let Err(error) = fs::rename(&active_root, previous_root) {
+                let _ = fs::remove_dir_all(&transaction_root);
+                return Err(format!(
+                    "Could not prepare the existing target backup for switching: {error}"
+                ));
+            }
+        }
+        let marker_path = transaction_root.join(TARGET_SWITCH_BACKUP_ROTATION_MARKER);
+        if let Err(error) = write_synced_file(&marker_path, b"ready\n") {
+            let rollback_error = rollback_target_switch_backup_rotation_paths(
+                &active_root,
+                previous_root.as_deref(),
+                &transaction_root,
+            )
+            .err();
+            return Err(format!(
+                "Could not persist the target-backup rotation checkpoint: {error}{}",
+                rollback_error
+                    .map(|rollback_error| format!(
+                        " The previous backup also could not be restored: {rollback_error}"
+                    ))
+                    .unwrap_or_default()
+            ));
+        }
+        Ok(Self {
+            active_root,
+            previous_root,
+            transaction_root,
+        })
+    }
+
+    fn rollback(&self) -> Result<(), String> {
+        rollback_target_switch_backup_rotation_paths(
+            &self.active_root,
+            self.previous_root.as_deref(),
+            &self.transaction_root,
+        )
+    }
+
+    fn commit(self) -> Result<(), String> {
+        if self.transaction_root.exists() {
+            fs::remove_dir_all(self.transaction_root).map_err(error_to_string)?;
+        }
+        Ok(())
+    }
+}
+
+fn rollback_target_switch_backup_rotation(
+    store_root: &Path,
+    profile: &GameProfile,
+    installed_mod_id: &str,
+    transaction_root: &Path,
+) -> Result<(), String> {
+    let active_root = profile_backup_dir(store_root, &profile.id, installed_mod_id);
+    let previous_root = transaction_root.join("previous");
+    rollback_target_switch_backup_rotation_paths(
+        &active_root,
+        previous_root.exists().then_some(previous_root.as_path()),
+        transaction_root,
+    )
+}
+
+fn rollback_target_switch_backup_rotation_paths(
+    active_root: &Path,
+    previous_root: Option<&Path>,
+    transaction_root: &Path,
+) -> Result<(), String> {
+    let rotation_started = previous_root.is_some()
+        || transaction_root
+            .join(TARGET_SWITCH_BACKUP_ROTATION_MARKER)
+            .is_file();
+    if rotation_started && active_root.exists() {
+        fs::remove_dir_all(active_root).map_err(error_to_string)?;
+    }
+    if let Some(previous_root) = previous_root {
+        if previous_root.exists() {
+            if let Some(parent) = active_root.parent() {
+                fs::create_dir_all(parent).map_err(error_to_string)?;
+            }
+            fs::rename(previous_root, active_root).map_err(error_to_string)?;
+        }
+    }
+    if transaction_root.exists() {
+        fs::remove_dir_all(transaction_root).map_err(error_to_string)?;
+    }
+    Ok(())
+}
+
+fn recover_previous_target_after_failure(
+    store_root: &Path,
+    profile: &GameProfile,
+    original: &InstalledModRecord,
+    target_switch_journal: &Path,
+    backup_rotation: Option<&InstallTargetBackupRotation>,
+    config_snapshots: &[ConfigSnapshot],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Some(backup_rotation) = backup_rotation {
+        if let Err(error) = backup_rotation.rollback() {
+            errors.push(format!(
+                "Could not restore the previous backup tree: {error}"
+            ));
+        }
+    }
+    if let Err(error) = restore_checkpoint_record(store_root, profile, original) {
+        errors.push(format!("Could not restore the previous target: {error}"));
+    } else if let Err(error) =
+        restore_config_snapshots_to_record(store_root, profile, &original.id, config_snapshots)
+    {
+        errors.push(format!(
+            "Could not restore the previous target's configuration: {error}"
+        ));
+    }
+    if errors.is_empty() {
+        finish_target_switch_journal(target_switch_journal)?;
+        Ok(())
+    } else {
+        Err(errors.join(" "))
+    }
+}
+
+fn target_switch_rollback_error(error: String, rollback_error: Option<String>) -> String {
+    match rollback_error {
+        Some(rollback_error) => {
+            format!("{error} Restoring the previous install target also failed: {rollback_error}")
+        }
+        None => format!("{error} The previous install target was restored."),
+    }
 }
 
 #[tauri::command]
@@ -5852,6 +8002,7 @@ fn set_all_profile_mods_enabled_sync(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
+    ensure_game_files_mutable(&profile, "change profile mods")?;
     let store_path = installed_mods_path(&root);
     let original_store = read_store::<InstalledModRecord>(&store_path).map_err(error_to_string)?;
     let mut next_store = StoreFile {
@@ -5891,7 +8042,8 @@ fn set_all_profile_mods_enabled_sync(
                     display_record_name(original)
                 )
             })?;
-            let deployment = match deploy_plan_transaction(
+            let config_snapshots = snapshot_record_configs(&profile, original)?;
+            let mut deployment = match deploy_plan_transaction(
                 &root,
                 &profile,
                 &original.id,
@@ -5902,29 +8054,56 @@ fn set_all_profile_mods_enabled_sync(
                 Ok(deployment) => deployment,
                 Err(error) => {
                     for deployment in deployments.iter().rev() {
-                        deployment.rollback();
+                        let _ = deployment.rollback();
                     }
                     return Err(format!("{}: {error}", display_record_name(original)));
                 }
             };
+            if let Err(error) = restore_config_snapshots_into_deployment(
+                &profile,
+                &mut deployment,
+                &config_snapshots,
+            ) {
+                let _ = deployment.rollback();
+                for deployment in deployments.iter().rev() {
+                    let _ = deployment.rollback();
+                }
+                return Err(format!(
+                    "{}: could not restore its saved configuration while enabling it: {error}",
+                    display_record_name(original)
+                ));
+            }
             let updated = &mut next_store.items[*index];
             updated.enabled = true;
             updated.last_status = "installed".to_string();
             updated.files_written = deployment.files_written.clone();
             updated.backups_written = deployment.backups_written.clone();
             updated.written_file_hashes = deployment.written_file_hashes.clone();
-            updated.config_files = config_files_from_paths(&updated.files_written);
+            updated.config_files =
+                merged_config_files(&original.config_files, &updated.files_written);
             files_changed.extend(deployment.files_written.clone());
             deployments.push(deployment);
         }
     } else {
         for index in &target_indices {
             let original = original_store.items[*index].clone();
-            match deactivate_mod_files(&root, &profile, &original) {
-                Ok(files) => files_changed.extend(files),
+            match deactivate_mod_files_with_policy(
+                &root,
+                &profile,
+                &original,
+                ModifiedFilePolicy::PreserveConfigChanges,
+            ) {
+                Ok(outcome) => files_changed.extend(outcome.files_changed),
                 Err(error) => {
-                    restore_deactivated_mods(&root, &profile, &deactivated);
-                    return Err(format!("{}: {error}", display_record_name(&original)));
+                    let restore_error =
+                        restore_deactivated_mods(&root, &profile, &deactivated).err();
+                    return Err(format!(
+                        "{}: {error}{}",
+                        display_record_name(&original),
+                        restore_error
+                            .map(|restore_error| format!(" {restore_error}"))
+                            .unwrap_or_default()
+                    ));
                 }
             }
             deactivated.push(original);
@@ -5941,14 +8120,27 @@ fn set_all_profile_mods_enabled_sync(
     if let Err(error) =
         commit_installed_mod_records(&root, &profile, &updated_records, &deployment_refs)
     {
-        for deployment in deployments.iter().rev() {
-            deployment.rollback();
+        let mut rollback_errors = deployments
+            .iter()
+            .rev()
+            .filter_map(|deployment| deployment.rollback().err())
+            .collect::<Vec<_>>();
+        if let Err(restore_error) = restore_deactivated_mods(&root, &profile, &deactivated) {
+            rollback_errors.push(restore_error);
         }
-        restore_deactivated_mods(&root, &profile, &deactivated);
-        return Err(error);
+        return if rollback_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(format!("{error} {}", rollback_errors.join(" ")))
+        };
     }
+    let mut warnings = Vec::new();
     for deployment in deployments {
-        deployment.commit();
+        if let Err(error) = deployment.commit() {
+            warnings.push(format!(
+                "The mod state was committed, but deployment cleanup is pending: {error}"
+            ));
+        }
     }
 
     let installed_mods = next_store
@@ -5961,7 +8153,7 @@ fn set_all_profile_mods_enabled_sync(
         enabled,
         changed_mods: target_indices.len(),
         files_changed,
-        warnings: Vec::new(),
+        warnings,
         installed_mods,
     })
 }
@@ -5995,6 +8187,7 @@ fn remove_mod_sync(
     let _profile_operation = operation::lock_profile(&profile_operation)?;
     let root = store_root(&app)?;
     let profile = get_profile(&root, &profile_id)?;
+    ensure_game_files_mutable(&profile, "remove mods")?;
     let path = installed_mods_path(&root);
     let mut store = read_store::<InstalledModRecord>(&path).map_err(error_to_string)?;
     let record_index = store
@@ -6007,6 +8200,13 @@ fn remove_mod_sync(
             "System runtimes are protected. Mod Garrison keeps them available for dependent mods."
                 .to_string(),
         );
+    }
+    if store.items[record_index].enabled {
+        ensure_mod_has_no_active_reverse_dependencies(
+            &profile,
+            &store.items,
+            &store.items[record_index],
+        )?;
     }
     let record = store.items.remove(record_index);
     let deactivation = if record.enabled {
@@ -6026,7 +8226,11 @@ fn remove_mod_sync(
 
     if let Err(error) = commit_removed_installed_mod_record(&root, &profile_id, &record.id) {
         if record.enabled && deactivation.preserved_files.is_empty() {
-            restore_deactivated_mods(&root, &profile, std::slice::from_ref(&record));
+            if let Err(restore_error) =
+                restore_deactivated_mods(&root, &profile, std::slice::from_ref(&record))
+            {
+                return Err(format!("{error} {restore_error}"));
+            }
         }
         return Err(error);
     }
@@ -6566,6 +8770,7 @@ pub fn run() {
             update_mod_config_value,
             disable_mod,
             enable_mod,
+            set_mod_install_target,
             remove_mod,
             open_profile_game_folder,
             open_external_url,
@@ -7532,7 +9737,11 @@ fn prepare_mod_routes(
     };
 
     if supports("bepinex") {
-        let roots = detected_loader_roots(entries, "bepinex", "BepInEx");
+        let known_executables = game_id
+            .and_then(game_definition_by_id)
+            .map(|definition| definition.executable_names.as_slice())
+            .unwrap_or_default();
+        let roots = bepinex_loader_roots(entries, known_executables);
         for root in roots {
             push_unique_route(&mut routes, &format!("{root}/plugins"));
             push_unique_route(&mut routes, &format!("{root}/config"));
@@ -7607,6 +9816,99 @@ fn detected_loader_roots(entries: &[ProbeEntry], loader_dir: &str, fallback: &st
     if roots.is_empty() {
         roots.push(fallback.to_string());
     }
+    roots
+}
+
+fn bepinex_loader_roots(entries: &[ProbeEntry], known_executables: &[String]) -> Vec<String> {
+    let mut existing_roots = entries
+        .iter()
+        .filter(|entry| entry.is_directory && entry.name.eq_ignore_ascii_case("bepinex"))
+        .map(|entry| normalize_archive_path(&entry.relative_path))
+        .collect::<Vec<_>>();
+    existing_roots.sort();
+    existing_roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let executable_roots = verified_unity_executable_roots(entries, known_executables);
+    if executable_roots.is_empty() {
+        if existing_roots.is_empty() {
+            return vec!["BepInEx".to_string()];
+        }
+        return existing_roots;
+    }
+
+    let mut roots = executable_roots
+        .into_iter()
+        .map(|root| join_install_route(&root, "BepInEx"))
+        .collect::<Vec<_>>();
+    // Ignore stale or prose-created BepInEx folders that are not adjacent to a
+    // verified Unity executable. They must not outrank real client/server roots.
+    for existing in existing_roots {
+        if let Some(root) = roots
+            .iter_mut()
+            .find(|root| root.eq_ignore_ascii_case(&existing))
+        {
+            *root = existing;
+        }
+    }
+    roots.sort_by(|left, right| {
+        install_target_scope_from_path(left)
+            .cmp(&install_target_scope_from_path(right))
+            .then_with(|| left.matches('/').count().cmp(&right.matches('/').count()))
+            .then_with(|| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()))
+    });
+    roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    roots
+}
+
+fn verified_unity_executable_roots(
+    entries: &[ProbeEntry],
+    known_executables: &[String],
+) -> Vec<String> {
+    let known_executables = known_executables
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut roots = entries
+        .iter()
+        .filter(|entry| !entry.is_directory && entry.name.to_ascii_lowercase().ends_with(".exe"))
+        .filter_map(|entry| {
+            let lower_name = entry.name.to_ascii_lowercase();
+            if matches!(
+                lower_name.as_str(),
+                "unitycrashhandler.exe"
+                    | "unitycrashhandler64.exe"
+                    | "crashreportclient.exe"
+                    | "unins000.exe"
+            ) {
+                return None;
+            }
+            let root = archive_path_parent(&entry.relative_path);
+            let executable_stem = Path::new(&entry.name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            let data_folder = format!("{executable_stem}_Data");
+            let has_matching_data = entries.iter().any(|candidate| {
+                candidate.is_directory
+                    && archive_path_parent(&candidate.relative_path).eq_ignore_ascii_case(&root)
+                    && candidate.name.eq_ignore_ascii_case(&data_folder)
+            });
+            let has_unity_player = entries.iter().any(|candidate| {
+                !candidate.is_directory
+                    && candidate.name.eq_ignore_ascii_case("UnityPlayer.dll")
+                    && archive_path_parent(&candidate.relative_path).eq_ignore_ascii_case(&root)
+            });
+            (has_matching_data || has_unity_player || known_executables.contains(&lower_name))
+                .then_some(root)
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        install_target_scope_from_path(left)
+            .cmp(&install_target_scope_from_path(right))
+            .then_with(|| left.matches('/').count().cmp(&right.matches('/').count()))
+            .then_with(|| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()))
+    });
+    roots.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     roots
 }
 
@@ -8123,13 +10425,17 @@ fn analyze_scanned_archive_with_identity(
     profile: &GameProfile,
     source_identity: Option<PackageIdentity>,
 ) -> ArchiveAnalysis {
+    let ue4ss = ue4ss_plan(&scanned, profile);
+    let unreal_pak = unreal_pak_plan(&scanned, profile);
+    let composite_unreal = composite_unreal_plan(&scanned, ue4ss.as_ref(), unreal_pak.as_ref());
     let mut plans = vec![
+        composite_unreal,
         bepinex_plan(&scanned, profile),
         native_script_plan(&scanned, profile),
-        ue4ss_plan(&scanned, profile),
+        ue4ss,
         reframework_plan(&scanned, profile),
         re_engine_native_plan(&scanned, profile),
-        unreal_pak_plan(&scanned, profile),
+        unreal_pak,
         loose_files_plan(&scanned),
     ]
     .into_iter()
@@ -8160,7 +10466,28 @@ fn analyze_scanned_archive_with_identity(
         package_identity.confidence = package_identity.confidence.max(best_confidence);
     }
 
-    let mut first_block_reason = None;
+    let unsupported_package_reason = unsupported_package_layout_reason(&scanned);
+    if let Some(reason) = unsupported_package_reason.as_ref() {
+        for plan in &mut plans {
+            if plan.adapter_id != "loose-files" {
+                plan.requires_confirmation = true;
+                push_unique_string_value(&mut plan.warnings, reason);
+            }
+        }
+    }
+    let mut first_block_reason = unsupported_package_reason;
+    for plan in &mut plans {
+        if plan.adapter_id == "loose-files" {
+            continue;
+        }
+        if let Some(reason) = incomplete_install_plan_reason(&scanned, plan) {
+            plan.requires_confirmation = true;
+            push_unique_string_value(&mut plan.warnings, &reason);
+            if first_block_reason.is_none() {
+                first_block_reason = Some(reason);
+            }
+        }
+    }
     let recommended_plan = plans.iter().find_map(|plan| {
         if plan.adapter_id == "loose-files" || plan.requires_confirmation {
             return None;
@@ -8215,6 +10542,161 @@ fn analyze_scanned_archive_with_identity(
         plans,
         recommended_plan,
     }
+}
+
+fn incomplete_install_plan_reason(scanned: &ScannedArchive, plan: &InstallPlan) -> Option<String> {
+    let verified_unreal_payloads = unreal_payload_files(&scanned.entries)
+        .into_iter()
+        .map(|file| normalize_archive_path(&file.path).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mapped_sources = plan
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.generated_content.is_none())
+        .map(|mapping| normalize_archive_path(&mapping.source_path).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut missing = installable_files(&scanned.entries)
+        .into_iter()
+        .filter(|file| {
+            let source = normalize_archive_path(&file.path).to_ascii_lowercase();
+            !mapped_sources.contains(&source)
+                && (!source.ends_with(".sig") || verified_unreal_payloads.contains(&source))
+        })
+        .map(|file| normalize_archive_path(&file.logical_path))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+    missing.sort_by_key(|path| path.to_ascii_lowercase());
+    missing.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+    let displayed = missing.iter().take(3).cloned().collect::<Vec<_>>();
+    Some(format!(
+        "The {} route leaves {} package payload file{} without a verified destination: {}{}. Automatic installation is blocked so the package is not installed partially.",
+        plan.adapter_name,
+        missing.len(),
+        if missing.len() == 1 { "" } else { "s" },
+        displayed.join(", "),
+        if missing.len() > displayed.len() {
+            format!(" and {} more", missing.len() - displayed.len())
+        } else {
+            String::new()
+        }
+    ))
+}
+
+fn unsupported_package_layout_reason(scanned: &ScannedArchive) -> Option<String> {
+    if let Some(module_config) = scanned.entries.iter().find(|entry| {
+        let normalized = normalize_archive_path(&entry.logical_path).to_ascii_lowercase();
+        normalized == "fomod/moduleconfig.xml" || normalized.ends_with("/fomod/moduleconfig.xml")
+    }) {
+        return Some(format!(
+            "This package uses a FOMOD installer ({}) with selectable or conditional components. Automatic installation is blocked until Mod Garrison can evaluate that installer without guessing.",
+            normalize_archive_path(&module_config.logical_path)
+        ));
+    }
+
+    ambiguous_variant_layout_reason(scanned)
+}
+
+fn ambiguous_variant_layout_reason(scanned: &ScannedArchive) -> Option<String> {
+    let mut groups = HashMap::<String, HashMap<String, HashSet<String>>>::new();
+    for file in installable_files(&scanned.entries) {
+        let normalized = normalize_archive_path(&file.logical_path).to_ascii_lowercase();
+        let components = normalized
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            if index + 2 >= components.len()
+                || !matches!(
+                    *component,
+                    "option" | "options" | "variant" | "variants" | "choice" | "choices"
+                )
+            {
+                continue;
+            }
+            let parent = components[..=index].join("/");
+            let choice = components[index + 1].to_string();
+            let basename = components.last()?.to_string();
+            groups
+                .entry(parent)
+                .or_default()
+                .entry(choice)
+                .or_default()
+                .insert(basename);
+        }
+    }
+
+    for (parent, choices) in groups {
+        if choices.len() < 2 {
+            continue;
+        }
+        let choice_files = choices.values().collect::<Vec<_>>();
+        let duplicate_payload = choice_files.iter().enumerate().any(|(index, files)| {
+            choice_files
+                .iter()
+                .skip(index + 1)
+                .any(|other| files.iter().any(|file| other.contains(file)))
+        });
+        if duplicate_payload {
+            return Some(format!(
+                "This package contains competing component variants under {parent}. Automatic installation is blocked so Mod Garrison does not guess between mutually exclusive files."
+            ));
+        }
+    }
+    None
+}
+
+fn composite_unreal_plan(
+    scanned: &ScannedArchive,
+    ue4ss: Option<&InstallPlan>,
+    unreal_pak: Option<&InstallPlan>,
+) -> Option<InstallPlan> {
+    let files = installable_files(&scanned.entries);
+    let has_script_payload = files.iter().any(|file| {
+        let path = file.logical_path.to_ascii_lowercase();
+        path.ends_with(".lua")
+            || path.starts_with("mods/")
+            || path.starts_with("ue4ss/")
+            || path.contains("/scripts/")
+    });
+    let has_container_payload = !unreal_payload_files(&scanned.entries).is_empty();
+    if !has_script_payload || !has_container_payload {
+        return None;
+    }
+
+    let ue4ss = ue4ss?;
+    let unreal_pak = unreal_pak?;
+    let mut mappings = ue4ss.mappings.clone();
+    for mapping in &unreal_pak.mappings {
+        push_unique_mapping(&mut mappings, mapping.clone());
+    }
+    let mut dependencies = ue4ss.dependencies.clone();
+    append_unique_dependencies(&mut dependencies, unreal_pak.dependencies.clone());
+    let mut warnings = ue4ss.warnings.clone();
+    for warning in &unreal_pak.warnings {
+        push_unique_string_value(&mut warnings, warning);
+    }
+    push_unique_string_value(
+        &mut warnings,
+        "This mixed package is installed as one transaction so its UE4SS scripts and Unreal container files stay in sync.",
+    );
+
+    Some(InstallPlan {
+        // Keep the primary adapter compatible with existing Unreal/UE4SS profiles while
+        // representing both payload families in one atomic plan.
+        adapter_id: "ue4ss".to_string(),
+        adapter_name: "UE4SS + Unreal Pak".to_string(),
+        confidence: ue4ss.confidence.max(unreal_pak.confidence).max(0.93),
+        summary: format!(
+            "Install {} mixed UE4SS and Unreal container file(s) as one package.",
+            mappings.len()
+        ),
+        mappings,
+        dependencies,
+        warnings,
+        requires_confirmation: ue4ss.requires_confirmation || unreal_pak.requires_confirmation,
+    })
 }
 
 fn merge_package_identity(
@@ -8308,12 +10790,25 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
     } else {
         "bepinex"
     };
-    let runtime_prefix = runtime_payload_prefix(&files, runtime);
+    let routed_payload_paths = files
+        .iter()
+        .map(source_payload_path_for_install_target)
+        .collect::<Vec<_>>();
+    let has_scoped_payload = files
+        .iter()
+        .any(|file| source_install_target_scope(&file.path).is_some());
+    let runtime_prefix = (!has_scoped_payload)
+        .then(|| runtime_payload_prefix(&files, runtime))
+        .flatten();
 
-    for file in &files {
+    for (file, routed_payload_path) in files.iter().zip(&routed_payload_paths) {
+        let source_scope = source_install_target_scope(&file.path);
         if let Some(prefix) = runtime_prefix.as_deref() {
             if let Some(relative_path) = archive_path_relative_to(&file.logical_path, prefix) {
                 for target_root in &target_roots {
+                    if !source_scope_matches_target_route(source_scope, target_root) {
+                        continue;
+                    }
                     push_unique_mapping(
                         &mut mappings,
                         mapping(
@@ -8328,9 +10823,12 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
             continue;
         }
 
-        let lower_path = file.logical_path.to_lowercase();
-        if let Some(relative_path) = path_after_named_segment(&file.logical_path, "bepinex") {
+        let lower_path = routed_payload_path.to_lowercase();
+        if let Some(relative_path) = path_after_named_segment(routed_payload_path, "bepinex") {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8339,9 +10837,12 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                 ));
             }
         } else if let Some(relative_path) =
-            path_after_named_segment(&file.logical_path, "doorstop_libs")
+            path_after_named_segment(routed_payload_path, "doorstop_libs")
         {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8353,9 +10854,12 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                 ));
             }
         } else if let Some(relative_path) =
-            path_after_named_segment(&file.logical_path, "unstripped_corlib")
+            path_after_named_segment(routed_payload_path, "unstripped_corlib")
         {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8366,8 +10870,12 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                     "BepInEx runtime support file.",
                 ));
             }
-        } else if let Some(relative_path) = path_after_named_segment(&file.logical_path, "dotnet") {
+        } else if let Some(relative_path) = path_after_named_segment(routed_payload_path, "dotnet")
+        {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8378,34 +10886,43 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                     "BepInEx bundled runtime file.",
                 ));
             }
-        } else if is_bepinex_root_runtime_file(&file.logical_path) {
+        } else if is_bepinex_root_runtime_file(routed_payload_path) {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
                     &join_install_route(
                         &install_route_parent(target_root),
-                        &basename(&file.logical_path),
+                        &basename(routed_payload_path),
                     ),
                     "BepInEx bootstrap file.",
                 ));
             }
         } else if lower_path.starts_with("plugins/") {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
-                    &join_install_route(target_root, &file.logical_path),
+                    &join_install_route(target_root, routed_payload_path),
                     "Plugin folder maps into BepInEx/plugins.",
                 ));
             }
         } else if lower_path.starts_with("config/") || lower_path.ends_with(".cfg") {
             let target_suffix = if lower_path.starts_with("config/") {
-                file.logical_path.clone()
+                routed_payload_path.clone()
             } else {
-                format!("config/{}", basename(&file.logical_path))
+                format!("config/{}", basename(routed_payload_path))
             };
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8413,14 +10930,17 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                     "BepInEx config file.",
                 ));
             }
-        } else if is_probable_bepinex_plugin_dll(&file.logical_path, profile) {
+        } else if is_probable_bepinex_plugin_dll(routed_payload_path, profile) {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
                     &join_install_route(
                         target_root,
-                        &format!("plugins/{}", basename(&file.logical_path)),
+                        &format!("plugins/{}", basename(routed_payload_path)),
                     ),
                     "Managed plugin DLL.",
                 ));
@@ -8428,16 +10948,35 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
         }
     }
 
-    let has_signal = files.iter().any(|file| {
-        let lower_path = file.logical_path.to_lowercase();
-        path_after_named_segment(&file.logical_path, "bepinex").is_some()
+    let has_signal = routed_payload_paths.iter().any(|path| {
+        let lower_path = path.to_lowercase();
+        path_after_named_segment(path, "bepinex").is_some()
             || lower_path.starts_with("plugins/")
-            || is_probable_bepinex_plugin_dll(&file.logical_path, profile)
-            || is_bepinex_root_runtime_file(&file.logical_path)
+            || is_probable_bepinex_plugin_dll(path, profile)
+            || is_bepinex_root_runtime_file(path)
     });
 
     if !has_signal || mappings.is_empty() {
         return None;
+    }
+
+    let mut requires_confirmation = false;
+    if bepinex_archive_supplies_runtime(&routed_payload_paths, runtime) {
+        let missing_roots = target_roots
+            .iter()
+            .filter(|target_root| {
+                !bepinex_runtime_mappings_cover_root(&mappings, runtime, target_root)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_roots.is_empty() {
+            requires_confirmation = true;
+            warnings.push(format!(
+                "The verified {} runtime payload does not cover every executable root (missing: {}). Automatic installation is blocked rather than copying a client/server variant into the wrong root.",
+                format_loader(runtime),
+                join_human_list(&missing_roots)
+            ));
+        }
     }
 
     if profile.engine == "unknown"
@@ -8465,8 +11004,72 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
         mappings,
         dependencies: vec![known_runtime_dependency(profile, runtime)],
         warnings,
-        requires_confirmation: false,
+        requires_confirmation,
     })
+}
+
+fn bepinex_archive_supplies_runtime(payload_paths: &[String], runtime: &str) -> bool {
+    let has_core = payload_paths
+        .iter()
+        .any(|path| runtime_core_file(runtime, path));
+    let has_injector = payload_paths.iter().any(|path| {
+        matches!(
+            basename(path).to_ascii_lowercase().as_str(),
+            "winhttp.dll" | "winhttp_il2cpp.dll"
+        )
+    });
+    let has_config = payload_paths.iter().any(|path| {
+        matches!(
+            basename(path).to_ascii_lowercase().as_str(),
+            "doorstop_config.ini" | "doorstop_config_il2cpp.ini"
+        )
+    });
+    has_core && has_injector && has_config
+}
+
+fn bepinex_runtime_mappings_cover_root(
+    mappings: &[InstallMapping],
+    runtime: &str,
+    target_root: &str,
+) -> bool {
+    let executable_root = install_route_parent(target_root);
+    let core_root = join_install_route(target_root, "core");
+    let has_core = mappings.iter().any(|mapping| {
+        mapping.target_root.eq_ignore_ascii_case("game")
+            && archive_path_is_within(&mapping.target_relative_path, &core_root)
+            && runtime_core_file(runtime, &mapping.target_relative_path)
+    });
+    let has_injector = mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.target_root.eq_ignore_ascii_case("game")
+                && archive_path_parent(&mapping.target_relative_path)
+                    .eq_ignore_ascii_case(&executable_root)
+        })
+        .any(|mapping| {
+            matches!(
+                basename(&mapping.target_relative_path)
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "winhttp.dll" | "winhttp_il2cpp.dll"
+            )
+        });
+    let has_config = mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.target_root.eq_ignore_ascii_case("game")
+                && archive_path_parent(&mapping.target_relative_path)
+                    .eq_ignore_ascii_case(&executable_root)
+        })
+        .any(|mapping| {
+            matches!(
+                basename(&mapping.target_relative_path)
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "doorstop_config.ini" | "doorstop_config_il2cpp.ini"
+            )
+        });
+    has_core && has_injector && has_config
 }
 
 fn native_script_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<InstallPlan> {
@@ -8484,16 +11087,24 @@ fn native_script_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option
     }
 
     let mut mappings = Vec::new();
-    let payload_prefix = common_installable_payload_prefix(&files);
-    for file in &files {
-        let payload_relative_path = relative_after_native_script_mods(&file.logical_path)
+    let routed_payload_paths = files
+        .iter()
+        .map(source_payload_path_for_install_target)
+        .collect::<Vec<_>>();
+    let payload_prefix = common_installable_payload_prefix_from_paths(&routed_payload_paths);
+    for (file, routed_payload_path) in files.iter().zip(&routed_payload_paths) {
+        let source_scope = source_install_target_scope(&file.path);
+        let payload_relative_path = relative_after_native_script_mods(routed_payload_path)
             .or_else(|| {
                 payload_prefix
                     .as_deref()
-                    .and_then(|prefix| archive_path_relative_to(&file.logical_path, prefix))
+                    .and_then(|prefix| archive_path_relative_to(routed_payload_path, prefix))
             })
-            .unwrap_or_else(|| normalize_archive_path(&file.logical_path));
+            .unwrap_or_else(|| normalize_archive_path(routed_payload_path));
         for target_dir in &target_dirs {
+            if !source_scope_matches_target_route(source_scope, target_dir) {
+                continue;
+            }
             push_unique_mapping(
                 &mut mappings,
                 mapping(
@@ -8504,6 +11115,9 @@ fn native_script_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option
                 ),
             );
         }
+    }
+    if mappings.is_empty() {
+        return None;
     }
 
     let mut warnings = Vec::new();
@@ -8536,23 +11150,32 @@ fn native_script_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option
 
 fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<InstallPlan> {
     let files = installable_files(&scanned.entries);
+    let unreal_payload_sources = unreal_payload_files(&scanned.entries)
+        .into_iter()
+        .map(|file| normalize_archive_path(&file.path).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
     let mut summary_targets = Vec::new();
     let mod_folder_name = scanned_generated_mod_folder_name(scanned);
     let (target_roots, mod_target_dirs) = ue4ss_install_targets(profile);
     let runtime_prefix = runtime_payload_prefix(&files, "ue4ss");
+    let routed_payload_paths = files
+        .iter()
+        .map(source_payload_path_for_install_target)
+        .collect::<Vec<_>>();
     let script_package = runtime_prefix.is_none()
-        && files.iter().any(|file| {
-            let lower_path = file.logical_path.to_lowercase();
+        && routed_payload_paths.iter().any(|path| {
+            let lower_path = path.to_lowercase();
             lower_path == "scripts"
                 || lower_path.starts_with("scripts/")
                 || lower_path.contains("/scripts/")
                 || lower_path.ends_with(".lua")
         });
-    let payload_prefix = common_installable_payload_prefix(&files);
+    let payload_prefix = common_installable_payload_prefix_from_paths(&routed_payload_paths);
+    let mut used_script_target_dirs = HashSet::new();
 
-    for file in &files {
+    for (file, routed_payload_path) in files.iter().zip(&routed_payload_paths) {
         if let Some(prefix) = runtime_prefix.as_deref() {
             if let Some(relative_path) = archive_path_relative_to(&file.logical_path, prefix) {
                 for target_root in &target_roots {
@@ -8571,46 +11194,76 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
             continue;
         }
 
-        let lower_path = file.logical_path.to_lowercase();
-        if is_ue4ss_root_runtime_file(&file.logical_path) {
+        let lower_path = routed_payload_path.to_lowercase();
+        if unreal_payload_sources.contains(&normalize_archive_path(&file.path).to_ascii_lowercase())
+            || lower_path.ends_with(".sig")
+        {
+            // Mixed packages are handled by the composite plan. Never bury pak/IoStore
+            // payloads inside a generated UE4SS mod folder.
+            continue;
+        }
+        let source_scope = source_install_target_scope(&file.path);
+        if is_ue4ss_root_runtime_file(routed_payload_path) {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 push_unique_route(&mut summary_targets, target_root);
                 mappings.push(mapping(
                     &file.path,
                     "game",
-                    &format!("{target_root}/{}", basename(&file.logical_path)),
+                    &format!("{target_root}/{}", basename(routed_payload_path)),
                     "UE4SS runtime bootstrap file.",
                 ));
             }
         } else if let Some(target_suffix) =
-            strip_prefix_ignore_ascii_case(&file.logical_path, "ue4ss/mods/")
-                .or_else(|| strip_prefix_ignore_ascii_case(&file.logical_path, "mods/"))
+            strip_prefix_ignore_ascii_case(routed_payload_path, "ue4ss/mods/")
+                .or_else(|| strip_prefix_ignore_ascii_case(routed_payload_path, "mods/"))
         {
             for target_dir in &mod_target_dirs {
+                if !source_scope_matches_target_route(source_scope, target_dir) {
+                    continue;
+                }
                 push_unique_route(&mut summary_targets, target_dir);
-                mappings.push(mapping(
-                    &file.path,
-                    "game",
-                    &format!("{target_dir}/{target_suffix}"),
-                    "UE4SS Mods folder.",
-                ));
+                push_unique_mapping(
+                    &mut mappings,
+                    mapping(
+                        &file.path,
+                        "game",
+                        &format!("{target_dir}/{target_suffix}"),
+                        "UE4SS Mods folder.",
+                    ),
+                );
+                if script_package {
+                    used_script_target_dirs
+                        .insert(normalize_archive_path(target_dir).to_ascii_lowercase());
+                }
             }
         } else if lower_path.starts_with("ue4ss/") {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 push_unique_route(&mut summary_targets, target_root);
-                mappings.push(mapping(
-                    &file.path,
-                    "game",
-                    &format!("{target_root}/{}", file.logical_path),
-                    "UE4SS runtime or configuration files.",
-                ));
+                push_unique_mapping(
+                    &mut mappings,
+                    mapping(
+                        &file.path,
+                        "game",
+                        &format!("{target_root}/{routed_payload_path}"),
+                        "UE4SS runtime or configuration files.",
+                    ),
+                );
             }
         } else if script_package {
             let payload_relative_path = payload_prefix
                 .as_deref()
-                .and_then(|prefix| archive_path_relative_to(&file.logical_path, prefix))
-                .unwrap_or_else(|| normalize_archive_path(&file.logical_path));
+                .and_then(|prefix| archive_path_relative_to(routed_payload_path, prefix))
+                .unwrap_or_else(|| normalize_archive_path(routed_payload_path));
             for target_dir in &mod_target_dirs {
+                if !source_scope_matches_target_route(source_scope, target_dir) {
+                    continue;
+                }
                 push_unique_route(&mut summary_targets, target_dir);
                 push_unique_mapping(
                     &mut mappings,
@@ -8621,7 +11274,36 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
                         "Complete UE4SS script package payload and companion file.",
                     ),
                 );
+                used_script_target_dirs
+                    .insert(normalize_archive_path(target_dir).to_ascii_lowercase());
             }
+        }
+    }
+
+    if script_package {
+        for target_dir in mod_target_dirs.iter().filter(|target_dir| {
+            used_script_target_dirs
+                .contains(&normalize_archive_path(target_dir).to_ascii_lowercase())
+        }) {
+            let activation_target = format!("{target_dir}/{mod_folder_name}/enabled.txt");
+            let activation_key = normalize_archive_path(&activation_target).to_ascii_lowercase();
+            if mappings.iter().any(|mapping| {
+                normalize_archive_path(&mapping.target_relative_path).to_ascii_lowercase()
+                    == activation_key
+            }) {
+                continue;
+            }
+            push_unique_route(&mut summary_targets, target_dir);
+            push_unique_mapping(
+                &mut mappings,
+                generated_mapping(
+                    &format!("ue4ss-{mod_folder_name}-enabled"),
+                    "game",
+                    &activation_target,
+                    "UE4SS activation marker generated by Mod Garrison.",
+                    "",
+                ),
+            );
         }
     }
 
@@ -8641,16 +11323,6 @@ fn ue4ss_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Install
     if profile.engine != "unreal" && profile.engine != "unknown" {
         warnings.push(
             "This looks like a UE4SS mod, but the selected profile is not marked as Unreal."
-                .to_string(),
-        );
-    }
-
-    if files
-        .iter()
-        .any(|file| file.logical_path.to_lowercase().ends_with(".pak"))
-    {
-        warnings.push(
-            "This archive also contains pak files; the Unreal pak adapter may be a better fit."
                 .to_string(),
         );
     }
@@ -8676,12 +11348,25 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
     let mut mappings = Vec::new();
     let mut warnings = Vec::new();
     let target_roots = reframework_target_roots(profile);
-    let runtime_prefix = runtime_payload_prefix(&files, "reframework");
+    let routed_payload_paths = files
+        .iter()
+        .map(source_payload_path_for_install_target)
+        .collect::<Vec<_>>();
+    let has_scoped_payload = files
+        .iter()
+        .any(|file| source_install_target_scope(&file.path).is_some());
+    let runtime_prefix = (!has_scoped_payload)
+        .then(|| runtime_payload_prefix(&files, "reframework"))
+        .flatten();
 
-    for file in &files {
+    for (file, routed_payload_path) in files.iter().zip(&routed_payload_paths) {
+        let source_scope = source_install_target_scope(&file.path);
         if let Some(prefix) = runtime_prefix.as_deref() {
             if let Some(relative_path) = archive_path_relative_to(&file.logical_path, prefix) {
                 for target_root in &target_roots {
+                    if !source_scope_matches_target_route(source_scope, target_root) {
+                        continue;
+                    }
                     push_unique_mapping(
                         &mut mappings,
                         mapping(
@@ -8696,23 +11381,29 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
             continue;
         }
 
-        let lower_path = file.logical_path.to_lowercase();
-        if is_reframework_root_runtime_file(&file.logical_path) {
+        let lower_path = routed_payload_path.to_lowercase();
+        if is_reframework_root_runtime_file(routed_payload_path) {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
                     &join_install_route(
                         &install_route_parent(target_root),
-                        &basename(&file.logical_path),
+                        &basename(routed_payload_path),
                     ),
                     "REFramework bootstrap/runtime file.",
                 ));
             }
         } else if let Some(relative_path) =
-            path_after_named_segment(&file.logical_path, "reframework")
+            path_after_named_segment(routed_payload_path, "reframework")
         {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
@@ -8722,24 +11413,30 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
             }
         } else if lower_path.ends_with(".lua") {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
                     &join_install_route(
                         target_root,
-                        &format!("autorun/{}", basename(&file.logical_path)),
+                        &format!("autorun/{}", basename(routed_payload_path)),
                     ),
                     "REFramework autorun Lua script.",
                 ));
             }
         } else if lower_path.ends_with(".dll") {
             for target_root in &target_roots {
+                if !source_scope_matches_target_route(source_scope, target_root) {
+                    continue;
+                }
                 mappings.push(mapping(
                     &file.path,
                     "game",
                     &join_install_route(
                         target_root,
-                        &format!("plugins/{}", basename(&file.logical_path)),
+                        &format!("plugins/{}", basename(routed_payload_path)),
                     ),
                     "REFramework native plugin.",
                 ));
@@ -8747,11 +11444,11 @@ fn reframework_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<I
         }
     }
 
-    let has_signal = files.iter().any(|file| {
-        let lower_path = file.logical_path.to_lowercase();
-        path_after_named_segment(&file.logical_path, "reframework").is_some()
+    let has_signal = routed_payload_paths.iter().any(|path| {
+        let lower_path = path.to_lowercase();
+        path_after_named_segment(path, "reframework").is_some()
             || lower_path.ends_with(".lua")
-            || is_reframework_root_runtime_file(&file.logical_path)
+            || is_reframework_root_runtime_file(path)
     });
 
     if !has_signal || mappings.is_empty() {
@@ -8836,34 +11533,36 @@ fn re_engine_native_relative_path(path: &str) -> Option<String> {
 }
 
 fn unreal_pak_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<InstallPlan> {
-    let pak_files = installable_files(&scanned.entries)
-        .into_iter()
-        .filter(|file| {
-            let lower_path = file.logical_path.to_lowercase();
-            lower_path.ends_with(".pak")
-                || lower_path.ends_with(".ucas")
-                || lower_path.ends_with(".utoc")
-        })
-        .collect::<Vec<_>>();
+    let pak_files = unreal_payload_files(&scanned.entries);
 
     if pak_files.is_empty() {
         return None;
     }
 
     let pak_target_dirs = unreal_pak_target_dirs(profile);
-    let mappings = pak_files
-        .iter()
-        .flat_map(|file| {
-            pak_target_dirs.iter().map(|pak_target_dir| {
+    let mut mappings = Vec::new();
+    let mut summary_targets = Vec::new();
+    for file in &pak_files {
+        let source_scope = source_install_target_scope(&file.path);
+        for pak_target_dir in &pak_target_dirs {
+            if !source_scope_matches_target_route(source_scope, pak_target_dir) {
+                continue;
+            }
+            push_unique_route(&mut summary_targets, pak_target_dir);
+            push_unique_mapping(
+                &mut mappings,
                 mapping(
                     &file.path,
                     "game",
                     &format!("{}/{}", pak_target_dir, basename(&file.logical_path)),
                     "Generic Unreal Engine pak-style mod file.",
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+                ),
+            );
+        }
+    }
+    if mappings.is_empty() {
+        return None;
+    }
     let warnings = if profile.engine == "unreal" || profile.engine == "unknown" {
         Vec::new()
     } else {
@@ -8884,13 +11583,48 @@ fn unreal_pak_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<In
         summary: format!(
             "Deploy {} pak file(s) to {}.",
             pak_files.len(),
-            join_human_list(&pak_target_dirs)
+            join_human_list(&summary_targets)
         ),
         mappings,
         dependencies: Vec::new(),
         warnings,
         requires_confirmation: false,
     })
+}
+
+fn is_unreal_container_file(path: &str) -> bool {
+    let lower_path = normalize_archive_path(path).to_ascii_lowercase();
+    lower_path.ends_with(".pak") || lower_path.ends_with(".ucas") || lower_path.ends_with(".utoc")
+}
+
+fn unreal_payload_family(path: &str, suffix: &str) -> Option<String> {
+    let normalized = normalize_archive_path(path).to_ascii_lowercase();
+    let without_suffix = normalized.strip_suffix(suffix)?;
+    Some(
+        without_suffix
+            .strip_suffix(".pak")
+            .unwrap_or(without_suffix)
+            .to_string(),
+    )
+}
+
+fn unreal_payload_files(entries: &[ArchiveEntry]) -> Vec<ArchiveEntry> {
+    let files = installable_files(entries);
+    let pak_families = files
+        .iter()
+        .filter_map(|file| unreal_payload_family(&file.logical_path, ".pak"))
+        .collect::<HashSet<_>>();
+
+    files
+        .into_iter()
+        .filter(|file| {
+            if is_unreal_container_file(&file.logical_path) {
+                return true;
+            }
+            unreal_payload_family(&file.logical_path, ".sig")
+                .is_some_and(|family| pak_families.contains(&family))
+        })
+        .collect()
 }
 
 fn loose_files_plan(scanned: &ScannedArchive) -> Option<InstallPlan> {
@@ -8937,10 +11671,14 @@ struct InstallMetadata {
     dependency_string: Option<String>,
     package_provider: Option<String>,
     package_version: Option<String>,
+    provider_file_id: Option<String>,
+    provider_variant: Option<String>,
     display_name: Option<String>,
     package_identity: Option<PackageIdentity>,
     runtime_id: Option<String>,
     icon_url: Option<String>,
+    install_targets: Vec<InstallTargetOption>,
+    selected_install_target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8994,6 +11732,27 @@ struct DeploymentJournalEntry {
     expected_sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeactivationJournal {
+    version: u32,
+    id: String,
+    profile_id: String,
+    record_id: String,
+    game_path: String,
+    original_record: InstalledModRecord,
+    entries: Vec<DeactivationJournalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeactivationJournalEntry {
+    target_root: String,
+    target_relative_path: String,
+    snapshot_file: Option<String>,
+    expected_deactivated_sha256: Option<String>,
+}
+
 #[derive(Debug)]
 struct DeploymentOutcome {
     files_written: Vec<String>,
@@ -9005,24 +11764,64 @@ struct DeploymentOutcome {
 }
 
 impl DeploymentOutcome {
-    fn commit(mut self) {
+    fn commit(mut self) -> Result<(), String> {
         self.journal.phase = DeploymentJournalPhase::StateCommitted;
-        let _ = write_deployment_journal(&self.transaction_root, &self.journal);
-        let _ = fs::remove_dir_all(self.transaction_root);
+        let journal_error = write_deployment_journal(&self.transaction_root, &self.journal).err();
+        match fs::remove_dir_all(&self.transaction_root) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(cleanup_error) => {
+                let journal_detail = journal_error
+                    .map(|error| {
+                        format!(" The committed journal also could not be updated: {error}")
+                    })
+                    .unwrap_or_default();
+                Err(format!(
+                    "The deployment was committed, but its recovery files could not be removed from {}: {cleanup_error}.{journal_detail}",
+                    self.transaction_root.to_string_lossy()
+                ))
+            }
+        }
     }
 
-    fn rollback(&self) {
+    fn rollback(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         for entry in self.rollback_entries.iter().rev() {
             if let Some(backup) = &entry.immediate_backup {
                 if let Some(parent) = entry.destination.parent() {
-                    let _ = fs::create_dir_all(parent);
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        errors.push(format!(
+                            "Could not recreate {}: {error}",
+                            parent.to_string_lossy()
+                        ));
+                        continue;
+                    }
                 }
-                let _ = replace_file_from_path(backup, &entry.destination);
+                if let Err(error) = replace_file_from_path(backup, &entry.destination) {
+                    errors.push(format!(
+                        "Could not restore {}: {error}",
+                        entry.destination.to_string_lossy()
+                    ));
+                }
             } else if entry.destination.exists() {
-                let _ = fs::remove_file(&entry.destination);
+                if let Err(error) = fs::remove_file(&entry.destination) {
+                    errors.push(format!(
+                        "Could not remove {}: {error}",
+                        entry.destination.to_string_lossy()
+                    ));
+                }
             }
         }
-        let _ = fs::remove_dir_all(&self.transaction_root);
+        if errors.is_empty() {
+            fs::remove_dir_all(&self.transaction_root).map_err(error_to_string)?;
+            Ok(())
+        } else {
+            Err(format!(
+                "Rollback was incomplete; recovery data was kept at {}. {}",
+                self.transaction_root.to_string_lossy(),
+                errors.join(" ")
+            ))
+        }
     }
 }
 
@@ -9082,6 +11881,370 @@ fn prepare_install_source_for_deployment(
     }
 }
 
+fn install_graph_active() -> bool {
+    INSTALL_GRAPH_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn active_install_graph_id() -> Option<String> {
+    INSTALL_GRAPH_ID.with(|id| id.borrow().clone())
+}
+
+fn enter_install_graph(id: &str) -> InstallGraphGuard {
+    INSTALL_GRAPH_DEPTH.with(|depth| {
+        debug_assert_eq!(depth.get(), 0);
+        depth.set(1);
+    });
+    INSTALL_GRAPH_ID.with(|active| {
+        *active.borrow_mut() = Some(id.to_string());
+    });
+    InstallGraphGuard
+}
+
+impl Drop for InstallGraphGuard {
+    fn drop(&mut self) {
+        INSTALL_GRAPH_DEPTH.with(|depth| {
+            debug_assert!(depth.get() > 0);
+            depth.set(0);
+        });
+        INSTALL_GRAPH_ID.with(|active| {
+            *active.borrow_mut() = None;
+        });
+    }
+}
+
+fn replacement_journal_paths(root: &Path) -> Result<HashSet<PathBuf>, String> {
+    let directory = replacement_transactions_dir(root);
+    if !directory.is_dir() {
+        return Ok(HashSet::new());
+    }
+    Ok(fs::read_dir(directory)
+        .map_err(error_to_string)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                && entry
+                    .path()
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        })
+        .map(|entry| entry.path())
+        .collect())
+}
+
+fn install_graph_transactions_dir(root: &Path) -> PathBuf {
+    root.join("install-graph-transactions")
+}
+
+fn begin_install_graph_transaction(
+    root: &Path,
+    profile: &GameProfile,
+) -> Result<InstallGraphTransaction, String> {
+    let id = Uuid::new_v4().to_string();
+    let journal_path = install_graph_transactions_dir(root).join(format!("{id}.json"));
+    let checkpoint =
+        read_store::<InstalledModRecord>(&installed_mods_path(root)).map_err(error_to_string)?;
+    let journal = InstallGraphJournal {
+        version: INSTALL_GRAPH_JOURNAL_VERSION,
+        id: id.clone(),
+        profile_id: profile.id.clone(),
+        phase: InstallGraphJournalPhase::Applying,
+        checkpoint: checkpoint.clone(),
+    };
+    atomic_write(&journal_path, &serialize_json_line(&journal)?).map_err(error_to_string)?;
+    Ok(InstallGraphTransaction {
+        id,
+        journal_path,
+        checkpoint,
+    })
+}
+
+fn scoped_replacement_journals(
+    root: &Path,
+    profile: &GameProfile,
+    transaction: &InstallGraphTransaction,
+) -> Result<Vec<(PathBuf, ReplacementJournal)>, String> {
+    let mut paths = replacement_journal_paths(root)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut journals = Vec::new();
+    for path in paths {
+        let raw = fs::read_to_string(&path).map_err(error_to_string)?;
+        let journal = parse_json_allow_bom::<ReplacementJournal>(&raw).map_err(error_to_string)?;
+        if journal.version != REPLACEMENT_JOURNAL_VERSION {
+            return Err(format!(
+                "Unsupported replacement journal version {} in {}.",
+                journal.version,
+                path.to_string_lossy()
+            ));
+        }
+        validate_replacement_journal_identity(&path, &journal)?;
+        if journal.profile_id == profile.id
+            && journal.install_graph_id.as_deref() == Some(transaction.id.as_str())
+        {
+            journals.push((path, journal));
+        }
+    }
+    Ok(journals)
+}
+
+fn commit_install_graph_replacements(
+    root: &Path,
+    profile: &GameProfile,
+    transaction: &InstallGraphTransaction,
+) -> Result<Vec<String>, String> {
+    let mut journals = scoped_replacement_journals(root, profile, transaction)?;
+    let current =
+        read_store::<InstalledModRecord>(&installed_mods_path(root)).map_err(error_to_string)?;
+    let raw = fs::read_to_string(&transaction.journal_path).map_err(error_to_string)?;
+    let mut graph_journal =
+        parse_json_allow_bom::<InstallGraphJournal>(&raw).map_err(error_to_string)?;
+    validate_install_graph_journal_identity(&transaction.journal_path, &graph_journal)?;
+    if graph_journal.phase != InstallGraphJournalPhase::Applying {
+        return Err("The dependency graph transaction was already committed.".to_string());
+    }
+
+    let mut writes = Vec::with_capacity(journals.len() + 1);
+    for (path, journal) in &mut journals {
+        if journal.phase != ReplacementJournalPhase::Ready
+            || replacement_candidate_for_journal(&current.items, journal)?.is_none()
+        {
+            return Err(format!(
+                "The replacement for {} did not reach a valid dependency-checked state.",
+                journal.expected_package_id
+            ));
+        }
+        journal.phase = ReplacementJournalPhase::Validated;
+        writes.push(StoreBatchWrite {
+            target: path.clone(),
+            content: serialize_json_line(journal)?,
+        });
+    }
+    graph_journal.phase = InstallGraphJournalPhase::Committed;
+    writes.push(StoreBatchWrite {
+        target: transaction.journal_path.clone(),
+        content: serialize_json_line(&graph_journal)?,
+    });
+    commit_store_batch(root, writes).map_err(error_to_string)?;
+
+    let mut warnings = Vec::new();
+    for (path, journal) in journals {
+        let finish_error = finish_replacement_journal(&path).err();
+        cleanup_install_data(root, &profile.id, &journal.old_record_id);
+        if let Some(error) = finish_error {
+            warnings.push(format!(
+                "Deferred cleanup for {} will be retried: {error}",
+                journal.expected_package_id
+            ));
+        }
+    }
+    if warnings.is_empty() {
+        finish_install_graph_journal(&transaction.journal_path)?;
+    }
+    Ok(warnings)
+}
+
+fn finish_rolled_back_install_graph_replacements(
+    root: &Path,
+    profile: &GameProfile,
+    transaction: &InstallGraphTransaction,
+) -> Result<(), String> {
+    let checkpoint_ids = transaction
+        .checkpoint
+        .items
+        .iter()
+        .filter(|record| record.profile_id == profile.id)
+        .map(|record| record.id.as_str())
+        .collect::<HashSet<_>>();
+    for (path, journal) in scoped_replacement_journals(root, profile, transaction)? {
+        if checkpoint_ids.contains(journal.old_record_id.as_str()) {
+            let snapshots = replacement_config_snapshots(root, profile, &journal)?;
+            if !snapshots.is_empty() {
+                restore_config_snapshots_to_record(
+                    root,
+                    profile,
+                    &journal.old_record_id,
+                    &snapshots,
+                )?;
+            }
+            finish_replacement_journal(&path)?;
+        } else {
+            finish_replacement_journal(&path)?;
+            cleanup_install_data(root, &profile.id, &journal.old_record_id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_install_graph_journal_identity(
+    path: &Path,
+    journal: &InstallGraphJournal,
+) -> Result<(), String> {
+    Uuid::parse_str(&journal.id)
+        .map_err(|_| "Install-graph recovery found an invalid transaction identity.".to_string())?;
+    if path.file_stem().and_then(|stem| stem.to_str()) != Some(journal.id.as_str()) {
+        return Err(format!(
+            "Install-graph recovery journal identity does not match its file name: {}",
+            path.to_string_lossy()
+        ));
+    }
+    if !is_safe_internal_storage_segment(&journal.profile_id)
+        || journal.checkpoint.items.iter().any(|record| {
+            !is_safe_internal_storage_segment(&record.profile_id)
+                || !is_safe_internal_storage_segment(&record.id)
+        })
+    {
+        return Err("Install-graph recovery found an unsafe storage identity.".to_string());
+    }
+    Ok(())
+}
+
+fn install_graph_journal_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let directory = install_graph_transactions_dir(root);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(directory)
+        .map_err(error_to_string)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                && entry
+                    .path()
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn finish_install_graph_journal(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(error_to_string)?;
+    }
+    let backup_path = backup_path_for(path);
+    if backup_path.exists() {
+        fs::remove_file(backup_path).map_err(error_to_string)?;
+    }
+    if let Some(parent) = path.parent() {
+        if parent.is_dir()
+            && fs::read_dir(parent)
+                .map_err(error_to_string)?
+                .next()
+                .is_none()
+        {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+    Ok(())
+}
+
+fn recover_install_graph_transactions(root: &Path) -> Result<(), String> {
+    let profiles = read_store::<GameProfile>(&profiles_path(root))
+        .map_err(error_to_string)?
+        .items
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<HashMap<_, _>>();
+    for path in install_graph_journal_paths(root)? {
+        let raw = fs::read_to_string(&path).map_err(error_to_string)?;
+        let journal = parse_json_allow_bom::<InstallGraphJournal>(&raw).map_err(error_to_string)?;
+        if journal.version != INSTALL_GRAPH_JOURNAL_VERSION {
+            return Err(format!(
+                "Unsupported install-graph journal version {} in {}.",
+                journal.version,
+                path.to_string_lossy()
+            ));
+        }
+        validate_install_graph_journal_identity(&path, &journal)?;
+        let Some(profile) = profiles.get(&journal.profile_id) else {
+            if journal.phase == InstallGraphJournalPhase::Committed {
+                finish_install_graph_journal(&path)?;
+                continue;
+            }
+            return Err(format!(
+                "Install-graph recovery retained {} because its game profile is unavailable.",
+                path.to_string_lossy()
+            ));
+        };
+        if !matches!(
+            game_process_running(Path::new(&profile.game_path)),
+            Ok(false)
+        ) {
+            continue;
+        }
+        let transaction = InstallGraphTransaction {
+            id: journal.id.clone(),
+            journal_path: path.clone(),
+            checkpoint: journal.checkpoint.clone(),
+        };
+        match journal.phase {
+            InstallGraphJournalPhase::Applying => {
+                rollback_install_graph(root, profile, &transaction.checkpoint)?;
+                finish_rolled_back_install_graph_replacements(root, profile, &transaction)?;
+                finish_install_graph_journal(&path)?;
+            }
+            InstallGraphJournalPhase::Committed => {
+                for (replacement_path, replacement) in
+                    scoped_replacement_journals(root, profile, &transaction)?
+                {
+                    if replacement.phase != ReplacementJournalPhase::Validated {
+                        return Err(format!(
+                            "Committed dependency graph contains an uncommitted replacement for {}.",
+                            replacement.expected_package_id
+                        ));
+                    }
+                    finish_replacement_journal(&replacement_path)?;
+                    cleanup_install_data(root, &profile.id, &replacement.old_record_id);
+                }
+                finish_install_graph_journal(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_install_graph_transaction<T, F>(
+    root: &Path,
+    profile: &GameProfile,
+    operation: F,
+) -> Result<(T, Vec<String>), String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    if install_graph_active() {
+        return operation().map(|value| (value, Vec::new()));
+    }
+
+    let transaction = begin_install_graph_transaction(root, profile)?;
+    let _graph = enter_install_graph(&transaction.id);
+    match operation() {
+        Ok(value) => {
+            let warnings = commit_install_graph_replacements(root, profile, &transaction)?;
+            Ok((value, warnings))
+        }
+        Err(error) => {
+            let rollback = rollback_install_graph(root, profile, &transaction.checkpoint)
+                .and_then(|_| {
+                    finish_rolled_back_install_graph_replacements(root, profile, &transaction)
+                })
+                .and_then(|_| finish_install_graph_journal(&transaction.journal_path));
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error} Mod Garrison also could not completely roll back the dependency graph: {rollback_error}"
+                )),
+            }
+        }
+    }
+}
+
 fn install_archive_impl_with_metadata(
     store_root: &Path,
     profile: &GameProfile,
@@ -9089,28 +12252,20 @@ fn install_archive_impl_with_metadata(
     plan: &InstallPlan,
     options: InstallOptions<'_>,
 ) -> Result<InstallResult, String> {
-    let graph_root = options.resolve_dependencies && options.dependency_depth == 0;
-    let checkpoint = if graph_root {
-        Some(
-            read_store::<InstalledModRecord>(&installed_mods_path(store_root))
-                .map_err(error_to_string)?,
-        )
-    } else {
-        None
-    };
-    let result =
-        install_archive_impl_with_metadata_inner(store_root, profile, archive_path, plan, options);
-    match (result, checkpoint) {
-        (Err(error), Some(checkpoint)) => {
-            match rollback_install_graph(store_root, profile, &checkpoint) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(format!(
-                    "{error} Mod Garrison also could not completely roll back the dependency graph: {rollback_error}"
-                )),
-            }
-        }
-        (result, _) => result,
+    if !options.resolve_dependencies {
+        return install_archive_impl_with_metadata_inner(
+            store_root,
+            profile,
+            archive_path,
+            plan,
+            options,
+        );
     }
+    let (mut result, warnings) = run_install_graph_transaction(store_root, profile, || {
+        install_archive_impl_with_metadata_inner(store_root, profile, archive_path, plan, options)
+    })?;
+    result.warnings.extend(warnings);
+    Ok(result)
 }
 
 fn install_archive_impl_with_metadata_inner(
@@ -9127,10 +12282,30 @@ fn install_archive_impl_with_metadata_inner(
         dependency_depth,
     } = options;
 
-    let supplied_runtime = metadata
-        .runtime_id
-        .clone()
-        .or_else(|| runtime_supplied_by_plan(profile, plan));
+    let verified_runtime = runtime_supplied_by_plan(profile, plan);
+    let supplied_runtime = if let Some(requested_runtime) = metadata.runtime_id.as_deref() {
+        match verified_runtime.as_deref() {
+            Some(verified_runtime) if verified_runtime.eq_ignore_ascii_case(requested_runtime) => {
+                Some(verified_runtime.to_string())
+            }
+            Some(verified_runtime) => {
+                return Err(format!(
+                    "The downloaded package was requested as {}, but its verified payload supplies {}. No files were changed.",
+                    format_loader(requested_runtime),
+                    format_loader(verified_runtime)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "The downloaded package was requested as {}, but its verified payload does not supply that runtime. No files were changed.",
+                    format_loader(requested_runtime)
+                ));
+            }
+        }
+    } else {
+        verified_runtime
+    };
+    let supplies_runtime = supplied_runtime.is_some();
     let mut effective_plan = plan.clone();
     if let Some(runtime) = supplied_runtime {
         metadata.runtime_id.get_or_insert_with(|| runtime.clone());
@@ -9145,6 +12320,61 @@ fn install_archive_impl_with_metadata_inner(
         effective_plan.warnings.sort();
         effective_plan.warnings.dedup();
     }
+    let mut runtime_dependency_target = None;
+    let install_target_plan = if supplies_runtime {
+        if let Some(selected_target_id) = metadata.selected_install_target_id.as_deref() {
+            let selected_target = metadata
+                .install_targets
+                .iter()
+                .find(|target| target.id == selected_target_id)
+                .cloned()
+                .ok_or_else(|| {
+                    "The selected runtime install target is no longer available.".to_string()
+                })?;
+            apply_install_target_option(&mut effective_plan, &selected_target)?;
+            runtime_dependency_target = Some(selected_target);
+        }
+        metadata.install_targets.clear();
+        metadata.selected_install_target_id = None;
+        None
+    } else {
+        if metadata.install_targets.is_empty() {
+            metadata.install_targets = plan_install_target_options(profile, &effective_plan);
+        }
+        let selected_install_target_id = select_install_target_id(
+            &metadata.install_targets,
+            metadata.selected_install_target_id.as_deref(),
+        )?;
+        let install_target_plan = selected_install_target_id
+            .as_deref()
+            .map(|_| effective_plan.clone());
+        if let Some(selected_target_id) = selected_install_target_id.as_deref() {
+            let selected_target = metadata
+                .install_targets
+                .iter()
+                .find(|target| target.id == selected_target_id)
+                .ok_or_else(|| {
+                    "The selected install target is no longer available for this package."
+                        .to_string()
+                })?;
+            apply_install_target_option(&mut effective_plan, selected_target)?;
+        }
+        metadata.selected_install_target_id = selected_install_target_id.clone();
+        install_target_plan
+    };
+    let selected_install_target = metadata
+        .selected_install_target_id
+        .as_deref()
+        .and_then(|selected_id| {
+            metadata
+                .install_targets
+                .iter()
+                .find(|target| target.id == selected_id)
+        })
+        .cloned();
+    let dependency_install_target = selected_install_target
+        .as_ref()
+        .or(runtime_dependency_target.as_ref());
     let plan = &effective_plan;
 
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
@@ -9172,12 +12402,13 @@ fn install_archive_impl_with_metadata_inner(
     let mut warnings = plan.warnings.clone();
 
     if resolve_dependencies {
-        let dependency_warnings = match install_dependencies_for_plan(
+        let dependency_warnings = match install_dependencies_for_plan_for_target(
             store_root,
             profile,
             plan,
             visited_dependencies,
             dependency_depth,
+            dependency_install_target,
         ) {
             Ok(warnings) => warnings,
             Err(error) => {
@@ -9186,6 +12417,21 @@ fn install_archive_impl_with_metadata_inner(
             }
         };
         warnings.extend(dependency_warnings);
+        if let Err(error) = ensure_required_plan_dependencies_available(store_root, profile, plan) {
+            cleanup_install_data(store_root, &profile.id, &install_id);
+            return Err(error);
+        }
+        if let Some(target) = dependency_install_target {
+            if let Err(error) =
+                ensure_install_target_dependencies_available(store_root, profile, plan, target)
+            {
+                cleanup_install_data(store_root, &profile.id, &install_id);
+                return Err(format!(
+                    "Could not satisfy dependencies for {}: {error}",
+                    target.label
+                ));
+            }
+        }
     }
 
     let deployment = match deploy_plan_transaction(
@@ -9207,7 +12453,14 @@ fn install_archive_impl_with_metadata_inner(
         let dependencies = plan
             .dependencies
             .iter()
-            .map(|dependency| refresh_dependency_status(store_root, profile, dependency))
+            .map(|dependency| {
+                refresh_dependency_status_for_target(
+                    store_root,
+                    profile,
+                    dependency,
+                    dependency_install_target,
+                )
+            })
             .collect::<Vec<_>>();
         let archive_name = metadata.archive_name.clone().unwrap_or_else(|| {
             original_source_path
@@ -9242,10 +12495,7 @@ fn install_archive_impl_with_metadata_inner(
                 .as_ref()
                 .and_then(|identity| identity.version.clone())
         });
-        let source_archive_sha256 = managed_source_path
-            .is_file()
-            .then(|| sha256_file(&managed_source_path))
-            .transpose()?;
+        let source_archive_sha256 = Some(sha256_managed_source(&managed_source_path)?);
 
         let record = InstalledModRecord {
             id: install_id.clone(),
@@ -9257,6 +12507,8 @@ fn install_archive_impl_with_metadata_inner(
             dependency_string: metadata.dependency_string,
             package_provider,
             package_version,
+            provider_file_id: metadata.provider_file_id,
+            provider_variant: metadata.provider_variant,
             source_archive_sha256,
             icon_url: metadata.icon_url,
             adapter_id: plan.adapter_id.clone(),
@@ -9272,6 +12524,9 @@ fn install_archive_impl_with_metadata_inner(
             enabled: true,
             last_status: "installed".to_string(),
             plan: Some(plan.clone()),
+            install_target_plan,
+            install_targets: metadata.install_targets,
+            selected_install_target_id: metadata.selected_install_target_id,
         };
 
         if let Err(error) = add_installed_mod(store_root, profile, record, &deployment) {
@@ -9290,14 +12545,21 @@ fn install_archive_impl_with_metadata_inner(
     })();
 
     match finalize {
-        Ok(result) => {
-            deployment.commit();
+        Ok(mut result) => {
+            if let Err(error) = deployment.commit() {
+                result.warnings.push(format!(
+                    "The mod was installed, but deployment cleanup is pending: {error}"
+                ));
+            }
             Ok(result)
         }
         Err(error) => {
-            deployment.rollback();
+            let rollback_error = deployment.rollback().err();
             cleanup_install_data(store_root, &profile.id, &install_id);
-            Err(error)
+            match rollback_error {
+                Some(rollback_error) => Err(format!("{error} {rollback_error}")),
+                None => Err(error),
+            }
         }
     }
 }
@@ -9327,18 +12589,22 @@ fn rollback_install_graph(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let mut errors = Vec::new();
+    let mut deactivated = Vec::new();
     for record in added.iter().rev() {
         if record.enabled && !record.externally_managed {
             if let Err(error) = deactivate_mod_files(store_root, profile, record) {
-                errors.push(format!("{}: {error}", display_record_name(record)));
-                continue;
+                let restore_error =
+                    restore_deactivated_mods(store_root, profile, &deactivated).err();
+                return Err(format!(
+                    "{}: {error}{}",
+                    display_record_name(record),
+                    restore_error
+                        .map(|restore_error| format!(" {restore_error}"))
+                        .unwrap_or_default()
+                ));
             }
+            deactivated.push(record.clone());
         }
-        cleanup_install_data(store_root, &profile.id, &record.id);
-    }
-    if !errors.is_empty() {
-        return Err(errors.join(" "));
     }
 
     let _commit = lock_mutations()?;
@@ -9357,7 +12623,31 @@ fn rollback_install_graph(
             content: serialize_json_line(record)?,
         });
     }
-    commit_store_batch(store_root, writes).map_err(error_to_string)
+    if let Err(error) = commit_store_batch(store_root, writes) {
+        return match restore_deactivated_mods(store_root, profile, &deactivated) {
+            Ok(()) => Err(error_to_string(error)),
+            Err(restore_error) => Err(format!("{} {restore_error}", error_to_string(error))),
+        };
+    }
+    drop(_commit);
+
+    let mut restore_errors = Vec::new();
+    for record in &checkpoint_records {
+        if let Err(error) = restore_checkpoint_record(store_root, profile, record) {
+            restore_errors.push(format!("{}: {error}", display_record_name(record)));
+        }
+    }
+    if !restore_errors.is_empty() {
+        return Err(format!(
+            "The dependency store checkpoint was restored, but its files could not all be redeployed. Recovery data was retained: {}",
+            restore_errors.join(" ")
+        ));
+    }
+
+    for record in &added {
+        cleanup_install_data(store_root, &profile.id, &record.id);
+    }
+    Ok(())
 }
 
 fn attach_manifest_dependencies(
@@ -9592,6 +12882,7 @@ fn duplicate_installed_mod_reason(
         if candidate_keys
             .iter()
             .any(|candidate| existing_keys.contains(candidate))
+            && install_candidate_overlaps_record_route_family(plan, metadata, record)
         {
             return Ok(Some(format!(
                 "{} is already installed in this profile. Disable, enable, or remove the existing copy before importing it again.",
@@ -9601,6 +12892,28 @@ fn duplicate_installed_mod_reason(
     }
 
     Ok(None)
+}
+
+fn install_candidate_overlaps_record_route_family(
+    plan: &InstallPlan,
+    metadata: &InstallMetadata,
+    record: &InstalledModRecord,
+) -> bool {
+    let candidate_families = metadata
+        .selected_install_target_id
+        .as_deref()
+        .and_then(|selected| {
+            metadata
+                .install_targets
+                .iter()
+                .find(|target| target.id == selected)
+        })
+        .map(|target| HashSet::from([install_target_route_family(&target.relative_path)]))
+        .unwrap_or_else(|| plan_payload_route_families(plan));
+    let record_families = installed_record_route_families(record);
+    candidate_families.is_empty()
+        || record_families.is_empty()
+        || !candidate_families.is_disjoint(&record_families)
 }
 
 fn install_identity_keys(
@@ -9824,23 +13137,54 @@ fn install_dependencies_for_plan(
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
 ) -> Result<Vec<String>, String> {
+    install_dependencies_for_plan_for_target(
+        store_root,
+        profile,
+        plan,
+        visited_dependencies,
+        dependency_depth,
+        None,
+    )
+}
+
+fn dependency_target_visit_key(base: &str, target: Option<&InstallTargetOption>) -> String {
+    target
+        .map(|target| {
+            format!(
+                "{base}|target:{}",
+                install_target_route_family(&target.relative_path)
+            )
+        })
+        .unwrap_or_else(|| base.to_string())
+}
+
+fn install_dependencies_for_plan_for_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    plan: &InstallPlan,
+    visited_dependencies: &mut HashSet<String>,
+    dependency_depth: usize,
+    target: Option<&InstallTargetOption>,
+) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
 
     for dependency in &plan.dependencies {
         if !dependency.required {
             continue;
         }
-        let dependency = refresh_dependency_status(store_root, profile, dependency);
+        let dependency =
+            refresh_dependency_status_for_target(store_root, profile, dependency, target);
         if dependency.status == "already-installed" {
             continue;
         }
 
-        match install_dependency_by_provider(
+        match install_dependency_by_provider_for_target(
             store_root,
             profile,
             &dependency,
             visited_dependencies,
             dependency_depth + 1,
+            target,
         ) {
             Ok(mut dependency_warnings) => warnings.append(&mut dependency_warnings),
             Err(error) if dependency.required => return Err(error),
@@ -9857,6 +13201,24 @@ fn install_dependency_by_provider(
     dependency: &DependencySpec,
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
+) -> Result<Vec<String>, String> {
+    install_dependency_by_provider_for_target(
+        store_root,
+        profile,
+        dependency,
+        visited_dependencies,
+        dependency_depth,
+        None,
+    )
+}
+
+fn install_dependency_by_provider_for_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    visited_dependencies: &mut HashSet<String>,
+    dependency_depth: usize,
+    target: Option<&InstallTargetOption>,
 ) -> Result<Vec<String>, String> {
     let capability = dependency_provider_definition(&dependency.provider).ok_or_else(|| {
         format!(
@@ -9875,6 +13237,7 @@ fn install_dependency_by_provider(
             dependency,
             visited_dependencies,
             dependency_depth,
+            target,
         ),
         "github-release" => resolve_github_release_dependency(dependency).and_then(|release| {
             install_release_dependency(
@@ -9884,6 +13247,7 @@ fn install_dependency_by_provider(
                 release,
                 visited_dependencies,
                 dependency_depth,
+                target,
             )
         }),
         "bepinbuilds" => resolve_bepinbuilds_dependency(dependency).and_then(|release| {
@@ -9894,6 +13258,7 @@ fn install_dependency_by_provider(
                 release,
                 visited_dependencies,
                 dependency_depth,
+                target,
             )
         }),
         resolver => Err(format!(
@@ -12313,35 +15678,545 @@ fn install_target_scope_label(scope: &str) -> &'static str {
     }
 }
 
-fn apply_selected_install_target(
+fn provider_plan_install_target_options(
     store_root: &Path,
     profile: &GameProfile,
     document: &ProviderRouteDocument,
-    plan: &mut InstallPlan,
-    selected_target_id: Option<&str>,
-) -> Result<(), String> {
-    let Some(selected_target_id) = selected_target_id.filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(());
-    };
-    let target = provider_install_target_options(store_root, profile, document)
+    plan: &InstallPlan,
+) -> Vec<InstallTargetOption> {
+    let mut derived = plan_install_target_options(profile, plan);
+    let described = provider_install_target_options(store_root, profile, document);
+    if derived.len() >= 2 {
+        for option in &mut derived {
+            if let Some(description_option) = described.iter().find(|described| {
+                install_target_routes_overlap(&option.relative_path, &described.relative_path)
+            }) {
+                // Destination paths are the execution authority for client/server
+                // partitioning. Provider prose may improve presentation, but must
+                // never rewrite the canonical scope used to filter files.
+                let equivalent_scope = option.scope == description_option.scope
+                    || (matches!(option.scope.as_str(), "client" | "general")
+                        && matches!(description_option.scope.as_str(), "client" | "general"));
+                if equivalent_scope {
+                    option.recommended = description_option.recommended;
+                    option.label = description_option.label.clone();
+                }
+            }
+        }
+        sort_install_target_options(&mut derived);
+        return derived;
+    }
+
+    let mut described = described
         .into_iter()
-        .find(|target| target.id == selected_target_id)
-        .ok_or_else(|| {
-            "The selected install target is no longer verified for this game. Refresh Discovery and try again."
-                .to_string()
-        })?;
+        .filter(|target| {
+            target.id == install_route_key(&plan.adapter_id, &target.relative_path)
+                && install_target_has_mappings(plan, target)
+        })
+        .map(|mut target| {
+            let canonical_scope = install_target_scope_from_path(&target.relative_path);
+            if target.scope != canonical_scope {
+                target.scope = canonical_scope;
+                target.label = format!(
+                    "{} ({})",
+                    install_target_scope_label(&target.scope),
+                    target.relative_path.replace('/', "\\")
+                );
+                target.recommended = matches!(target.scope.as_str(), "client" | "general");
+            }
+            target
+        })
+        .collect::<Vec<_>>();
+    described.sort_by(|first, second| first.id.cmp(&second.id));
+    described.dedup_by(|first, second| first.id == second.id);
+    if described.len() > 1 && !install_target_options_are_exclusive(plan, &described) {
+        return Vec::new();
+    }
+    sort_install_target_options(&mut described);
+    described
+}
+
+fn provider_selected_install_target_id(
+    store_root: &Path,
+    profile: &GameProfile,
+    document: &ProviderRouteDocument,
+    options: &[InstallTargetOption],
+    selected_target_id: Option<&str>,
+) -> Option<String> {
+    let described = provider_install_target_options(store_root, profile, document);
+    if let Some(selected_target_id) = selected_target_id.filter(|value| !value.trim().is_empty()) {
+        if let Some(option) = options
+            .iter()
+            .find(|option| option.id == selected_target_id)
+        {
+            return Some(option.id.clone());
+        }
+        let described = described
+            .iter()
+            .find(|option| option.id == selected_target_id);
+        if let Some(described) = described {
+            let overlapping = options
+                .iter()
+                .filter(|option| {
+                    install_target_routes_overlap(&option.relative_path, &described.relative_path)
+                })
+                .collect::<Vec<_>>();
+            if overlapping.len() == 1 {
+                return Some(overlapping[0].id.clone());
+            }
+            if let Some(option) = overlapping.into_iter().find(|option| {
+                option.scope == described.scope
+                    || (matches!(option.scope.as_str(), "client" | "general")
+                        && matches!(described.scope.as_str(), "client" | "general"))
+            }) {
+                return Some(option.id.clone());
+            }
+        }
+        // Preserve the invalid identifier so the canonical selector fails closed
+        // instead of silently installing to a different destination.
+        return Some(selected_target_id.to_string());
+    }
+
+    // If a provider describes exactly one route and explicitly says it is
+    // server-only, choose the sole overlapping canonical server destination.
+    // All other multi-route packages retain the normal client-first default.
+    if described.len() == 1
+        && matches!(
+            described[0].scope.as_str(),
+            "hosted-server" | "dedicated-server"
+        )
+    {
+        let matching = options
+            .iter()
+            .filter(|option| {
+                matches!(option.scope.as_str(), "hosted-server" | "dedicated-server")
+                    && install_target_routes_overlap(
+                        &option.relative_path,
+                        &described[0].relative_path,
+                    )
+            })
+            .collect::<Vec<_>>();
+        if matching.len() == 1 {
+            return Some(matching[0].id.clone());
+        }
+    }
+    None
+}
+
+fn plan_install_target_options(
+    profile: &GameProfile,
+    plan: &InstallPlan,
+) -> Vec<InstallTargetOption> {
+    let mut routes = match plan.adapter_id.as_str() {
+        "unreal-pak" => unreal_pak_target_dirs(profile),
+        "ue4ss" => ue4ss_install_targets(profile).0,
+        "script-files" => native_script_target_dirs(profile),
+        "bepinex" => bepinex_target_roots(profile),
+        "reframework" => reframework_target_roots(profile),
+        _ => Vec::new(),
+    };
+    for mapping in plan
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+    {
+        let derived = match plan.adapter_id.as_str() {
+            "unreal-pak" => Some(install_route_parent(&mapping.target_relative_path)),
+            "ue4ss" => {
+                install_route_prefix_through(&mapping.target_relative_path, &["binaries", "win64"])
+            }
+            "bepinex" => install_route_prefix_through(&mapping.target_relative_path, &["bepinex"]),
+            "reframework" => {
+                install_route_prefix_through(&mapping.target_relative_path, &["reframework"])
+            }
+            _ => None,
+        };
+        if let Some(derived) = derived.filter(|route| !route.is_empty()) {
+            push_unique_route(&mut routes, &derived);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut options = routes
+        .into_iter()
+        .filter_map(|relative_path| {
+            let relative_path = normalize_archive_path(&relative_path);
+            let id = install_route_key(&plan.adapter_id, &relative_path);
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let scope = install_target_scope_from_path(&relative_path);
+            let option = InstallTargetOption {
+                id,
+                label: format!(
+                    "{} ({})",
+                    install_target_scope_label(&scope),
+                    relative_path.replace('/', "\\")
+                ),
+                relative_path,
+                recommended: matches!(scope.as_str(), "client" | "general"),
+                scope,
+            };
+            install_target_has_mappings(plan, &option).then_some(option)
+        })
+        .collect::<Vec<_>>();
+    if plan_has_mixed_unreal_payload(plan) {
+        let mut seen_scopes = HashSet::new();
+        options.retain(|option| seen_scopes.insert(option.scope.clone()));
+    }
+    if options.len() < 2 || !install_target_options_are_exclusive(plan, &options) {
+        return Vec::new();
+    }
+    sort_install_target_options(&mut options);
+    options
+}
+
+fn install_target_options_are_exclusive(
+    plan: &InstallPlan,
+    options: &[InstallTargetOption],
+) -> bool {
+    let mixed_unreal_payload = plan_has_mixed_unreal_payload(plan);
+    let source_sets = options
+        .iter()
+        .map(|target| {
+            plan.mappings
+                .iter()
+                .filter(|mapping| {
+                    mapping.target_root.eq_ignore_ascii_case("game")
+                        && mapping_matches_install_target(
+                            &plan.adapter_id,
+                            mapping,
+                            target,
+                            mixed_unreal_payload,
+                        )
+                })
+                .map(|mapping| normalize_archive_path(&mapping.source_path).to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = source_sets.first() else {
+        return false;
+    };
+    if first.is_empty() || source_sets.iter().any(HashSet::is_empty) {
+        return false;
+    }
+    if source_sets.iter().skip(1).all(|set| set == first) {
+        return true;
+    }
+
+    let common_sources = source_sets
+        .iter()
+        .skip(1)
+        .fold(first.clone(), |common, sources| {
+            common.intersection(sources).cloned().collect()
+        });
+    let mut found_partitioned_source = false;
+    for (target, sources) in options.iter().zip(&source_sets) {
+        for source in sources.difference(&common_sources) {
+            let Some(source_scope) = source_install_target_scope(source) else {
+                return false;
+            };
+            if !source_scope_matches_target_scope(Some(source_scope), &target.scope) {
+                return false;
+            }
+            found_partitioned_source = true;
+        }
+    }
+    found_partitioned_source
+}
+
+fn install_route_prefix_through(path: &str, suffix: &[&str]) -> Option<String> {
+    let parts = normalize_archive_path(path)
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let index = parts.windows(suffix.len()).position(|window| {
+        window
+            .iter()
+            .zip(suffix)
+            .all(|(part, expected)| part.eq_ignore_ascii_case(expected))
+    })?;
+    Some(parts[..index + suffix.len()].join("/"))
+}
+
+fn install_target_scope_from_path(relative_path: &str) -> String {
+    let parts = normalize_archive_path(relative_path)
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| matches!(part.as_str(), "dedicatedserver" | "dedicated-server"))
+    {
+        "dedicated-server".to_string()
+    } else if parts.iter().any(|part| {
+        matches!(
+            part.as_str(),
+            "windowsserver"
+                | "windows-server"
+                | "hostedserver"
+                | "hosted-server"
+                | "localserver"
+                | "local-server"
+                | "server"
+        )
+    }) {
+        "hosted-server".to_string()
+    } else {
+        "client".to_string()
+    }
+}
+
+fn source_install_target_variant(path: &str) -> Option<(usize, &'static str)> {
+    let normalized = normalize_archive_path(path);
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let directory_count = parts.len().saturating_sub(1);
+    for (index, part) in parts.iter().take(directory_count).enumerate() {
+        // Variant folders are expected at the package edge, optionally under one
+        // or two wrapper folders. Deeper "Client" or "Server" directories may be
+        // legitimate mod data, so they are deliberately not inferred.
+        if index > 2 {
+            break;
+        }
+        let compact = compact_provider_slug(part);
+        let scope = match compact.as_str() {
+            "client"
+            | "clientfile"
+            | "clientfiles"
+            | "clientside"
+            | "clientsidefiles"
+            | "clientonly"
+            | "clientversion"
+            | "singleplayer"
+            | "singleplayerfiles"
+            | "singleplayeronly"
+            | "singleplayerversion"
+            | "solo"
+            | "solofiles" => Some("client"),
+            "server" | "serverfile" | "serverfiles" | "serverside" | "serversidefiles"
+            | "serveronly" | "serverversion" | "localserver" | "localserverfiles"
+            | "hostedserver" | "hostedserverfiles" | "windowsserver" => Some("hosted-server"),
+            "dedicatedserver"
+            | "dedicatedserverfile"
+            | "dedicatedserverfiles"
+            | "dedicatedserveronly"
+            | "dedicatedserverversion" => Some("dedicated-server"),
+            _ => None,
+        };
+        if let Some(scope) = scope {
+            return Some((index, scope));
+        }
+        if matches!(
+            compact.as_str(),
+            "ue4ss"
+                | "mods"
+                | "mod"
+                | "scripts"
+                | "script"
+                | "content"
+                | "paks"
+                | "binaries"
+                | "plugins"
+                | "plugin"
+        ) {
+            break;
+        }
+    }
+    None
+}
+
+fn source_install_target_scope(path: &str) -> Option<&'static str> {
+    source_install_target_variant(path).map(|(_, scope)| scope)
+}
+
+fn source_payload_path_for_install_target(file: &ArchiveEntry) -> String {
+    let normalized_source = normalize_archive_path(&file.path);
+    if let Some((variant_index, _)) = source_install_target_variant(&normalized_source) {
+        let remaining = normalized_source
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .skip(variant_index + 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        if !remaining.is_empty() {
+            return remaining;
+        }
+    }
+    normalize_archive_path(&file.logical_path)
+}
+
+fn source_scope_matches_target_scope(source_scope: Option<&str>, target_scope: &str) -> bool {
+    match source_scope {
+        None => true,
+        Some("client") => matches!(target_scope, "client" | "general"),
+        Some("hosted-server") => target_scope == "hosted-server",
+        Some("dedicated-server") => target_scope == "dedicated-server",
+        Some(_) => false,
+    }
+}
+
+fn source_scope_matches_target_route(source_scope: Option<&str>, target_route: &str) -> bool {
+    source_scope_matches_target_scope(source_scope, &install_target_scope_from_path(target_route))
+}
+
+fn sort_install_target_options(options: &mut [InstallTargetOption]) {
+    options.sort_by(|first, second| {
+        second
+            .recommended
+            .cmp(&first.recommended)
+            .then_with(|| first.label.to_lowercase().cmp(&second.label.to_lowercase()))
+            .then_with(|| first.id.cmp(&second.id))
+    });
+    if !options.is_empty() && !options.iter().any(|option| option.recommended) {
+        options[0].recommended = true;
+    }
+}
+
+fn install_target_routes_overlap(first: &str, second: &str) -> bool {
+    let first = normalize_archive_path(first).to_ascii_lowercase();
+    let second = normalize_archive_path(second).to_ascii_lowercase();
+    first == second
+        || first.starts_with(&format!("{second}/"))
+        || second.starts_with(&format!("{first}/"))
+}
+
+fn install_target_has_mappings(plan: &InstallPlan, target: &InstallTargetOption) -> bool {
+    let mixed_unreal_payload = plan_has_mixed_unreal_payload(plan);
+    plan.mappings.iter().any(|mapping| {
+        mapping.target_root.eq_ignore_ascii_case("game")
+            && mapping_matches_install_target(
+                &plan.adapter_id,
+                mapping,
+                target,
+                mixed_unreal_payload,
+            )
+    })
+}
+
+fn plan_has_mixed_unreal_payload(plan: &InstallPlan) -> bool {
+    plan.adapter_id == "ue4ss"
+        && plan.mappings.iter().any(|mapping| {
+            matches!(
+                Path::new(&mapping.target_relative_path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("pak" | "ucas" | "utoc")
+            )
+        })
+}
+
+fn mapping_matches_install_target(
+    adapter_id: &str,
+    mapping: &InstallMapping,
+    target: &InstallTargetOption,
+    mixed_unreal_payload: bool,
+) -> bool {
     let target_path = normalize_archive_path(&target.relative_path).to_lowercase();
     let target_prefix = format!("{target_path}/");
+    let mapping_path = normalize_archive_path(&mapping.target_relative_path).to_lowercase();
+    if mapping_path == target_path || mapping_path.starts_with(&target_prefix) {
+        return true;
+    }
+    if mixed_unreal_payload {
+        let mapping_scope = install_target_scope_from_path(&mapping_path);
+        return match target.scope.as_str() {
+            "dedicated-server" => mapping_scope == "dedicated-server",
+            "hosted-server" => mapping_scope == "hosted-server",
+            _ => matches!(mapping_scope.as_str(), "client" | "general"),
+        };
+    }
+
+    if !matches!(adapter_id, "bepinex" | "reframework") {
+        return false;
+    }
+    let target_parent = install_route_parent(&target_path);
+    if target_parent.is_empty() {
+        return !mapping_path.contains('/');
+    }
+    mapping_path
+        .strip_prefix(&format!("{target_parent}/"))
+        .is_some_and(|remaining| !remaining.contains('/'))
+}
+
+fn select_install_target_id(
+    options: &[InstallTargetOption],
+    selected_target_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(selected_target_id) = selected_target_id.filter(|value| !value.trim().is_empty()) {
+        return options
+            .iter()
+            .find(|target| target.id == selected_target_id)
+            .map(|target| Some(target.id.clone()))
+            .ok_or_else(|| {
+                "The selected install target is no longer verified for this game. Refresh Discovery and try again."
+                    .to_string()
+            });
+    }
+
+    Ok(options
+        .iter()
+        .find(|target| target.recommended)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|target| matches!(target.scope.as_str(), "client" | "general"))
+        })
+        .or_else(|| options.first())
+        .map(|target| target.id.clone()))
+}
+
+fn select_dependency_install_target_id(
+    plan: &InstallPlan,
+    options: &[InstallTargetOption],
+    parent_target: Option<&InstallTargetOption>,
+) -> Result<Option<String>, String> {
+    let Some(parent_target) = parent_target else {
+        return select_install_target_id(options, None);
+    };
+    let parent_family = install_target_route_family(&parent_target.relative_path);
+    let matching = options
+        .iter()
+        .filter(|target| install_target_route_family(&target.relative_path) == parent_family)
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [target] => Ok(Some(target.id.clone())),
+        [] if options.is_empty() && plan_payload_covers_install_target(plan, parent_target) => {
+            Ok(None)
+        }
+        [] => Err(format!(
+            "The dependency has no verified install target in the same game-root family as {}.",
+            parent_target.label
+        )),
+        _ => Err(format!(
+            "The dependency has multiple ambiguous install targets in the same game-root family as {}.",
+            parent_target.label
+        )),
+    }
+}
+
+fn apply_install_target_option(
+    plan: &mut InstallPlan,
+    target: &InstallTargetOption,
+) -> Result<(), String> {
+    let adapter_id = plan.adapter_id.clone();
+    let mixed_unreal_payload = plan_has_mixed_unreal_payload(plan);
     let selected_mapping_count = plan
         .mappings
         .iter()
         .filter(|mapping| {
-            if !mapping.target_root.eq_ignore_ascii_case("game") {
-                return false;
-            }
-            let mapping_path = normalize_archive_path(&mapping.target_relative_path).to_lowercase();
-            mapping_path == target_path || mapping_path.starts_with(&target_prefix)
+            mapping.target_root.eq_ignore_ascii_case("game")
+                && mapping_matches_install_target(
+                    &adapter_id,
+                    mapping,
+                    target,
+                    mixed_unreal_payload,
+                )
         })
         .count();
     if selected_mapping_count == 0 {
@@ -12355,8 +16230,7 @@ fn apply_selected_install_target(
         if !mapping.target_root.eq_ignore_ascii_case("game") {
             return true;
         }
-        let mapping_path = normalize_archive_path(&mapping.target_relative_path).to_lowercase();
-        mapping_path == target_path || mapping_path.starts_with(&target_prefix)
+        mapping_matches_install_target(&adapter_id, mapping, target, mixed_unreal_payload)
     });
     Ok(())
 }
@@ -12871,58 +16745,14 @@ fn apply_profile_route_knowledge(
             continue;
         }
         push_unique_route(&mut outcome.expected_routes, &route.relative_path);
-        match ensure_directory_beneath_root(Path::new(&profile.game_path), &route.relative_path) {
-            Ok(created) => {
-                route.created |= created;
-                if created {
-                    push_unique_route(&mut outcome.created_routes, &route.relative_path);
-                }
-            }
-            Err(error) => outcome.warnings.push(format!(
-                "Could not prepare learned install route {}: {}",
-                route.relative_path, error
-            )),
-        }
+        // Provider prose is discovery evidence, not filesystem authority. Creating
+        // this directory here would make the next archive scan mistake our own
+        // mutation for a genuine game route. A verified install plan creates its
+        // destination parents later inside the deployment transaction.
+        route.created = safe_join(Path::new(&profile.game_path), &route.relative_path)
+            .is_ok_and(|path| path.is_dir());
     }
     outcome
-}
-
-fn ensure_directory_beneath_root(root: &Path, relative_path: &str) -> Result<bool, String> {
-    if !root.is_dir() {
-        return Err("The verified Steam game folder no longer exists.".to_string());
-    }
-    let root_canonical = fs::canonicalize(root).map_err(error_to_string)?;
-    let target = safe_join(root, relative_path)?;
-    if target.exists() && !target.is_dir() {
-        return Err("The expected route exists as a file.".to_string());
-    }
-
-    let mut existing_ancestor = target.as_path();
-    while !existing_ancestor.exists() {
-        existing_ancestor = existing_ancestor
-            .parent()
-            .ok_or_else(|| "The route has no safe existing parent.".to_string())?;
-    }
-    let ancestor_canonical = fs::canonicalize(existing_ancestor).map_err(error_to_string)?;
-    if !ancestor_canonical.starts_with(&root_canonical) {
-        return Err("The route escapes the verified Steam game folder.".to_string());
-    }
-    if target.is_dir() {
-        let target_canonical = fs::canonicalize(&target).map_err(error_to_string)?;
-        if !target_canonical.starts_with(&root_canonical) {
-            return Err("The route resolves outside the verified Steam game folder.".to_string());
-        }
-        return Ok(false);
-    }
-
-    fs::create_dir_all(&target).map_err(error_to_string)?;
-    let target_canonical = fs::canonicalize(&target).map_err(error_to_string)?;
-    if !target_canonical.starts_with(&root_canonical) {
-        return Err(
-            "The created route resolves outside the verified Steam game folder.".to_string(),
-        );
-    }
-    Ok(true)
 }
 
 fn prepare_package_install_routes(
@@ -12930,10 +16760,16 @@ fn prepare_package_install_routes(
     profile: &GameProfile,
     scanned: &ScannedArchive,
     document: &ProviderRouteDocument,
+    verified_plan: &mut InstallPlan,
 ) -> RouteKnowledgeOutcome {
     let candidates = extract_install_route_candidates(profile, &document.text)
         .into_iter()
-        .filter(|candidate| archive_supports_adapter(scanned, &candidate.adapter_id))
+        .filter(|candidate| {
+            candidate
+                .adapter_id
+                .eq_ignore_ascii_case(&verified_plan.adapter_id)
+                && archive_supports_adapter(scanned, &candidate.adapter_id)
+        })
         .filter(|candidate| {
             route_adapter_compatible(profile, &candidate.adapter_id) || profile.engine == "unknown"
         })
@@ -12941,6 +16777,10 @@ fn prepare_package_install_routes(
     if candidates.is_empty() {
         return RouteKnowledgeOutcome::default();
     }
+    let candidate_keys = candidates
+        .iter()
+        .map(|candidate| install_route_key(&candidate.adapter_id, &candidate.relative_path))
+        .collect::<HashSet<_>>();
 
     let mut knowledge = read_profile_route_knowledge(root, &profile.id)
         .ok()
@@ -12987,12 +16827,128 @@ fn prepare_package_install_routes(
     }
     knowledge.learned_at = now_string();
     let mut outcome = apply_profile_route_knowledge(profile, &mut knowledge);
+    let current_package_routes = knowledge
+        .routes
+        .iter()
+        .filter(|route| {
+            candidate_keys.contains(&install_route_key(&route.adapter_id, &route.relative_path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    apply_verified_provider_routes_to_plan(
+        profile,
+        scanned,
+        &current_package_routes,
+        verified_plan,
+        &mut outcome.warnings,
+    );
     if let Err(error) = write_profile_route_knowledge(root, &knowledge) {
         outcome.warnings.push(format!(
             "Could not remember this package's install route: {error}"
         ));
     }
     outcome
+}
+
+fn apply_verified_provider_routes_to_plan(
+    profile: &GameProfile,
+    scanned: &ScannedArchive,
+    routes: &[LearnedInstallRoute],
+    plan: &mut InstallPlan,
+    warnings: &mut Vec<String>,
+) {
+    if plan.adapter_id != "unreal-pak" {
+        return;
+    }
+
+    // Real game roots always outrank prose. Provider routes are useful only when
+    // the archive was verified but the game has not created any pak root yet.
+    if !find_unreal_pak_roots(Path::new(&profile.game_path)).is_empty() {
+        return;
+    }
+
+    let mut verified_routes = routes
+        .iter()
+        .filter(|route| route.adapter_id.eq_ignore_ascii_case(&plan.adapter_id))
+        .filter(|route| route.package_verified && route.trusted)
+        .filter(|route| {
+            validate_learned_route_shape(&route.adapter_id, &route.relative_path)
+                && route_has_safe_internal_root(profile, &route.relative_path, &route.adapter_id)
+                && archive_supports_adapter(scanned, &route.adapter_id)
+        })
+        .map(|route| route.relative_path.clone())
+        .collect::<Vec<_>>();
+    verified_routes.sort_by(|left, right| {
+        install_target_scope_from_path(left)
+            .cmp(&install_target_scope_from_path(right))
+            .then_with(|| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()))
+    });
+    verified_routes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if verified_routes.is_empty() {
+        return;
+    }
+
+    let original_game_sources = plan
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.generated_content.is_none() && mapping.target_root.eq_ignore_ascii_case("game")
+        })
+        .map(|mapping| normalize_archive_path(&mapping.source_path).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut remapped = plan
+        .mappings
+        .iter()
+        .filter(|mapping| !mapping.target_root.eq_ignore_ascii_case("game"))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for mapping in plan
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.target_root.eq_ignore_ascii_case("game"))
+    {
+        let source_scope = source_install_target_scope(&mapping.source_path);
+        for route in &verified_routes {
+            if !source_scope_matches_target_route(source_scope, route) {
+                continue;
+            }
+            let mut routed = mapping.clone();
+            routed.target_relative_path =
+                join_install_route(route, &basename(&mapping.target_relative_path));
+            routed.reason =
+                "Provider route accepted after the archive install layout was verified."
+                    .to_string();
+            push_unique_mapping(&mut remapped, routed);
+        }
+    }
+
+    let remapped_sources = remapped
+        .iter()
+        .filter(|mapping| {
+            mapping.generated_content.is_none() && mapping.target_root.eq_ignore_ascii_case("game")
+        })
+        .map(|mapping| normalize_archive_path(&mapping.source_path).to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    if !original_game_sources.is_subset(&remapped_sources) {
+        plan.requires_confirmation = true;
+        push_unique_string_value(
+            warnings,
+            "Provider routes did not cover every verified package payload scope. Automatic installation was blocked.",
+        );
+        push_unique_string_value(
+            &mut plan.warnings,
+            "Provider routes did not cover every verified package payload scope. Automatic installation was blocked.",
+        );
+        return;
+    }
+
+    plan.mappings = remapped;
+    plan.summary = format!(
+        "Deploy {} verified pak payload mapping(s) to {}.",
+        plan.mappings.len(),
+        join_human_list(&verified_routes)
+    );
 }
 
 fn package_route_has_strong_evidence(
@@ -14509,6 +18465,7 @@ fn install_nexus_discovered_mod(
         version,
         provider_game_id,
         install_target_id,
+        None,
         &mut visited_dependencies,
         0,
     )
@@ -14528,13 +18485,58 @@ fn install_resolved_nexus_file(
     version: Option<String>,
     provider_game_id: String,
     install_target_id: Option<&str>,
+    dependency_target: Option<&InstallTargetOption>,
+    visited_dependencies: &mut HashSet<String>,
+    dependency_depth: usize,
+) -> Result<InstallResult, String> {
+    let (mut result, warnings) = run_install_graph_transaction(store_root, profile, || {
+        install_resolved_nexus_file_inner(
+            store_root,
+            profile,
+            client,
+            api_key,
+            account,
+            domain,
+            nexus_mod_id,
+            file,
+            download_url,
+            version,
+            provider_game_id,
+            install_target_id,
+            dependency_target,
+            visited_dependencies,
+            dependency_depth,
+        )
+    })?;
+    result.warnings.extend(warnings);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_resolved_nexus_file_inner(
+    store_root: &Path,
+    profile: &GameProfile,
+    client: &Client,
+    api_key: &str,
+    account: &NexusUserValidation,
+    domain: &str,
+    nexus_mod_id: u64,
+    file: &NexusFileRecord,
+    download_url: &str,
+    version: Option<String>,
+    provider_game_id: String,
+    install_target_id: Option<&str>,
+    dependency_target: Option<&InstallTargetOption>,
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
 ) -> Result<InstallResult, String> {
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Nexus dependency chain is too deep to install safely.".to_string());
     }
-    let visit_key = format!("nexus:{}/{}", domain.to_lowercase(), nexus_mod_id);
+    let visit_key = dependency_target_visit_key(
+        &format!("nexus:{}/{}", domain.to_lowercase(), nexus_mod_id),
+        dependency_target,
+    );
     if !visited_dependencies.insert(visit_key) {
         return Err(
             "Nexus returned a circular dependency chain. No duplicate package was installed."
@@ -14573,17 +18575,6 @@ fn install_resolved_nexus_file(
             provided_runtime.as_deref(),
         ),
     );
-    let dependency_warnings = install_nexus_requirement_dependencies(
-        store_root,
-        profile,
-        client,
-        api_key,
-        account,
-        &dependencies,
-        visited_dependencies,
-        dependency_depth + 1,
-    )?;
-
     let archive_path =
         download_nexus_file(store_root, client, domain, nexus_mod_id, file, download_url)?;
     let package_id = format!("nexus:{}/{}", domain, nexus_mod_id);
@@ -14595,26 +18586,51 @@ fn install_resolved_nexus_file(
         "Nexus Mods discovery result and file download",
     );
     let scanned = scan_import_source(store_root, &archive_path)?;
-    let route_outcome =
-        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
-    let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
+    let analysis =
+        analyze_scanned_archive_with_identity(scanned.clone(), profile, Some(source_identity));
     let install_source_path = analysis.archive_path.clone();
     let package_identity = analysis.package_identity.clone();
     let mut plan = analysis
         .recommended_plan
         .ok_or_else(|| analysis.compatibility.reason.clone())?;
-
-    apply_selected_install_target(
+    let route_outcome = prepare_package_install_routes(
         store_root,
         profile,
+        &scanned,
         &provider_document,
         &mut plan,
-        install_target_id,
-    )?;
+    );
 
-    append_unique_dependencies(&mut plan.dependencies, dependencies);
-    plan.warnings.extend(dependency_warnings);
+    append_unique_dependencies(&mut plan.dependencies, dependencies.clone());
     plan.warnings.extend(route_outcome.warnings);
+    let install_targets =
+        provider_plan_install_target_options(store_root, profile, &provider_document, &plan);
+    let selected_install_target_id = if dependency_target.is_some() {
+        select_dependency_install_target_id(&plan, &install_targets, dependency_target)?
+    } else {
+        provider_selected_install_target_id(
+            store_root,
+            profile,
+            &provider_document,
+            &install_targets,
+            install_target_id,
+        )
+    };
+    let selected_install_target = selected_install_target_id
+        .as_deref()
+        .and_then(|selected| install_targets.iter().find(|target| target.id == selected));
+    let dependency_warnings = install_nexus_requirement_dependencies(
+        store_root,
+        profile,
+        client,
+        api_key,
+        account,
+        &dependencies,
+        visited_dependencies,
+        dependency_depth + 1,
+        selected_install_target,
+    )?;
+    plan.warnings.extend(dependency_warnings);
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -14639,10 +18655,14 @@ fn install_resolved_nexus_file(
                 dependency_string,
                 package_provider: Some("nexus".to_string()),
                 package_version: file.version.clone(),
+                provider_file_id: Some(file.file_id.to_string()),
+                provider_variant: Some(nexus_file_display_name(file)),
                 display_name: Some(nexus_file_display_name(file)),
                 package_identity: Some(package_identity),
                 runtime_id: None,
                 icon_url,
+                install_targets,
+                selected_install_target_id,
             },
             resolve_dependencies: true,
             visited_dependencies,
@@ -14661,6 +18681,7 @@ fn install_nexus_requirement_dependencies(
     dependencies: &[DependencySpec],
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
+    target: Option<&InstallTargetOption>,
 ) -> Result<Vec<String>, String> {
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Nexus dependency chain is too deep to install safely.".to_string());
@@ -14668,18 +18689,20 @@ fn install_nexus_requirement_dependencies(
     let mut warnings = Vec::new();
 
     for dependency in dependencies.iter().filter(|dependency| dependency.required) {
-        let dependency = refresh_dependency_status(store_root, profile, dependency);
+        let dependency =
+            refresh_dependency_status_for_target(store_root, profile, dependency, target);
         if dependency.status == "already-installed" {
             continue;
         }
 
         if dependency.provider != "nexus" {
-            match install_dependency_by_provider(
+            match install_dependency_by_provider_for_target(
                 store_root,
                 profile,
                 &dependency,
                 visited_dependencies,
                 dependency_depth,
+                target,
             ) {
                 Ok(mut installed_warnings) => warnings.append(&mut installed_warnings),
                 Err(error) => {
@@ -14700,10 +18723,13 @@ fn install_nexus_requirement_dependencies(
             Some(&dependency_domain),
             Some(&dependency_domain),
         )?;
-        let visit_key = format!(
-            "nexus:{}/{}",
-            dependency_domain.to_lowercase(),
-            dependency_mod_id
+        let visit_key = dependency_target_visit_key(
+            &format!(
+                "nexus:{}/{}",
+                dependency_domain.to_lowercase(),
+                dependency_mod_id
+            ),
+            target,
         );
         if visited_dependencies.contains(&visit_key) {
             continue;
@@ -14748,6 +18774,7 @@ fn install_nexus_requirement_dependencies(
             dependency_file.version.clone(),
             dependency_domain.clone(),
             None,
+            target,
             visited_dependencies,
             dependency_depth,
         )?;
@@ -15311,21 +19338,19 @@ fn install_thunderstore_discovered_mod(
         "Thunderstore community catalogue and package manifest",
     );
     let scanned = scan_zip_archive(&archive_path)?;
-    let route_outcome =
-        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
-    let analysis = analyze_scanned_archive_with_identity(scanned, profile, Some(source_identity));
+    let analysis =
+        analyze_scanned_archive_with_identity(scanned.clone(), profile, Some(source_identity));
     let package_identity = analysis.package_identity.clone();
     let mut plan = analysis
         .recommended_plan
         .ok_or_else(|| analysis.compatibility.reason.clone())?;
-
-    apply_selected_install_target(
+    let route_outcome = prepare_package_install_routes(
         store_root,
         profile,
+        &scanned,
         &provider_document,
         &mut plan,
-        install_target_id,
-    )?;
+    );
 
     for dependency_string in &package_version.dependencies {
         let parsed = parse_thunderstore_dependency(dependency_string);
@@ -15342,6 +19367,15 @@ fn install_thunderstore_discovered_mod(
         ),
     );
     plan.warnings.extend(route_outcome.warnings);
+    let install_targets =
+        provider_plan_install_target_options(store_root, profile, &provider_document, &plan);
+    let selected_install_target_id = provider_selected_install_target_id(
+        store_root,
+        profile,
+        &provider_document,
+        &install_targets,
+        install_target_id,
+    );
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -15364,10 +19398,14 @@ fn install_thunderstore_discovered_mod(
                 dependency_string: Some(dependency_string),
                 package_provider: Some("thunderstore".to_string()),
                 package_version: Some(package_version.version_number.clone()),
+                provider_file_id: None,
+                provider_variant: Some(package_version.version_number.clone()),
                 display_name: Some(package_version.full_name),
                 package_identity: Some(package_identity),
                 runtime_id: None,
                 icon_url: package_version.icon.clone(),
+                install_targets,
+                selected_install_target_id,
             },
             resolve_dependencies: true,
             visited_dependencies: &mut visited_dependencies,
@@ -15382,18 +19420,19 @@ fn install_thunderstore_dependency(
     dependency: &DependencySpec,
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
+    target: Option<&InstallTargetOption>,
 ) -> Result<Vec<String>, String> {
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Dependency chain is too deep to install safely.".to_string());
     }
 
     let package_ref = parse_thunderstore_ref(dependency)?;
-    let visit_key = thunderstore_visit_key(&package_ref);
+    let visit_key = dependency_target_visit_key(&thunderstore_visit_key(&package_ref), target);
     if !visited_dependencies.insert(visit_key) {
         return Ok(Vec::new());
     }
 
-    if dependency_already_available(store_root, profile, dependency) {
+    if dependency_already_available_for_target(store_root, profile, dependency, target) {
         return Ok(Vec::new());
     }
 
@@ -15403,7 +19442,10 @@ fn install_thunderstore_dependency(
         name: package_ref.name.clone(),
         version: Some(package_version.version_number.clone()),
     };
-    visited_dependencies.insert(thunderstore_visit_key(&resolved_ref));
+    visited_dependencies.insert(dependency_target_visit_key(
+        &thunderstore_visit_key(&resolved_ref),
+        target,
+    ));
     let package_id = thunderstore_package_id(&package_ref);
     let dependency_string =
         thunderstore_dependency_string(&package_ref, &package_version.version_number);
@@ -15415,28 +19457,37 @@ fn install_thunderstore_dependency(
         &package_ref.name,
     );
 
-    if thunderstore_package_installed(
-        store_root,
+    let installed_records = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let replacement_id = match dependency_install_disposition_for_target(
+        &installed_records.items,
         profile,
+        dependency,
         &package_id,
-        Some(&dependency_string),
-        Some(&package_version.version_number),
-    ) || thunderstore_runtime_available(profile, &package_ref)
-    {
-        return Ok(Vec::new());
-    }
+        &package_version.version_number,
+        target,
+    )? {
+        DependencyInstallDisposition::AlreadySatisfied => return Ok(Vec::new()),
+        DependencyInstallDisposition::InstallNew => None,
+        DependencyInstallDisposition::Replace(installed_mod_id) => Some(installed_mod_id),
+    };
 
     let archive_path = download_thunderstore_package(store_root, &resolved_ref, &package_version)?;
     let scanned = scan_zip_archive(&archive_path)?;
-    let route_outcome =
-        prepare_package_install_routes(store_root, profile, &scanned, &provider_document);
-    let analysis = analyze_scanned_archive(scanned, profile);
+    let analysis = analyze_scanned_archive(scanned.clone(), profile);
     let mut plan = analysis.recommended_plan.ok_or_else(|| {
         format!(
             "Could not find a safe install route for dependency {}.",
             dependency.name
         )
     })?;
+    let route_outcome = prepare_package_install_routes(
+        store_root,
+        profile,
+        &scanned,
+        &provider_document,
+        &mut plan,
+    );
 
     for dependency_string in &package_version.dependencies {
         let parsed = parse_thunderstore_dependency(dependency_string);
@@ -15453,6 +19504,10 @@ fn install_thunderstore_dependency(
         ),
     );
     plan.warnings.extend(route_outcome.warnings);
+    let install_targets =
+        provider_plan_install_target_options(store_root, profile, &provider_document, &plan);
+    let selected_install_target_id =
+        select_dependency_install_target_id(&plan, &install_targets, target)?;
 
     if plan.adapter_id == "loose-files" || plan.requires_confirmation {
         return Err(format!(
@@ -15462,26 +19517,37 @@ fn install_thunderstore_dependency(
     }
 
     let archive_path_string = archive_path.to_string_lossy().to_string();
-    let result = install_archive_impl_with_metadata(
+    let result = replace_installed_mod_transaction(
         store_root,
         profile,
-        &archive_path_string,
-        &plan,
-        InstallOptions {
-            metadata: InstallMetadata {
-                archive_name: Some(package_version.full_name.clone()),
-                package_id: Some(package_id),
-                dependency_string: Some(dependency_string),
-                package_provider: Some("thunderstore".to_string()),
-                package_version: Some(package_version.version_number.clone()),
-                display_name: Some(package_version.full_name.clone()),
-                package_identity: None,
-                runtime_id: runtime_id_for_dependency(profile, dependency),
-                icon_url: package_version.icon.clone(),
-            },
-            resolve_dependencies: true,
-            visited_dependencies,
-            dependency_depth,
+        replacement_id.as_deref(),
+        &package_id,
+        || {
+            install_archive_impl_with_metadata(
+                store_root,
+                profile,
+                &archive_path_string,
+                &plan,
+                InstallOptions {
+                    metadata: InstallMetadata {
+                        archive_name: Some(package_version.full_name.clone()),
+                        package_id: Some(package_id.clone()),
+                        dependency_string: Some(dependency_string),
+                        package_provider: Some("thunderstore".to_string()),
+                        package_version: Some(package_version.version_number.clone()),
+                        display_name: Some(package_version.full_name.clone()),
+                        package_identity: None,
+                        runtime_id: runtime_id_for_dependency(profile, dependency),
+                        icon_url: package_version.icon.clone(),
+                        install_targets,
+                        selected_install_target_id,
+                        ..InstallMetadata::default()
+                    },
+                    resolve_dependencies: true,
+                    visited_dependencies,
+                    dependency_depth,
+                },
+            )
         },
     )?;
 
@@ -15500,19 +19566,38 @@ fn install_release_dependency(
     release_ref: ReleaseDependencyRef,
     visited_dependencies: &mut HashSet<String>,
     dependency_depth: usize,
+    target: Option<&InstallTargetOption>,
 ) -> Result<Vec<String>, String> {
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
         return Err("Dependency chain is too deep to install safely.".to_string());
     }
 
-    let visit_key = format!("release:{}", release_ref.source_key.to_lowercase());
+    let visit_key = dependency_target_visit_key(
+        &format!("release:{}", release_ref.source_key.to_lowercase()),
+        target,
+    );
     if !visited_dependencies.insert(visit_key) {
         return Ok(Vec::new());
     }
 
-    if dependency_already_available(store_root, profile, dependency) {
+    if dependency_already_available_for_target(store_root, profile, dependency, target) {
         return Ok(Vec::new());
     }
+
+    let installed_records = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+        .map_err(error_to_string)?;
+    let replacement_id = match dependency_install_disposition_for_target(
+        &installed_records.items,
+        profile,
+        dependency,
+        &release_ref.source_key,
+        &release_ref.version,
+        target,
+    )? {
+        DependencyInstallDisposition::AlreadySatisfied => return Ok(Vec::new()),
+        DependencyInstallDisposition::InstallNew => None,
+        DependencyInstallDisposition::Replace(installed_mod_id) => Some(installed_mod_id),
+    };
 
     let archive_path = download_release_archive(store_root, dependency, &release_ref)?;
     let scanned = scan_zip_archive(&archive_path)?;
@@ -15530,31 +19615,45 @@ fn install_release_dependency(
             dependency.name
         ));
     }
+    let install_targets = plan_install_target_options(profile, &plan);
+    let selected_install_target_id =
+        select_dependency_install_target_id(&plan, &install_targets, target)?;
 
     let archive_path_string = archive_path.to_string_lossy().to_string();
-    let result = install_archive_impl_with_metadata(
+    let result = replace_installed_mod_transaction(
         store_root,
         profile,
-        &archive_path_string,
-        &plan,
-        InstallOptions {
-            metadata: InstallMetadata {
-                archive_name: Some(release_ref.display_name.clone()),
-                package_id: Some(release_ref.source_key.clone()),
-                dependency_string: Some(format!(
-                    "{}@{}",
-                    release_ref.source_key, release_ref.version
-                )),
-                package_provider: Some(dependency.provider.clone()),
-                package_version: Some(release_ref.version.clone()),
-                display_name: Some(release_ref.display_name.clone()),
-                package_identity: None,
-                runtime_id: runtime_id_for_dependency(profile, dependency),
-                icon_url: None,
-            },
-            resolve_dependencies: true,
-            visited_dependencies,
-            dependency_depth,
+        replacement_id.as_deref(),
+        &release_ref.source_key,
+        || {
+            install_archive_impl_with_metadata(
+                store_root,
+                profile,
+                &archive_path_string,
+                &plan,
+                InstallOptions {
+                    metadata: InstallMetadata {
+                        archive_name: Some(release_ref.display_name.clone()),
+                        package_id: Some(release_ref.source_key.clone()),
+                        dependency_string: Some(format!(
+                            "{}@{}",
+                            release_ref.source_key, release_ref.version
+                        )),
+                        package_provider: Some(dependency.provider.clone()),
+                        package_version: Some(release_ref.version.clone()),
+                        display_name: Some(release_ref.display_name.clone()),
+                        package_identity: None,
+                        runtime_id: runtime_id_for_dependency(profile, dependency),
+                        icon_url: None,
+                        install_targets,
+                        selected_install_target_id,
+                        ..InstallMetadata::default()
+                    },
+                    resolve_dependencies: true,
+                    visited_dependencies,
+                    dependency_depth,
+                },
+            )
         },
     )?;
 
@@ -15571,23 +19670,45 @@ fn refresh_dependency_status(
     profile: &GameProfile,
     dependency: &DependencySpec,
 ) -> DependencySpec {
+    refresh_dependency_status_with_availability(
+        dependency,
+        dependency_availability(store_root, profile, dependency),
+    )
+}
+
+fn refresh_dependency_status_for_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    target: Option<&InstallTargetOption>,
+) -> DependencySpec {
+    let availability = target
+        .map(|target| dependency_availability_for_target(store_root, profile, dependency, target))
+        .unwrap_or_else(|| dependency_availability(store_root, profile, dependency));
+    refresh_dependency_status_with_availability(dependency, availability)
+}
+
+fn refresh_dependency_status_with_availability(
+    dependency: &DependencySpec,
+    availability: DependencyAvailability,
+) -> DependencySpec {
+    const UNVERIFIED_VERSION_NOTE: &str =
+        "The component is present, but its installed version could not be verified.";
     let mut refreshed = dependency.clone();
-    let availability = dependency_availability(store_root, profile, dependency);
+    refreshed.notes = dependency
+        .notes
+        .as_deref()
+        .and_then(|notes| non_empty_string(notes.replace(UNVERIFIED_VERSION_NOTE, "").trim()));
     if availability.available {
         refreshed.status = "already-installed".to_string();
         if dependency.version.is_some() && !availability.version_verified {
-            let note = "The component is present, but its installed version could not be verified.";
-            if !refreshed
-                .notes
-                .as_deref()
-                .is_some_and(|existing| existing.contains(note))
-            {
-                refreshed.notes = Some(match refreshed.notes.take() {
-                    Some(existing) if !existing.trim().is_empty() => format!("{existing} {note}"),
-                    _ => note.to_string(),
-                });
-            }
+            refreshed.notes = Some(match refreshed.notes.take() {
+                Some(existing) => format!("{existing} {UNVERIFIED_VERSION_NOTE}"),
+                None => UNVERIFIED_VERSION_NOTE.to_string(),
+            });
         }
+    } else {
+        refreshed.status = "missing".to_string();
     }
     refreshed
 }
@@ -15604,6 +19725,19 @@ fn dependency_already_available(
     dependency: &DependencySpec,
 ) -> bool {
     dependency_availability(store_root, profile, dependency).available
+}
+
+fn dependency_already_available_for_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    target: Option<&InstallTargetOption>,
+) -> bool {
+    target
+        .map(|target| {
+            dependency_availability_for_target(store_root, profile, dependency, target).available
+        })
+        .unwrap_or_else(|| dependency_already_available(store_root, profile, dependency))
 }
 
 fn dependency_availability(
@@ -15677,10 +19811,23 @@ fn dependency_availability(
     }
 
     if dependency.provider != "thunderstore" {
-        return DependencyAvailability {
-            available: dependency.status == "already-installed",
-            version_verified: dependency.version.is_none(),
-        };
+        if let Some(store) = installed_store.as_ref() {
+            let installed = installed_dependency_match(&store.items, profile, dependency);
+            if let Some(record) = installed.satisfying {
+                return DependencyAvailability {
+                    available: true,
+                    version_verified: dependency.version.is_none()
+                        || record.package_version.is_some(),
+                };
+            }
+            if let Some(record) = installed.same_package {
+                return DependencyAvailability {
+                    available: false,
+                    version_verified: record.package_version.is_some(),
+                };
+            }
+        }
+        return DependencyAvailability::default();
     }
 
     let Ok(package_ref) = parse_thunderstore_ref(dependency) else {
@@ -15718,6 +19865,125 @@ fn dependency_availability(
                             .as_deref()
                             .is_some_and(|installed| installed.eq_ignore_ascii_case(expected))
                     }))
+        }),
+        dependency.version.as_deref(),
+    )
+}
+
+fn dependency_availability_for_target(
+    store_root: &Path,
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    target: &InstallTargetOption,
+) -> DependencyAvailability {
+    let installed_store = read_store::<InstalledModRecord>(&installed_mods_path(store_root)).ok();
+    if let Some(runtime) = runtime_id_for_dependency(profile, dependency) {
+        let records = installed_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .items
+                    .iter()
+                    .filter(|record| {
+                        record.profile_id == profile.id
+                            && record.enabled
+                            && record.last_status != "removed"
+                            && runtime_record_matches(record, &runtime)
+                            && record_payload_covers_install_target(record, target)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(required) = dependency.version.as_deref() {
+            if records.iter().any(|record| {
+                record
+                    .package_version
+                    .as_deref()
+                    .is_some_and(|installed| version_requirement_matches(required, installed))
+            }) {
+                return DependencyAvailability {
+                    available: true,
+                    version_verified: true,
+                };
+            }
+            if records
+                .iter()
+                .any(|record| record.package_version.is_some())
+            {
+                return DependencyAvailability {
+                    available: false,
+                    version_verified: true,
+                };
+            }
+        }
+        return DependencyAvailability {
+            available: !records.is_empty()
+                || runtime_installed_for_target(profile, &runtime, target),
+            version_verified: dependency.version.is_none(),
+        };
+    }
+
+    let Some(store) = installed_store.as_ref() else {
+        return DependencyAvailability::default();
+    };
+    if dependency.provider == "nexus" {
+        return availability_from_records(
+            store.items.iter().filter(|record| {
+                record.profile_id == profile.id
+                    && record.enabled
+                    && record.last_status != "removed"
+                    && record
+                        .package_id
+                        .as_deref()
+                        .is_some_and(|package_id| package_id.eq_ignore_ascii_case(&dependency.id))
+                    && record_payload_covers_install_target(record, target)
+            }),
+            dependency.version.as_deref(),
+        );
+    }
+
+    if dependency.provider != "thunderstore" {
+        let installed =
+            installed_dependency_match_for_target(&store.items, profile, dependency, Some(target));
+        if let Some(record) = installed.satisfying {
+            return DependencyAvailability {
+                available: true,
+                version_verified: dependency.version.is_none() || record.package_version.is_some(),
+            };
+        }
+        if let Some(record) = installed.same_package {
+            return DependencyAvailability {
+                available: false,
+                version_verified: record.package_version.is_some(),
+            };
+        }
+        return DependencyAvailability::default();
+    }
+
+    let Ok(package_ref) = parse_thunderstore_ref(dependency) else {
+        return DependencyAvailability::default();
+    };
+    let package_id = thunderstore_package_id(&package_ref);
+    let dependency_string = package_ref
+        .version
+        .as_ref()
+        .map(|version| thunderstore_dependency_string(&package_ref, version));
+    availability_from_records(
+        store.items.iter().filter(|record| {
+            record.profile_id == profile.id
+                && record.enabled
+                && record.last_status != "removed"
+                && (record
+                    .package_id
+                    .as_deref()
+                    .is_some_and(|installed| installed.eq_ignore_ascii_case(&package_id))
+                    || dependency_string.as_deref().is_some_and(|expected| {
+                        record
+                            .dependency_string
+                            .as_deref()
+                            .is_some_and(|installed| installed.eq_ignore_ascii_case(expected))
+                    }))
+                && record_payload_covers_install_target(record, target)
         }),
         dependency.version.as_deref(),
     )
@@ -15786,16 +20052,424 @@ fn version_requirement_matches(required: &str, installed: &str) -> bool {
         .unwrap_or_else(|_| normalized_required.eq_ignore_ascii_case(normalized_installed))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct InstalledDependencyMatch<'a> {
+    satisfying: Option<&'a InstalledModRecord>,
+    same_package: Option<&'a InstalledModRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DependencyInstallDisposition {
+    AlreadySatisfied,
+    InstallNew,
+    Replace(String),
+}
+
+fn installed_dependency_match<'a>(
+    records: &'a [InstalledModRecord],
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+) -> InstalledDependencyMatch<'a> {
+    installed_dependency_match_for_target(records, profile, dependency, None)
+}
+
+fn installed_dependency_match_for_target<'a>(
+    records: &'a [InstalledModRecord],
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    target: Option<&InstallTargetOption>,
+) -> InstalledDependencyMatch<'a> {
+    let mut result = InstalledDependencyMatch::default();
+
+    for record in records.iter().filter(|record| {
+        record.profile_id == profile.id
+            && record.last_status != "removed"
+            && installed_record_matches_dependency_package(profile, record, dependency)
+            && target.is_none_or(|target| record_payload_covers_install_target(record, target))
+    }) {
+        if result.same_package.is_none()
+            || record.enabled
+                && result
+                    .same_package
+                    .is_some_and(|existing| !existing.enabled)
+        {
+            result.same_package = Some(record);
+        }
+        if record.enabled
+            && installed_record_satisfies_dependency(profile, record, dependency)
+            && result.satisfying.is_none()
+        {
+            result.satisfying = Some(record);
+        }
+    }
+
+    result
+}
+
+fn installed_record_matches_dependency_package(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    dependency: &DependencySpec,
+) -> bool {
+    if let Some(runtime) = runtime_id_for_dependency(profile, dependency) {
+        return runtime_record_matches(record, &runtime);
+    }
+
+    if dependency.provider.eq_ignore_ascii_case("thunderstore") {
+        let Ok(package_ref) = parse_thunderstore_ref(dependency) else {
+            return false;
+        };
+        let expected_package_id = thunderstore_package_id(&package_ref);
+        if record
+            .package_id
+            .as_deref()
+            .is_some_and(|installed| installed.eq_ignore_ascii_case(&expected_package_id))
+        {
+            return true;
+        }
+        return record
+            .dependency_string
+            .as_deref()
+            .and_then(|installed| parse_thunderstore_token(installed, None))
+            .is_some_and(|installed| {
+                installed
+                    .namespace
+                    .eq_ignore_ascii_case(&package_ref.namespace)
+                    && installed.name.eq_ignore_ascii_case(&package_ref.name)
+            });
+    }
+
+    let package_id_matches = |candidate: &str| {
+        record
+            .package_id
+            .as_deref()
+            .is_some_and(|installed| installed.eq_ignore_ascii_case(candidate))
+    };
+    if package_id_matches(&dependency.id)
+        || dependency.source.as_deref().is_some_and(package_id_matches)
+    {
+        return true;
+    }
+
+    record
+        .dependency_string
+        .as_deref()
+        .is_some_and(|installed| {
+            [
+                &dependency.id,
+                dependency.source.as_deref().unwrap_or_default(),
+            ]
+            .into_iter()
+            .filter(|candidate| !candidate.trim().is_empty())
+            .any(|candidate| {
+                installed.eq_ignore_ascii_case(candidate)
+                    || installed
+                        .strip_prefix(candidate)
+                        .is_some_and(|suffix| suffix.starts_with('@'))
+            })
+        })
+}
+
+fn installed_record_satisfies_dependency(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    dependency: &DependencySpec,
+) -> bool {
+    installed_record_matches_dependency_package(profile, record, dependency)
+        && dependency.version.as_deref().is_none_or(|required| {
+            record
+                .package_version
+                .as_deref()
+                .is_none_or(|installed| version_requirement_matches(required, installed))
+        })
+}
+
+fn installed_record_definitely_satisfies_dependency(
+    profile: &GameProfile,
+    record: &InstalledModRecord,
+    dependency: &DependencySpec,
+) -> bool {
+    installed_record_matches_dependency_package(profile, record, dependency)
+        && dependency.version.as_deref().is_none_or(|required| {
+            record
+                .package_version
+                .as_deref()
+                .is_some_and(|installed| version_requirement_matches(required, installed))
+        })
+}
+
+fn active_reverse_dependencies<'a>(
+    profile: &GameProfile,
+    records: &'a [InstalledModRecord],
+    target: &'a InstalledModRecord,
+) -> Vec<(&'a InstalledModRecord, &'a DependencySpec)> {
+    if !target.enabled || target.runtime_id.is_some() {
+        return Vec::new();
+    }
+
+    let mut reverse_dependencies = Vec::new();
+    for dependent in records.iter().filter(|record| {
+        record.profile_id == profile.id
+            && record.id != target.id
+            && record.enabled
+            && record.last_status != "removed"
+    }) {
+        for dependency in dependent.dependencies.iter().filter(|item| item.required) {
+            if !installed_record_satisfies_dependency(profile, target, dependency)
+                || !record_payload_covers_dependent_target(target, dependent)
+            {
+                continue;
+            }
+            let has_alternative = records.iter().any(|candidate| {
+                candidate.id != target.id
+                    && candidate.id != dependent.id
+                    && candidate.profile_id == profile.id
+                    && candidate.enabled
+                    && candidate.last_status != "removed"
+                    && installed_record_definitely_satisfies_dependency(
+                        profile, candidate, dependency,
+                    )
+                    && record_payload_covers_dependent_target(candidate, dependent)
+            });
+            if !has_alternative {
+                reverse_dependencies.push((dependent, dependency));
+            }
+        }
+    }
+    reverse_dependencies
+}
+
+fn ensure_mod_has_no_active_reverse_dependencies(
+    profile: &GameProfile,
+    records: &[InstalledModRecord],
+    target: &InstalledModRecord,
+) -> Result<(), String> {
+    let reverse_dependencies = active_reverse_dependencies(profile, records, target);
+    if reverse_dependencies.is_empty() {
+        return Ok(());
+    }
+
+    let mut dependents = reverse_dependencies
+        .iter()
+        .map(|(record, dependency)| {
+            format!(
+                "{} ({})",
+                display_record_name(record),
+                dependency.name.trim()
+            )
+        })
+        .collect::<Vec<_>>();
+    dependents.sort_by_key(|value| value.to_ascii_lowercase());
+    dependents.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+    Err(format!(
+        "{} is still required by enabled mod{}: {}. Disable or remove the dependent mod{} first.",
+        display_record_name(target),
+        if dependents.len() == 1 { "" } else { "s" },
+        dependents.join(", "),
+        if dependents.len() == 1 { "" } else { "s" },
+    ))
+}
+
+fn ensure_replacement_preserves_reverse_dependencies(
+    profile: &GameProfile,
+    records: &[InstalledModRecord],
+    existing: &InstalledModRecord,
+    replacement: &InstalledModRecord,
+) -> Result<(), String> {
+    let mut conflicts = Vec::new();
+    for dependent in records.iter().filter(|record| {
+        record.profile_id == profile.id
+            && record.id != existing.id
+            && record.enabled
+            && record.last_status != "removed"
+    }) {
+        for requirement in dependent.dependencies.iter().filter(|item| item.required) {
+            if !installed_record_matches_dependency_package(profile, existing, requirement)
+                || !record_payload_covers_dependent_target(existing, dependent)
+                || (installed_record_definitely_satisfies_dependency(
+                    profile,
+                    replacement,
+                    requirement,
+                ) && record_payload_covers_dependent_target(replacement, dependent))
+            {
+                continue;
+            }
+            let has_alternative = records.iter().any(|candidate| {
+                candidate.id != existing.id
+                    && candidate.id != dependent.id
+                    && candidate.profile_id == profile.id
+                    && candidate.enabled
+                    && candidate.last_status != "removed"
+                    && installed_record_definitely_satisfies_dependency(
+                        profile,
+                        candidate,
+                        requirement,
+                    )
+                    && record_payload_covers_dependent_target(candidate, dependent)
+            });
+            if !has_alternative {
+                conflicts.push(format!(
+                    "{} requires {}",
+                    display_record_name(dependent),
+                    requirement
+                        .version
+                        .as_deref()
+                        .unwrap_or("the installed version")
+                ));
+            }
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    conflicts.sort_by_key(|value| value.to_ascii_lowercase());
+    conflicts.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+    Err(format!(
+        "Cannot replace {} with version {} because it would break enabled mod{}: {}.",
+        display_record_name(existing),
+        replacement
+            .package_version
+            .as_deref()
+            .unwrap_or("an unverified version"),
+        if conflicts.len() == 1 { "" } else { "s" },
+        conflicts.join(", ")
+    ))
+}
+
+#[cfg(test)]
+fn dependency_install_disposition(
+    records: &[InstalledModRecord],
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    candidate_package_id: &str,
+    candidate_version: &str,
+) -> Result<DependencyInstallDisposition, String> {
+    dependency_install_disposition_for_target(
+        records,
+        profile,
+        dependency,
+        candidate_package_id,
+        candidate_version,
+        None,
+    )
+}
+
+fn dependency_install_disposition_for_target(
+    records: &[InstalledModRecord],
+    profile: &GameProfile,
+    dependency: &DependencySpec,
+    candidate_package_id: &str,
+    candidate_version: &str,
+    target: Option<&InstallTargetOption>,
+) -> Result<DependencyInstallDisposition, String> {
+    if dependency
+        .version
+        .as_deref()
+        .is_some_and(|required| !version_requirement_matches(required, candidate_version))
+    {
+        return Err(format!(
+            "{} returned version {}, which does not satisfy the required version {}.",
+            dependency.name,
+            candidate_version,
+            dependency.version.as_deref().unwrap_or_default()
+        ));
+    }
+
+    let installed = installed_dependency_match_for_target(records, profile, dependency, target);
+    if installed.satisfying.is_some() {
+        return Ok(DependencyInstallDisposition::AlreadySatisfied);
+    }
+    let Some(existing) = installed.same_package else {
+        return Ok(DependencyInstallDisposition::InstallNew);
+    };
+    if existing.runtime_id.is_some() || existing.externally_managed {
+        return Err(format!(
+            "{} is present as a protected or externally managed component, but its version does not satisfy {}. Update that component before installing the dependent mod.",
+            display_record_name(existing),
+            dependency.name
+        ));
+    }
+    if !existing
+        .package_id
+        .as_deref()
+        .is_some_and(|installed| installed.eq_ignore_ascii_case(candidate_package_id))
+    {
+        return Err(format!(
+            "{} appears to provide {}, but its provider identity is incomplete. Reinstall it through Mod Garrison before changing dependency versions.",
+            display_record_name(existing),
+            dependency.name
+        ));
+    }
+
+    let mut conflicts = Vec::new();
+    for dependent in records.iter().filter(|record| {
+        record.profile_id == profile.id
+            && record.id != existing.id
+            && record.enabled
+            && record.last_status != "removed"
+    }) {
+        for requirement in dependent.dependencies.iter().filter(|item| item.required) {
+            if !installed_record_matches_dependency_package(profile, existing, requirement)
+                || !record_payload_covers_dependent_target(existing, dependent)
+                || requirement
+                    .version
+                    .as_deref()
+                    .is_none_or(|required| version_requirement_matches(required, candidate_version))
+            {
+                continue;
+            }
+            let has_alternative = records.iter().any(|candidate| {
+                candidate.id != existing.id
+                    && candidate.id != dependent.id
+                    && candidate.profile_id == profile.id
+                    && candidate.enabled
+                    && candidate.last_status != "removed"
+                    && installed_record_definitely_satisfies_dependency(
+                        profile,
+                        candidate,
+                        requirement,
+                    )
+                    && record_payload_covers_dependent_target(candidate, dependent)
+            });
+            if !has_alternative {
+                conflicts.push(format!(
+                    "{} requires {}",
+                    display_record_name(dependent),
+                    requirement
+                        .version
+                        .as_deref()
+                        .unwrap_or("the installed version")
+                ));
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.sort_by_key(|value| value.to_ascii_lowercase());
+        conflicts.dedup_by(|first, second| first.eq_ignore_ascii_case(second));
+        return Err(format!(
+            "Cannot replace {} with version {} because it would break enabled mod{}: {}.",
+            display_record_name(existing),
+            candidate_version,
+            if conflicts.len() == 1 { "" } else { "s" },
+            conflicts.join(", ")
+        ));
+    }
+
+    Ok(DependencyInstallDisposition::Replace(existing.id.clone()))
+}
+
 fn push_missing_dependency(
     missing_dependencies: &mut Vec<DependencySpec>,
     seen: &mut HashSet<String>,
     dependency: DependencySpec,
+    target: Option<&InstallTargetOption>,
 ) {
     if !dependency.required || dependency.status == "already-installed" {
         return;
     }
 
-    if seen.insert(dependency_key(&dependency)) {
+    if seen.insert(dependency_key_for_target(&dependency, target)) {
         missing_dependencies.push(dependency);
     }
 }
@@ -15807,6 +20481,13 @@ fn dependency_key(dependency: &DependencySpec) -> String {
         dependency.id,
         dependency.version.as_deref().unwrap_or_default()
     )
+}
+
+fn dependency_key_for_target(
+    dependency: &DependencySpec,
+    target: Option<&InstallTargetOption>,
+) -> String {
+    dependency_target_visit_key(&dependency_key(dependency), target)
 }
 
 fn mod_file_health_for_record(
@@ -16965,6 +21646,14 @@ fn sanitize_file_segment(value: &str) -> String {
         .collect()
 }
 
+fn is_safe_internal_storage_segment(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && !value.ends_with('.')
+        && !value.ends_with(' ')
+        && sanitize_file_segment(value) == value
+}
+
 fn sanitize_url_path_segment(value: &str) -> String {
     sanitize_file_segment(value).replace('.', "")
 }
@@ -17084,13 +21773,30 @@ fn deploy_plan_transaction(
             let archive_file = File::open(source_path).map_err(error_to_string)?;
             Some(ZipArchive::new(archive_file).map_err(error_to_string)?)
         };
+        let archive_member_indices = if let Some(archive) = archive.as_mut() {
+            let mut indices = HashMap::with_capacity(archive.len());
+            for index in 0..archive.len() {
+                let member = archive.by_index(index).map_err(error_to_string)?;
+                let normalized = normalize_archive_path(member.name()).to_ascii_lowercase();
+                if indices.insert(normalized.clone(), index).is_some() {
+                    return Err(format!(
+                        "The archive contains ambiguous duplicate paths after normalization: {normalized}"
+                    ));
+                }
+            }
+            Some(indices)
+        } else {
+            None
+        };
         let profile_root = profile_dir(store_root, &profile.id);
         let mut prepared = Vec::with_capacity(plan.mappings.len());
         let mut destination_keys = HashSet::new();
         let mut expanded_bytes = 0_u64;
 
         for (index, mapping) in plan.mappings.iter().enumerate() {
-            validate_archive_relative_path(&mapping.source_path)?;
+            if mapping.generated_content.is_none() {
+                validate_archive_relative_path(&mapping.source_path)?;
+            }
             validate_archive_relative_path(&mapping.target_relative_path)?;
 
             let target_root = if mapping.target_root == "game" {
@@ -17122,9 +21828,28 @@ fn deploy_plan_transaction(
             }
 
             let staged_path = stage_root.join(format!("{index}.bin"));
-            let file_size = if let Some(archive) = archive.as_mut() {
+            let file_size = if let Some(content) = mapping.generated_content.as_deref() {
+                let bytes = content.as_bytes();
+                if bytes.len() as u64 > MAX_ARCHIVE_FILE_BYTES {
+                    return Err(format!(
+                        "Generated install content is too large: {}",
+                        mapping.target_relative_path
+                    ));
+                }
+                let mut output = File::create(&staged_path).map_err(error_to_string)?;
+                output.write_all(bytes).map_err(error_to_string)?;
+                output.sync_all().map_err(error_to_string)?;
+                bytes.len() as u64
+            } else if let Some(archive) = archive.as_mut() {
+                let normalized_source =
+                    normalize_archive_path(&mapping.source_path).to_ascii_lowercase();
+                let member_index = archive_member_indices
+                    .as_ref()
+                    .and_then(|indices| indices.get(&normalized_source))
+                    .copied()
+                    .ok_or_else(|| format!("Archive entry is missing: {}", mapping.source_path))?;
                 let mut zip_file = archive
-                    .by_name(&mapping.source_path)
+                    .by_index(member_index)
                     .map_err(|_| format!("Archive entry is missing: {}", mapping.source_path))?;
                 validate_archive_file_size(
                     &mapping.source_path,
@@ -17230,12 +21955,36 @@ fn deploy_plan_transaction(
                     rollback_entries,
                     journal,
                 };
-                outcome.rollback();
-                return Err(error);
+                return match outcome.rollback() {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!("{error} {rollback_error}")),
+                };
             }
 
             let destination_string = file.destination.to_string_lossy().to_string();
-            let deployed_hash = sha256_file(&file.destination)?;
+            let deployed_hash = match sha256_file(&file.destination) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    let outcome = DeploymentOutcome {
+                        files_written,
+                        backups_written,
+                        written_file_hashes,
+                        transaction_root: transaction_root.clone(),
+                        rollback_entries,
+                        journal,
+                    };
+                    return match outcome.rollback() {
+                        Ok(()) => Err(format!(
+                            "Could not verify deployed file {}: {error}",
+                            file.target_relative_path
+                        )),
+                        Err(rollback_error) => Err(format!(
+                            "Could not verify deployed file {}: {error} {rollback_error}",
+                            file.target_relative_path
+                        )),
+                    };
+                }
+            };
             if deployed_hash != journal.entries[index].expected_sha256 {
                 let outcome = DeploymentOutcome {
                     files_written,
@@ -17245,11 +21994,14 @@ fn deploy_plan_transaction(
                     rollback_entries,
                     journal,
                 };
-                outcome.rollback();
-                return Err(format!(
+                let error = format!(
                     "Mod Garrison could not verify the deployed file: {}",
                     file.target_relative_path
-                ));
+                );
+                return match outcome.rollback() {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!("{error} {rollback_error}")),
+                };
             }
             written_file_hashes.insert(destination_string.clone(), deployed_hash);
             files_written.push(destination_string);
@@ -17265,7 +22017,10 @@ fn deploy_plan_transaction(
         })
     })();
 
-    if result.is_err() && transaction_root.exists() {
+    if result.is_err()
+        && transaction_root.exists()
+        && !deployment_journal_path(&transaction_root).exists()
+    {
         let _ = fs::remove_dir_all(&transaction_root);
     }
     result
@@ -17441,6 +22196,40 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn sha256_managed_source(path: &Path) -> Result<String, String> {
+    if path.is_file() {
+        return sha256_file(path);
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "Managed package source is missing: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    let mut relative_paths = collect_folder_relative_paths(path)?;
+    relative_paths.sort_by_key(|relative| normalize_archive_path(relative).to_ascii_lowercase());
+    let mut hasher = Sha256::new();
+    hasher.update(b"mod-garrison-directory-v1\0");
+    for relative_path in relative_paths {
+        let normalized = normalize_archive_path(&relative_path);
+        let path_bytes = normalized.as_bytes();
+        hasher.update((path_bytes.len() as u64).to_le_bytes());
+        hasher.update(path_bytes);
+        let source_file = safe_join(path, &relative_path)?;
+        let mut file = File::open(&source_file).map_err(error_to_string)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(error_to_string)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn cleanup_install_data(store_root: &Path, profile_id: &str, install_id: &str) {
     let _ = fs::remove_dir_all(profile_package_dir(store_root, profile_id, install_id));
     let _ = fs::remove_dir_all(profile_backup_dir(store_root, profile_id, install_id));
@@ -17454,22 +22243,37 @@ fn restore_deactivated_mods(
     store_root: &Path,
     profile: &GameProfile,
     records: &[InstalledModRecord],
-) {
+) -> Result<(), String> {
+    let mut errors = Vec::new();
     for record in records {
         let Some(plan) = record.plan.clone() else {
+            errors.push(format!(
+                "{} has no saved install plan.",
+                display_record_name(record)
+            ));
             continue;
         };
         let mut restored = record.clone();
         let install_id = restored.id.clone();
         let archive_path = restored.archive_path.clone();
-        let _ = deploy_mod_files(
+        if let Err(error) = deploy_mod_files(
             store_root,
             profile,
             &install_id,
             &archive_path,
             &plan,
             &mut restored,
-        );
+        ) {
+            errors.push(format!("{}: {error}", display_record_name(record)));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Mod Garrison could not fully restore deactivated mods: {}",
+            errors.join(" ")
+        ))
     }
 }
 
@@ -17510,11 +22314,10 @@ fn restore_checkpoint_record(
         std::slice::from_ref(&restored),
         &[&deployment],
     ) {
-        deployment.rollback();
+        let _ = deployment.rollback();
         return Err(error);
     }
-    deployment.commit();
-    Ok(())
+    deployment.commit()
 }
 
 fn installed_record_files_match(record: &InstalledModRecord) -> bool {
@@ -17581,7 +22384,7 @@ fn rollback_profile_migration(
         let _ = deactivate_mod_files(store_root, new_profile, record);
         let _ = fs::remove_dir_all(profile_backup_dir(store_root, &new_profile.id, &record.id));
     }
-    restore_deactivated_mods(store_root, old_profile, old_records);
+    let _ = restore_deactivated_mods(store_root, old_profile, old_records);
     for record in old_records {
         let _ = write_receipt(store_root, old_profile, record);
     }
@@ -17960,6 +22763,8 @@ enum ModifiedFilePolicy {
     Reject,
     RequireRemovalConfirmation,
     Preserve,
+    AllowConfigChanges,
+    PreserveConfigChanges,
 }
 
 fn deactivate_mod_files(
@@ -17971,6 +22776,40 @@ fn deactivate_mod_files(
         .map(|outcome| outcome.files_changed)
 }
 
+fn deactivation_journal_path(transaction_root: &Path) -> PathBuf {
+    transaction_root.join("deactivation.json")
+}
+
+fn managed_path_journal_location(
+    store_root: &Path,
+    profile: &GameProfile,
+    path: &Path,
+) -> Result<(String, String), String> {
+    let game_root = Path::new(&profile.game_path);
+    if let Ok(relative) = path.strip_prefix(game_root) {
+        return Ok(("game".to_string(), to_portable_path(relative)));
+    }
+    let profile_root = profile_dir(store_root, &profile.id);
+    if let Ok(relative) = path.strip_prefix(&profile_root) {
+        return Ok(("profile".to_string(), to_portable_path(relative)));
+    }
+    Err(format!(
+        "Managed deactivation path is outside its game and profile roots: {}",
+        path.to_string_lossy()
+    ))
+}
+
+fn write_deactivation_journal(
+    transaction_root: &Path,
+    journal: &DeactivationJournal,
+) -> Result<(), String> {
+    atomic_write(
+        &deactivation_journal_path(transaction_root),
+        &serialize_json_line(journal)?,
+    )
+    .map_err(error_to_string)
+}
+
 fn deactivate_mod_files_with_policy(
     store_root: &Path,
     profile: &GameProfile,
@@ -17978,6 +22817,52 @@ fn deactivate_mod_files_with_policy(
     modified_file_policy: ModifiedFilePolicy,
 ) -> Result<DeactivationOutcome, String> {
     let backup_root = profile_backup_dir(store_root, &profile.id, &record.id);
+    let mut validated_backups = Vec::with_capacity(record.backups_written.len());
+    for backup_path in &record.backups_written {
+        let backup = PathBuf::from(backup_path);
+        let relative_path = backup.strip_prefix(&backup_root).map_err(|_| {
+            format!(
+                "Refused to restore a managed overwrite backup outside this mod's backup folder: {}",
+                backup.to_string_lossy()
+            )
+        })?;
+        if !backup.is_file() {
+            return Err(format!(
+                "Cannot safely deactivate {} because its managed overwrite backup is missing or is not a regular file: {}",
+                display_record_name(record),
+                backup.to_string_lossy()
+            ));
+        }
+        validate_deployment_containment(&backup_root, &backup).map_err(|error| {
+            format!(
+                "Cannot safely deactivate {} because its managed overwrite backup is invalid: {} ({error})",
+                display_record_name(record),
+                backup.to_string_lossy()
+            )
+        })?;
+        let backup_hash = sha256_file(&backup).map_err(|error| {
+            format!(
+                "Cannot safely deactivate {} because its managed overwrite backup could not be verified: {} ({error})",
+                display_record_name(record),
+                backup.to_string_lossy()
+            )
+        })?;
+        let target = safe_join(
+            Path::new(&profile.game_path),
+            &to_portable_path(relative_path),
+        )?;
+        validate_deployment_containment(Path::new(&profile.game_path), &target).map_err(
+            |error| {
+                format!(
+                    "Cannot safely deactivate {} because its managed overwrite target is invalid: {} ({error})",
+                    display_record_name(record),
+                    target.to_string_lossy()
+                )
+            },
+        )?;
+        validated_backups.push((backup, target, backup_hash));
+    }
+
     let transaction_root = profile_dir(store_root, &profile.id)
         .join("transactions")
         .join(Uuid::new_v4().to_string());
@@ -17988,16 +22873,9 @@ fn deactivate_mod_files_with_policy(
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    for backup_path in &record.backups_written {
-        let backup = PathBuf::from(backup_path);
-        if let Ok(relative_path) = backup.strip_prefix(&backup_root) {
-            let target = safe_join(
-                Path::new(&profile.game_path),
-                &to_portable_path(relative_path),
-            )?;
-            if !affected_paths.iter().any(|path| path == &target) {
-                affected_paths.push(target);
-            }
+    for (_, target, _) in &validated_backups {
+        if !affected_paths.iter().any(|path| path == target) {
+            affected_paths.push(target.clone());
         }
     }
     for path in &affected_paths {
@@ -18010,6 +22888,15 @@ fn deactivate_mod_files_with_policy(
     for file_path in &record.files_written {
         let path = PathBuf::from(file_path);
         if !path.exists() {
+            continue;
+        }
+        if modified_file_policy == ModifiedFilePolicy::PreserveConfigChanges
+            && is_user_editable_config_file(&path)
+        {
+            let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+            if preserved_identities.insert(identity) {
+                preserved_files.push(path.to_string_lossy().to_string());
+            }
             continue;
         }
         let expected_hash = managed_record_hash_for_path(record, &path);
@@ -18046,16 +22933,37 @@ fn deactivate_mod_files_with_policy(
                     ));
                 }
             }
+            ModifiedFilePolicy::AllowConfigChanges if is_user_editable_config_file(&path) => {
+                // Target switching snapshots these bytes before deactivation and
+                // redeploys them through the new target's deployment journal.
+            }
+            ModifiedFilePolicy::AllowConfigChanges => {
+                let _ = fs::remove_dir_all(&transaction_root);
+                return Err(message);
+            }
+            ModifiedFilePolicy::PreserveConfigChanges => {
+                let _ = fs::remove_dir_all(&transaction_root);
+                return Err(message);
+            }
         }
     }
 
-    let mut snapshots = Vec::with_capacity(affected_paths.len());
+    let expected_post_hashes = validated_backups
+        .iter()
+        .map(|(_, target, hash)| {
+            (
+                normalize_filesystem_identity(target.to_string_lossy().as_ref()),
+                hash.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut journal_entries = Vec::with_capacity(affected_paths.len());
     for (index, path) in affected_paths.iter().enumerate() {
         let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
         if preserved_identities.contains(&identity) {
             continue;
         }
-        let snapshot = if path.exists() {
+        let snapshot_file = if path.exists() {
             if !path.is_file() {
                 let _ = fs::remove_dir_all(&transaction_root);
                 return Err(format!(
@@ -18063,16 +22971,38 @@ fn deactivate_mod_files_with_policy(
                     path.to_string_lossy()
                 ));
             }
-            let snapshot = transaction_root.join(format!("{index}.bin"));
-            fs::copy(path, &snapshot).map_err(error_to_string)?;
-            Some(snapshot)
+            let snapshot_file = format!("{index}.bin");
+            let snapshot = transaction_root.join(&snapshot_file);
+            copy_file_synced(path, &snapshot)?;
+            Some(snapshot_file)
         } else {
             None
         };
-        snapshots.push(DeploymentRollbackEntry {
-            destination: path.clone(),
-            immediate_backup: snapshot,
+        let (target_root, target_relative_path) =
+            managed_path_journal_location(store_root, profile, path)?;
+        journal_entries.push(DeactivationJournalEntry {
+            target_root,
+            target_relative_path,
+            snapshot_file,
+            expected_deactivated_sha256: expected_post_hashes.get(&identity).cloned(),
         });
+    }
+    let journal = DeactivationJournal {
+        version: DEACTIVATION_JOURNAL_VERSION,
+        id: transaction_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        profile_id: profile.id.clone(),
+        record_id: record.id.clone(),
+        game_path: profile.game_path.clone(),
+        original_record: record.clone(),
+        entries: journal_entries,
+    };
+    if let Err(error) = write_deactivation_journal(&transaction_root, &journal) {
+        let _ = fs::remove_dir_all(&transaction_root);
+        return Err(error);
     }
 
     let operation = (|| -> Result<Vec<String>, String> {
@@ -18089,24 +23019,19 @@ fn deactivate_mod_files_with_policy(
             }
         }
 
-        for backup_path in &record.backups_written {
-            let backup = PathBuf::from(backup_path);
-            if !backup.exists() {
-                continue;
+        for (backup, target, expected_hash) in &validated_backups {
+            if sha256_file(backup)? != *expected_hash {
+                return Err(format!(
+                    "Cannot safely deactivate {} because its managed overwrite backup changed after verification: {}",
+                    display_record_name(record),
+                    backup.to_string_lossy()
+                ));
             }
-            let Ok(relative_path) = backup.strip_prefix(&backup_root) else {
-                continue;
-            };
-            let target = safe_join(
-                Path::new(&profile.game_path),
-                &to_portable_path(relative_path),
-            )?;
-            validate_deployment_containment(Path::new(&profile.game_path), &target)?;
             let target_identity = normalize_filesystem_identity(target.to_string_lossy().as_ref());
             if preserved_identities.contains(&target_identity) {
                 continue;
             }
-            replace_file_from_path(&backup, &target)?;
+            replace_file_from_path(backup, target)?;
             files_changed.push(target.to_string_lossy().to_string());
         }
         Ok(files_changed)
@@ -18114,7 +23039,6 @@ fn deactivate_mod_files_with_policy(
 
     match operation {
         Ok(mut files_changed) => {
-            let _ = fs::remove_dir_all(transaction_root);
             files_changed.sort_by_key(|path| normalize_filesystem_identity(path));
             files_changed.dedup_by(|first, second| {
                 normalize_filesystem_identity(first) == normalize_filesystem_identity(second)
@@ -18128,15 +23052,25 @@ fn deactivate_mod_files_with_policy(
             })
         }
         Err(error) => {
-            for snapshot in snapshots.iter().rev() {
-                if let Some(source) = &snapshot.immediate_backup {
-                    let _ = replace_file_from_path(source, &snapshot.destination);
-                } else if snapshot.destination.exists() {
-                    let _ = fs::remove_file(&snapshot.destination);
+            match restore_deactivation_journal(
+                store_root,
+                profile,
+                &transaction_root,
+                &journal,
+            ) {
+                Ok(true) => {
+                    let _ = fs::remove_dir_all(transaction_root);
+                    Err(error)
                 }
+                Ok(false) => Err(format!(
+                    "{error} Deactivation rollback was deferred because the game path is unavailable. Recovery data was retained at {}.",
+                    transaction_root.to_string_lossy()
+                )),
+                Err(restore_error) => Err(format!(
+                    "{error} Deactivation rollback was incomplete and its recovery data was retained at {}: {restore_error}",
+                    transaction_root.to_string_lossy()
+                )),
             }
-            let _ = fs::remove_dir_all(transaction_root);
-            Err(error)
         }
     }
 }
@@ -18151,7 +23085,7 @@ fn deploy_mod_files(
 ) -> Result<Vec<String>, String> {
     let (files_written, deployment) =
         deploy_mod_files_pending(store_root, profile, install_id, archive_path, plan, record)?;
-    deployment.commit();
+    deployment.commit()?;
     Ok(files_written)
 }
 
@@ -18187,13 +23121,13 @@ fn verify_managed_source_integrity(
     let Some(expected_hash) = record.source_archive_sha256.as_deref() else {
         return Ok(());
     };
-    if !source_path.is_file() {
+    if !source_path.is_file() && !source_path.is_dir() {
         return Err(format!(
-            "The managed source for {} is missing or is no longer a file.",
+            "The managed source for {} is missing or is no longer a file or folder.",
             display_record_name(record)
         ));
     }
-    let actual_hash = sha256_file(source_path)?;
+    let actual_hash = sha256_managed_source(source_path)?;
     if !actual_hash.eq_ignore_ascii_case(expected_hash.trim()) {
         return Err(format!(
             "The managed source for {} changed after installation. Reinstall the mod from its provider or original archive.",
@@ -18269,6 +23203,8 @@ fn adopt_existing_native_script_mods(
             )),
             package_provider: Some("local".to_string()),
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -18291,6 +23227,9 @@ fn adopt_existing_native_script_mods(
             enabled: true,
             last_status: "installed".to_string(),
             plan: Some(plan),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
 
         store.items.push(record);
@@ -18434,6 +23373,8 @@ fn adopt_existing_ue4ss_mods(
                 package_id: Some(package_id),
                 package_provider: Some("local".to_string()),
                 package_version: None,
+                provider_file_id: None,
+                provider_variant: None,
                 source_archive_sha256: None,
                 dependency_string: None,
                 icon_url: None,
@@ -18453,6 +23394,9 @@ fn adopt_existing_ue4ss_mods(
                 enabled: true,
                 last_status: "installed".to_string(),
                 plan: Some(plan),
+                install_target_plan: None,
+                install_targets: Vec::new(),
+                selected_install_target_id: None,
             };
             store.items.push(record);
             adopted_count += 1;
@@ -18533,6 +23477,8 @@ fn ensure_visible_runtime_records(
             package_id: Some(format!("observed-runtime:{runtime}")),
             package_provider: Some("detected-runtime".to_string()),
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -18559,6 +23505,9 @@ fn ensure_visible_runtime_records(
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         store.items.push(record);
         changed += 1;
@@ -18596,6 +23545,8 @@ fn adopt_detected_runtime_layout(
     record.archive_name = format_loader(runtime).to_string();
     record.package_id = Some(format!("observed-runtime:{runtime}"));
     record.package_provider = Some("detected-runtime".to_string());
+    record.provider_file_id = None;
+    record.provider_variant = None;
     record.source_archive_sha256 = None;
     record.dependency_string = None;
     record.files_written = files_written.clone();
@@ -18609,6 +23560,9 @@ fn adopt_detected_runtime_layout(
         .collect();
     record.backups_written.clear();
     record.plan = None;
+    record.install_target_plan = None;
+    record.install_targets.clear();
+    record.selected_install_target_id = None;
     record.externally_managed = true;
     record.enabled = true;
     record.last_status = "installed".to_string();
@@ -20120,6 +25074,21 @@ fn config_files_from_paths(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn merged_config_files(existing: &[String], deployed_paths: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for path in existing
+        .iter()
+        .cloned()
+        .chain(config_files_from_paths(deployed_paths))
+    {
+        if seen.insert(normalize_filesystem_identity(&path)) {
+            merged.push(path);
+        }
+    }
+    merged
+}
+
 fn install_display_name(
     store_root: &Path,
     archive_path: &str,
@@ -20411,8 +25380,12 @@ fn installable_files(entries: &[ArchiveEntry]) -> Vec<ArchiveEntry> {
 }
 
 fn is_package_metadata(path: &str) -> bool {
+    let normalized = normalize_archive_path(path).to_ascii_lowercase();
+    if normalized == "fomod" || normalized.starts_with("fomod/") || normalized.contains("/fomod/") {
+        return true;
+    }
     matches!(
-        path.to_lowercase().as_str(),
+        normalized.as_str(),
         "manifest.json"
             | "readme.md"
             | "readme.txt"
@@ -20434,6 +25407,26 @@ fn mapping(
         target_root: target_root.to_string(),
         target_relative_path: normalize_archive_path(target_relative_path),
         reason: reason.to_string(),
+        generated_content: None,
+    }
+}
+
+fn generated_mapping(
+    source_id: &str,
+    target_root: &str,
+    target_relative_path: &str,
+    reason: &str,
+    content: &str,
+) -> InstallMapping {
+    InstallMapping {
+        source_path: format!(
+            ".mod-garrison/generated/{}",
+            sanitize_file_segment(source_id)
+        ),
+        target_root: target_root.to_string(),
+        target_relative_path: normalize_archive_path(target_relative_path),
+        reason: reason.to_string(),
+        generated_content: Some(content.to_string()),
     }
 }
 
@@ -20535,13 +25528,8 @@ fn runtime_core_file(runtime: &str, path: &str) -> bool {
     }
 }
 
-fn common_installable_payload_prefix(files: &[ArchiveEntry]) -> Option<String> {
-    let prefix = common_top_folder(
-        &files
-            .iter()
-            .map(|file| normalize_archive_path(&file.logical_path))
-            .collect::<Vec<_>>(),
-    )?;
+fn common_installable_payload_prefix_from_paths(paths: &[String]) -> Option<String> {
+    let prefix = common_top_folder(paths)?;
     let semantic_payload_root = matches!(
         basename(&prefix).to_ascii_lowercase().as_str(),
         "script"
@@ -20846,7 +25834,25 @@ fn native_script_target_dirs(profile: &GameProfile) -> Vec<String> {
 }
 
 fn bepinex_target_roots(profile: &GameProfile) -> Vec<String> {
-    loader_target_roots(profile, "bepinex", "BepInEx")
+    let game_path = Path::new(&profile.game_path);
+    let entries = if game_path.is_dir() {
+        walk_game_folder(game_path)
+    } else {
+        Vec::new()
+    };
+    let known_executables = profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .or_else(|| {
+            profile
+                .steam_app_id
+                .as_deref()
+                .and_then(game_definition_by_steam_app_id)
+        })
+        .map(|definition| definition.executable_names.as_slice())
+        .unwrap_or_default();
+    bepinex_loader_roots(&entries, known_executables)
 }
 
 fn reframework_target_roots(profile: &GameProfile) -> Vec<String> {
@@ -21475,6 +26481,19 @@ fn build_managed_folder_record_migration(
             }
         }
     }
+    if let Some(plan) = &mut revised.install_target_plan {
+        for mapping in &mut plan.mappings {
+            if let Some(rewritten) = rewrite_legacy_generated_path(
+                &mapping.target_relative_path,
+                &candidates,
+                &clean_folder_name,
+                true,
+            ) {
+                mapping.target_relative_path = rewritten;
+                changed = true;
+            }
+        }
+    }
 
     if !changed {
         return Ok(None);
@@ -21810,6 +26829,10 @@ fn should_descend_into(relative_path: &str, name: &str) -> bool {
         )
         || lower_path.contains("/binaries")
         || lower_path.contains("/content")
+        || lower_path.contains("/windowsserver/")
+        || lower_path.ends_with("/windowsserver")
+        || lower_path.contains("/dedicatedserver/")
+        || lower_path.ends_with("/dedicatedserver")
 }
 
 fn score_map(keys: &[&str]) -> HashMap<String, i32> {
@@ -22077,7 +27100,10 @@ fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
     ensure_store::<ProviderGameMapping>(&provider_game_mappings_path(&root))
         .map_err(error_to_string)?;
     ensure_app_settings(&settings_path(&root)).map_err(error_to_string)?;
+    recover_deactivation_transactions(&root)?;
     recover_deployment_transactions_once(&root)?;
+    recover_target_switch_transactions_once(&root)?;
+    recover_install_graph_transactions(&root)?;
     recover_replacement_transactions_once(&root)?;
     Ok(root)
 }
@@ -22265,15 +27291,328 @@ fn replacement_transactions_dir(root: &Path) -> PathBuf {
     root.join("replacement-transactions")
 }
 
+fn target_switch_transactions_dir(root: &Path) -> PathBuf {
+    root.join("target-switch-transactions")
+}
+
+fn target_switch_backup_rotation_root(
+    root: &Path,
+    profile_id: &str,
+    transaction_id: &str,
+) -> PathBuf {
+    profile_dir(root, profile_id)
+        .join("target-switch-backups")
+        .join(transaction_id)
+}
+
+fn begin_target_switch_journal(
+    root: &Path,
+    profile: &GameProfile,
+    original_record: &InstalledModRecord,
+    selected_install_target_id: &str,
+    config_snapshots: &[ConfigSnapshot],
+) -> Result<PathBuf, String> {
+    let id = Uuid::new_v4().to_string();
+    let transaction_root = target_switch_transactions_dir(root).join(&id);
+    fs::create_dir_all(&transaction_root).map_err(error_to_string)?;
+    let result = (|| -> Result<(), String> {
+        let mut persisted_snapshots = Vec::new();
+        for (index, snapshot) in config_snapshots.iter().enumerate() {
+            validate_deployment_containment(Path::new(&profile.game_path), &snapshot.path)?;
+            let target_relative_path = snapshot
+                .path
+                .strip_prefix(Path::new(&profile.game_path))
+                .map(to_portable_path)
+                .map_err(|_| {
+                    format!(
+                        "Configuration snapshot is outside the game folder: {}",
+                        snapshot.path.to_string_lossy()
+                    )
+                })?;
+            let snapshot_relative_path = format!("configs/{index}.bin");
+            let snapshot_path = safe_join(&transaction_root, &snapshot_relative_path)?;
+            write_synced_file(&snapshot_path, &snapshot.bytes).map_err(error_to_string)?;
+            persisted_snapshots.push(TargetSwitchConfigSnapshot {
+                target_relative_path,
+                snapshot_relative_path,
+            });
+        }
+        let journal = TargetSwitchJournal {
+            version: TARGET_SWITCH_JOURNAL_VERSION,
+            id: id.clone(),
+            profile_id: profile.id.clone(),
+            mod_id: original_record.id.clone(),
+            selected_install_target_id: selected_install_target_id.to_string(),
+            original_record: original_record.clone(),
+            config_snapshots: persisted_snapshots,
+        };
+        atomic_write(
+            &transaction_root.join("journal.json"),
+            &serialize_json_line(&journal)?,
+        )
+        .map_err(error_to_string)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&transaction_root);
+        return Err(error);
+    }
+    Ok(transaction_root)
+}
+
+fn finish_target_switch_journal(transaction_root: &Path) -> Result<(), String> {
+    if transaction_root.exists() {
+        fs::remove_dir_all(transaction_root).map_err(error_to_string)?;
+    }
+    if let Some(parent) = transaction_root.parent() {
+        if parent.is_dir()
+            && fs::read_dir(parent)
+                .map_err(error_to_string)?
+                .next()
+                .is_none()
+        {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+    Ok(())
+}
+
+fn target_switch_config_snapshots(
+    profile: &GameProfile,
+    transaction_root: &Path,
+    journal: &TargetSwitchJournal,
+) -> Result<Vec<ConfigSnapshot>, String> {
+    journal
+        .config_snapshots
+        .iter()
+        .map(|snapshot| {
+            let path = safe_join(
+                Path::new(&profile.game_path),
+                &snapshot.target_relative_path,
+            )?;
+            validate_deployment_containment(Path::new(&profile.game_path), &path)?;
+            if !is_user_editable_config_file(&path) {
+                return Err(format!(
+                    "Target-switch recovery refused an unsupported configuration path: {}",
+                    snapshot.target_relative_path
+                ));
+            }
+            let snapshot_path = safe_join(transaction_root, &snapshot.snapshot_relative_path)?;
+            validate_deployment_containment(transaction_root, &snapshot_path)?;
+            Ok(ConfigSnapshot {
+                path,
+                bytes: fs::read(&snapshot_path).map_err(error_to_string)?,
+            })
+        })
+        .collect()
+}
+
+fn deployment_transaction_pending_for_install(
+    root: &Path,
+    profile_id: &str,
+    install_id: &str,
+) -> bool {
+    let transactions = profile_dir(root, profile_id).join("transactions");
+    let Ok(entries) = fs::read_dir(transactions) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let journal_path = deployment_journal_path(&entry.path());
+        fs::read_to_string(journal_path)
+            .ok()
+            .and_then(|raw| parse_json_allow_bom::<DeploymentJournal>(&raw).ok())
+            .is_some_and(|journal| journal.install_id == install_id)
+    })
+}
+
+fn recover_target_switch_transactions_once(root: &Path) -> Result<(), String> {
+    recover_target_switch_transactions(root)
+}
+
+fn recover_target_switch_transactions(root: &Path) -> Result<(), String> {
+    let transactions_root = target_switch_transactions_dir(root);
+    if !transactions_root.is_dir() {
+        return Ok(());
+    }
+    let profiles = read_store::<GameProfile>(&profiles_path(root))
+        .map_err(error_to_string)?
+        .items
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<HashMap<_, _>>();
+    let mut transaction_dirs = fs::read_dir(&transactions_root)
+        .map_err(error_to_string)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    transaction_dirs.sort();
+
+    for transaction_root in transaction_dirs {
+        let journal_path = transaction_root.join("journal.json");
+        if !journal_path.is_file() {
+            let transaction_id = transaction_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    "Target-switch recovery found an invalid transaction directory.".to_string()
+                })?;
+            Uuid::parse_str(transaction_id).map_err(|_| {
+                format!(
+                    "Target-switch recovery found an invalid transaction directory: {}",
+                    transaction_root.to_string_lossy()
+                )
+            })?;
+            fs::remove_dir_all(&transaction_root).map_err(error_to_string)?;
+            continue;
+        }
+        let journal = fs::read_to_string(&journal_path)
+            .map_err(error_to_string)
+            .and_then(|raw| {
+                parse_json_allow_bom::<TargetSwitchJournal>(&raw).map_err(error_to_string)
+            })?;
+        if journal.version != TARGET_SWITCH_JOURNAL_VERSION {
+            return Err(format!(
+                "Unsupported target-switch journal version {} in {}.",
+                journal.version,
+                journal_path.to_string_lossy()
+            ));
+        }
+        validate_target_switch_journal_identity(&transaction_root, &journal)?;
+        let Some(profile) = profiles.get(&journal.profile_id) else {
+            let rotation_root =
+                target_switch_backup_rotation_root(root, &journal.profile_id, &journal.id);
+            if rotation_root.exists() {
+                fs::remove_dir_all(&rotation_root).map_err(error_to_string)?;
+            }
+            finish_target_switch_journal(&transaction_root)?;
+            continue;
+        };
+        if !matches!(
+            game_process_running(Path::new(&profile.game_path)),
+            Ok(false)
+        ) {
+            continue;
+        }
+        if deployment_transaction_pending_for_install(root, &journal.profile_id, &journal.mod_id) {
+            return Err(format!(
+                "Target switching for {} still has an unresolved deployment journal. Mod Garrison left both recovery records intact.",
+                display_record_name(&journal.original_record)
+            ));
+        }
+        let current_store = read_store::<InstalledModRecord>(&installed_mods_path(root))
+            .map_err(error_to_string)?;
+        let current = current_store
+            .items
+            .iter()
+            .find(|record| record.profile_id == journal.profile_id && record.id == journal.mod_id);
+        let committed = current.is_some_and(|record| {
+            record.selected_install_target_id.as_deref()
+                == Some(journal.selected_install_target_id.as_str())
+        });
+        let rotation_root =
+            target_switch_backup_rotation_root(root, &journal.profile_id, &journal.id);
+        if committed {
+            if rotation_root.exists() {
+                fs::remove_dir_all(&rotation_root).map_err(error_to_string)?;
+            }
+            finish_target_switch_journal(&transaction_root)?;
+            continue;
+        }
+        rollback_target_switch_backup_rotation(root, profile, &journal.mod_id, &rotation_root)?;
+        restore_checkpoint_record(root, profile, &journal.original_record)?;
+        let config_snapshots =
+            target_switch_config_snapshots(profile, &transaction_root, &journal)?;
+        restore_config_snapshots_to_record(
+            root,
+            profile,
+            &journal.original_record.id,
+            &config_snapshots,
+        )?;
+        finish_target_switch_journal(&transaction_root)?;
+    }
+    Ok(())
+}
+
+fn validate_target_switch_journal_identity(
+    transaction_root: &Path,
+    journal: &TargetSwitchJournal,
+) -> Result<(), String> {
+    Uuid::parse_str(&journal.id)
+        .map_err(|_| "Target-switch recovery found an invalid transaction identity.".to_string())?;
+    if transaction_root.file_name().and_then(|name| name.to_str()) != Some(journal.id.as_str()) {
+        return Err(format!(
+            "Target-switch recovery journal identity does not match its directory: {}",
+            transaction_root.to_string_lossy()
+        ));
+    }
+    if journal.original_record.id != journal.mod_id
+        || journal.original_record.profile_id != journal.profile_id
+    {
+        return Err(
+            "Target-switch recovery journal contains inconsistent ownership metadata.".to_string(),
+        );
+    }
+    if !is_safe_internal_storage_segment(&journal.profile_id)
+        || !is_safe_internal_storage_segment(&journal.mod_id)
+    {
+        return Err(
+            "Target-switch recovery journal contains an unsafe storage identity.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn begin_replacement_journal(
     root: &Path,
     profile: &GameProfile,
     old_record_id: &str,
     expected_package_id: &str,
     checkpoint: StoreFile<InstalledModRecord>,
+    config_snapshots: &[ConfigSnapshot],
 ) -> Result<PathBuf, String> {
     let id = Uuid::new_v4().to_string();
     let path = replacement_transactions_dir(root).join(format!("{id}.json"));
+    let snapshot_root = replacement_snapshot_root(root, &id)?;
+    if !config_snapshots.is_empty() {
+        fs::create_dir_all(&snapshot_root).map_err(error_to_string)?;
+    }
+    let journal_snapshots = (|| -> Result<Vec<ReplacementConfigSnapshot>, String> {
+        let mut journal_snapshots = Vec::with_capacity(config_snapshots.len());
+        for (index, snapshot) in config_snapshots.iter().enumerate() {
+            validate_deployment_containment(Path::new(&profile.game_path), &snapshot.path)?;
+            if !is_user_editable_config_file(&snapshot.path) {
+                return Err(format!(
+                    "Replacement recovery refused an unsupported configuration path: {}",
+                    snapshot.path.to_string_lossy()
+                ));
+            }
+            let target_relative_path = snapshot
+                .path
+                .strip_prefix(Path::new(&profile.game_path))
+                .map(to_portable_path)
+                .map_err(|_| {
+                    format!(
+                        "Replacement recovery configuration is outside the game folder: {}",
+                        snapshot.path.to_string_lossy()
+                    )
+                })?;
+            let snapshot_relative_path = format!("config-{index}.bin");
+            let snapshot_path = snapshot_root.join(&snapshot_relative_path);
+            write_synced_file(&snapshot_path, &snapshot.bytes).map_err(error_to_string)?;
+            journal_snapshots.push(ReplacementConfigSnapshot {
+                target_relative_path,
+                snapshot_relative_path,
+            });
+        }
+        Ok(journal_snapshots)
+    })();
+    let journal_snapshots = match journal_snapshots {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&snapshot_root);
+            return Err(error);
+        }
+    };
     let journal = ReplacementJournal {
         version: REPLACEMENT_JOURNAL_VERSION,
         id,
@@ -22281,14 +27620,99 @@ fn begin_replacement_journal(
         old_record_id: old_record_id.to_string(),
         expected_package_id: expected_package_id.to_string(),
         checkpoint,
+        phase: ReplacementJournalPhase::Preparing,
+        replacement_record_id: None,
+        install_graph_id: active_install_graph_id(),
+        config_snapshots: journal_snapshots,
     };
-    atomic_write(&path, &serialize_json_line(&journal)?).map_err(error_to_string)?;
+    if let Err(error) =
+        atomic_write(&path, &serialize_json_line(&journal)?).map_err(error_to_string)
+    {
+        let _ = fs::remove_dir_all(&snapshot_root);
+        return Err(error);
+    }
     Ok(path)
 }
 
+fn mark_replacement_journal_ready(path: &Path, replacement_record_id: &str) -> Result<(), String> {
+    if !is_safe_internal_storage_segment(replacement_record_id) {
+        return Err("Replacement recovery refused an unsafe replacement identity.".to_string());
+    }
+    let raw = fs::read_to_string(path).map_err(error_to_string)?;
+    let mut journal = parse_json_allow_bom::<ReplacementJournal>(&raw).map_err(error_to_string)?;
+    validate_replacement_journal_identity(path, &journal)?;
+    if matches!(
+        journal.phase,
+        ReplacementJournalPhase::Ready | ReplacementJournalPhase::Validated
+    ) {
+        if journal.replacement_record_id.as_deref() == Some(replacement_record_id) {
+            return Ok(());
+        }
+        return Err(
+            "Replacement recovery was already committed to a different installation identity."
+                .to_string(),
+        );
+    }
+    journal.phase = ReplacementJournalPhase::Ready;
+    journal.replacement_record_id = Some(replacement_record_id.to_string());
+    let content = serialize_json_line(&journal)?;
+    let _guard = lock_store_io().map_err(error_to_string)?;
+    atomic_write_unlocked_with_backup(path, &content, false).map_err(error_to_string)
+}
+
+fn commit_replacement_journals(
+    root: &Path,
+    profile: &GameProfile,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let current =
+        read_store::<InstalledModRecord>(&installed_mods_path(root)).map_err(error_to_string)?;
+    let mut writes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let raw = fs::read_to_string(path).map_err(error_to_string)?;
+        let mut journal =
+            parse_json_allow_bom::<ReplacementJournal>(&raw).map_err(error_to_string)?;
+        validate_replacement_journal_identity(path, &journal)?;
+        if journal.profile_id != profile.id {
+            return Err(
+                "Replacement recovery journal belongs to a different game profile.".to_string(),
+            );
+        }
+        if journal.phase == ReplacementJournalPhase::Preparing {
+            return Err(format!(
+                "The replacement for {} did not reach dependency validation.",
+                journal.expected_package_id
+            ));
+        }
+        if replacement_candidate_for_journal(&current.items, &journal)?.is_none() {
+            return Err(format!(
+                "The replacement for {} was not present when the dependency graph committed.",
+                journal.expected_package_id
+            ));
+        }
+        journal.phase = ReplacementJournalPhase::Validated;
+        writes.push(StoreBatchWrite {
+            target: path.clone(),
+            content: serialize_json_line(&journal)?,
+        });
+    }
+    commit_store_batch(root, writes).map_err(error_to_string)
+}
+
 fn finish_replacement_journal(path: &Path) -> Result<(), String> {
+    let snapshot_root = path.with_extension("files");
     if path.exists() {
         fs::remove_file(path).map_err(error_to_string)?;
+    }
+    let backup_path = backup_path_for(path);
+    if backup_path.exists() {
+        fs::remove_file(&backup_path).map_err(error_to_string)?;
+    }
+    if snapshot_root.exists() {
+        fs::remove_dir_all(&snapshot_root).map_err(error_to_string)?;
     }
     if let Some(parent) = path.parent() {
         if parent.is_dir()
@@ -22303,21 +27727,154 @@ fn finish_replacement_journal(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn recover_replacement_transactions_once(root: &Path) -> Result<(), String> {
-    let recovery_key = root.to_path_buf();
-    let mut recovered = RECOVERED_REPLACEMENT_ROOTS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map_err(|_| {
-            "Mod Garrison's replacement recovery coordinator is unavailable.".to_string()
-        })?;
-    if recovered.contains(&recovery_key) {
-        return Ok(());
-    }
+fn replacement_snapshot_root(root: &Path, journal_id: &str) -> Result<PathBuf, String> {
+    Uuid::parse_str(journal_id)
+        .map_err(|_| "Replacement recovery found an invalid transaction identity.".to_string())?;
+    Ok(replacement_transactions_dir(root).join(format!("{journal_id}.files")))
+}
 
-    recover_replacement_transactions(root)?;
-    recovered.insert(recovery_key);
+fn validate_replacement_journal_identity(
+    journal_path: &Path,
+    journal: &ReplacementJournal,
+) -> Result<(), String> {
+    Uuid::parse_str(&journal.id)
+        .map_err(|_| "Replacement recovery found an invalid transaction identity.".to_string())?;
+    if journal_path.file_stem().and_then(|stem| stem.to_str()) != Some(journal.id.as_str()) {
+        return Err(format!(
+            "Replacement recovery journal identity does not match its file name: {}",
+            journal_path.to_string_lossy()
+        ));
+    }
+    if !is_safe_internal_storage_segment(&journal.profile_id)
+        || !is_safe_internal_storage_segment(&journal.old_record_id)
+        || journal
+            .install_graph_id
+            .as_deref()
+            .is_some_and(|id| Uuid::parse_str(id).is_err())
+        || journal
+            .replacement_record_id
+            .as_deref()
+            .is_some_and(|id| !is_safe_internal_storage_segment(id))
+        || journal.checkpoint.items.iter().any(|record| {
+            !is_safe_internal_storage_segment(&record.profile_id)
+                || !is_safe_internal_storage_segment(&record.id)
+        })
+    {
+        return Err(
+            "Replacement recovery journal contains an unsafe storage identity.".to_string(),
+        );
+    }
+    match (journal.phase, journal.replacement_record_id.as_deref()) {
+        (ReplacementJournalPhase::Preparing, None)
+        | (ReplacementJournalPhase::Ready, Some(_))
+        | (ReplacementJournalPhase::Validated, Some(_)) => {}
+        _ => {
+            return Err(
+                "Replacement recovery journal contains an inconsistent commit phase.".to_string(),
+            );
+        }
+    }
     Ok(())
+}
+
+fn replacement_config_snapshots(
+    root: &Path,
+    profile: &GameProfile,
+    journal: &ReplacementJournal,
+) -> Result<Vec<ConfigSnapshot>, String> {
+    let snapshot_root = replacement_snapshot_root(root, &journal.id)?;
+    let game_root = Path::new(&profile.game_path);
+    journal
+        .config_snapshots
+        .iter()
+        .map(|snapshot| {
+            let target_relative_path =
+                sanitize_bundle_relative_path(&snapshot.target_relative_path)?;
+            let snapshot_relative_path =
+                sanitize_bundle_relative_path(&snapshot.snapshot_relative_path)?;
+            let target_path = safe_join(game_root, &target_relative_path)?;
+            validate_deployment_containment(game_root, &target_path)?;
+            if !is_user_editable_config_file(&target_path) {
+                return Err(format!(
+                    "Replacement recovery refused an unsupported configuration path: {}",
+                    snapshot.target_relative_path
+                ));
+            }
+            let snapshot_path = safe_join(&snapshot_root, &snapshot_relative_path)?;
+            validate_deployment_containment(&snapshot_root, &snapshot_path)?;
+            let bytes = fs::read(&snapshot_path).map_err(|error| {
+                format!(
+                    "Could not read replacement recovery configuration {}: {error}",
+                    snapshot_path.to_string_lossy()
+                )
+            })?;
+            Ok(ConfigSnapshot {
+                path: target_path,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn replacement_candidate_for_journal<'a>(
+    records: &'a [InstalledModRecord],
+    journal: &ReplacementJournal,
+) -> Result<Option<&'a InstalledModRecord>, String> {
+    if journal.phase == ReplacementJournalPhase::Preparing {
+        return Ok(None);
+    }
+    let replacement_record_id = journal.replacement_record_id.as_deref().ok_or_else(|| {
+        "Replacement recovery journal is validated without an installation identity.".to_string()
+    })?;
+    let checkpoint_ids = journal
+        .checkpoint
+        .items
+        .iter()
+        .filter(|record| record.profile_id == journal.profile_id)
+        .map(|record| record.id.as_str())
+        .collect::<HashSet<_>>();
+    if checkpoint_ids.contains(replacement_record_id) {
+        return Err(
+            "Replacement recovery journal points to a checkpoint installation identity."
+                .to_string(),
+        );
+    }
+    let Some(record) = records.iter().find(|record| {
+        record.profile_id == journal.profile_id && record.id == replacement_record_id
+    }) else {
+        return Ok(None);
+    };
+    if !record
+        .package_id
+        .as_deref()
+        .is_some_and(|package_id| package_id.eq_ignore_ascii_case(&journal.expected_package_id))
+    {
+        return Err(
+            "Replacement recovery found the committed installation identity with a different provider package."
+                .to_string(),
+        );
+    }
+    if record.enabled && !installed_record_files_match(record) {
+        return Err(format!(
+            "The validated replacement for {} no longer matches its managed files.",
+            journal.expected_package_id
+        ));
+    }
+    Ok(Some(record))
+}
+
+fn validated_replacement_record_for_journal<'a>(
+    records: &'a [InstalledModRecord],
+    journal: &ReplacementJournal,
+) -> Result<Option<&'a InstalledModRecord>, String> {
+    if journal.phase != ReplacementJournalPhase::Validated {
+        return Ok(None);
+    }
+    replacement_candidate_for_journal(records, journal)
+}
+
+fn recover_replacement_transactions_once(root: &Path) -> Result<(), String> {
+    recover_replacement_transactions(root)
 }
 
 fn recover_replacement_transactions(root: &Path) -> Result<(), String> {
@@ -22326,11 +27883,8 @@ fn recover_replacement_transactions(root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut journals = fs::read_dir(&transactions_dir)
-        .map_err(error_to_string)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
+    let mut journals = replacement_journal_paths(root)?
+        .into_iter()
         .collect::<Vec<_>>();
     journals.sort();
     for journal_path in journals {
@@ -22343,12 +27897,21 @@ fn recover_replacement_transactions(root: &Path) -> Result<(), String> {
                 journal_path.to_string_lossy()
             ));
         }
+        validate_replacement_journal_identity(&journal_path, &journal)?;
 
         let profile = read_store::<GameProfile>(&profiles_path(root))
             .map_err(error_to_string)?
             .items
             .into_iter()
             .find(|profile| profile.id == journal.profile_id);
+        if profile.as_ref().is_some_and(|profile| {
+            !matches!(
+                game_process_running(Path::new(&profile.game_path)),
+                Ok(false)
+            )
+        }) {
+            continue;
+        }
         let old_record = journal
             .checkpoint
             .items
@@ -22360,15 +27923,22 @@ fn recover_replacement_transactions(root: &Path) -> Result<(), String> {
 
         let current = read_store::<InstalledModRecord>(&installed_mods_path(root))
             .map_err(error_to_string)?;
-        let replacement_installed = current.items.iter().any(|record| {
-            record.profile_id == journal.profile_id
-                && record.id != journal.old_record_id
-                && record.package_id.as_deref().is_some_and(|package_id| {
-                    package_id.eq_ignore_ascii_case(&journal.expected_package_id)
-                })
-        });
+        let replacement =
+            validated_replacement_record_for_journal(&current.items, &journal)?.cloned();
 
-        if replacement_installed || profile.is_none() || old_record.is_none() {
+        if let (Some(profile), Some(replacement)) = (profile.as_ref(), replacement.as_ref()) {
+            let snapshots = replacement_config_snapshots(root, profile, &journal)?;
+            if !snapshots.is_empty() {
+                restore_config_snapshots_to_record(root, profile, &replacement.id, &snapshots)?;
+            }
+            if let Some(old_record) = old_record {
+                cleanup_install_data(root, &journal.profile_id, &old_record.id);
+            }
+            finish_replacement_journal(&journal_path)?;
+            continue;
+        }
+
+        if profile.is_none() || old_record.is_none() {
             if let Some(old_record) = old_record {
                 cleanup_install_data(root, &journal.profile_id, &old_record.id);
             }
@@ -22385,35 +27955,59 @@ fn recover_replacement_transactions(root: &Path) -> Result<(), String> {
                 display_record_name(&old_record)
             )
         })?;
-        restore_checkpoint_record(root, &profile, &old_record).map_err(|error| {
-            format!(
-                "Could not restore {} after an interrupted update: {error}",
-                display_record_name(&old_record)
-            )
-        })?;
+        let snapshots = replacement_config_snapshots(root, &profile, &journal)?;
+        if !snapshots.is_empty() {
+            restore_config_snapshots_to_record(root, &profile, &old_record.id, &snapshots)
+                .map_err(|error| {
+                    format!(
+                        "Could not restore the edited configuration for {} after an interrupted update: {error}",
+                        display_record_name(&old_record)
+                    )
+                })?;
+        }
         finish_replacement_journal(&journal_path)?;
+    }
+    cleanup_orphaned_replacement_snapshots(&transactions_dir)?;
+    Ok(())
+}
+
+fn cleanup_orphaned_replacement_snapshots(transactions_dir: &Path) -> Result<(), String> {
+    if !transactions_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(transactions_dir).map_err(error_to_string)? {
+        let entry = entry.map_err(error_to_string)?;
+        if !entry.file_type().map_err(error_to_string)?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("files") {
+            continue;
+        }
+        let Some(journal_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if Uuid::parse_str(journal_id).is_err()
+            || transactions_dir.join(format!("{journal_id}.json")).exists()
+        {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(error_to_string)?;
+    }
+    if transactions_dir.is_dir()
+        && fs::read_dir(transactions_dir)
+            .map_err(error_to_string)?
+            .next()
+            .is_none()
+    {
+        let _ = fs::remove_dir(transactions_dir);
     }
     Ok(())
 }
 
 fn recover_store_transactions_once(root: &Path) -> Result<(), String> {
-    let recovery_key = root.to_path_buf();
-    let mut recovered = RECOVERED_STORE_ROOTS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map_err(|_| "Mod Garrison's recovery coordinator is unavailable.".to_string())?;
-    if recovered.contains(&recovery_key) {
-        return Ok(());
-    }
-
-    let result = {
-        let _guard = lock_store_io().map_err(error_to_string)?;
-        recover_store_transactions_unlocked(root).map_err(error_to_string)
-    };
-    if result.is_ok() {
-        recovered.insert(recovery_key);
-    }
-    result
+    let _guard = lock_store_io().map_err(error_to_string)?;
+    recover_store_transactions_unlocked(root).map_err(error_to_string)
 }
 
 fn commit_store_batch(root: &Path, writes: Vec<StoreBatchWrite>) -> io::Result<()> {
@@ -22620,21 +28214,214 @@ fn copy_file_synced(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(error_to_string)
 }
 
-fn recover_deployment_transactions_once(root: &Path) -> Result<(), String> {
-    let recovery_key = root.to_path_buf();
-    let mut recovered = RECOVERED_DEPLOYMENT_ROOTS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map_err(|_| {
-            "Mod Garrison's deployment recovery coordinator is unavailable.".to_string()
-        })?;
-    if recovered.contains(&recovery_key) {
+fn deactivation_entry_destination(
+    root: &Path,
+    profile: &GameProfile,
+    entry: &DeactivationJournalEntry,
+) -> Result<PathBuf, String> {
+    validate_archive_relative_path(&entry.target_relative_path)?;
+    let target_root = if entry.target_root.eq_ignore_ascii_case("game") {
+        let game_root = Path::new(&profile.game_path);
+        if !game_root.is_dir() {
+            return Err("game-root-unavailable".to_string());
+        }
+        game_root.to_path_buf()
+    } else if entry.target_root.eq_ignore_ascii_case("profile") {
+        profile_dir(root, &profile.id)
+    } else {
+        return Err(format!(
+            "Deactivation journal contains an unknown target root: {}",
+            entry.target_root
+        ));
+    };
+    let destination = safe_join(&target_root, &entry.target_relative_path)?;
+    validate_deployment_containment(&target_root, &destination)?;
+    Ok(destination)
+}
+
+fn restore_deactivation_journal(
+    root: &Path,
+    profile: &GameProfile,
+    transaction_root: &Path,
+    journal: &DeactivationJournal,
+) -> Result<bool, String> {
+    if journal
+        .entries
+        .iter()
+        .any(|entry| entry.target_root.eq_ignore_ascii_case("game"))
+        && !Path::new(&profile.game_path).is_dir()
+    {
+        return Ok(false);
+    }
+    for entry in journal.entries.iter().rev() {
+        let destination = deactivation_entry_destination(root, profile, entry)?;
+        let snapshot = entry
+            .snapshot_file
+            .as_deref()
+            .map(|snapshot| {
+                validate_archive_relative_path(snapshot)?;
+                let snapshot = safe_join(transaction_root, snapshot)?;
+                validate_deployment_containment(transaction_root, &snapshot)?;
+                if !snapshot.is_file() {
+                    return Err(format!(
+                        "Deactivation recovery is missing snapshot {}.",
+                        snapshot.to_string_lossy()
+                    ));
+                }
+                Ok(snapshot)
+            })
+            .transpose()?;
+        let snapshot_hash = snapshot.as_deref().map(sha256_file).transpose()?;
+        if destination.exists() {
+            if !destination.is_file() {
+                return Err(format!(
+                    "Deactivation recovery found a folder where a managed file was expected: {}",
+                    destination.to_string_lossy()
+                ));
+            }
+            let current_hash = sha256_file(&destination)?;
+            if snapshot_hash
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&current_hash))
+            {
+                continue;
+            }
+            if !entry
+                .expected_deactivated_sha256
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&current_hash))
+            {
+                return Err(format!(
+                    "Deactivation recovery preserved a file changed after the interrupted operation: {}",
+                    destination.to_string_lossy()
+                ));
+            }
+        }
+        if let Some(snapshot) = snapshot {
+            replace_file_from_path(&snapshot, &destination)?;
+        } else if destination.exists() {
+            fs::remove_file(&destination).map_err(error_to_string)?;
+        }
+    }
+    Ok(true)
+}
+
+fn validate_deactivation_journal_identity(
+    root: &Path,
+    transaction_root: &Path,
+    journal: &DeactivationJournal,
+) -> Result<(), String> {
+    Uuid::parse_str(&journal.id)
+        .map_err(|_| "Deactivation recovery found an invalid transaction identity.".to_string())?;
+    if transaction_root.file_name().and_then(|name| name.to_str()) != Some(journal.id.as_str())
+        || transaction_root.parent()
+            != Some(
+                profile_dir(root, &journal.profile_id)
+                    .join("transactions")
+                    .as_path(),
+            )
+        || journal.original_record.id != journal.record_id
+        || journal.original_record.profile_id != journal.profile_id
+        || !is_safe_internal_storage_segment(&journal.profile_id)
+        || !is_safe_internal_storage_segment(&journal.record_id)
+    {
+        return Err(
+            "Deactivation recovery journal contains inconsistent ownership metadata.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn deactivation_record_state_is_uncommitted(
+    current: &InstalledModRecord,
+    original: &InstalledModRecord,
+) -> bool {
+    current.profile_id == original.profile_id
+        && current.id == original.id
+        && current.enabled == original.enabled
+        && current.last_status == original.last_status
+        && current.selected_install_target_id == original.selected_install_target_id
+        && current.files_written == original.files_written
+        && current.backups_written == original.backups_written
+        && current.written_file_hashes == original.written_file_hashes
+        && current.package_version == original.package_version
+}
+
+fn recover_deactivation_transactions(root: &Path) -> Result<(), String> {
+    let profiles = read_store::<GameProfile>(&profiles_path(root))
+        .map_err(error_to_string)?
+        .items
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<HashMap<_, _>>();
+    let records = read_store::<InstalledModRecord>(&installed_mods_path(root))
+        .map_err(error_to_string)?
+        .items;
+    let profiles_root = root.join("profiles");
+    if !profiles_root.is_dir() {
         return Ok(());
     }
-
-    recover_deployment_transactions(root)?;
-    recovered.insert(recovery_key);
+    let mut transactions = Vec::new();
+    for profile_entry in fs::read_dir(&profiles_root).map_err(error_to_string)? {
+        let profile_entry = profile_entry.map_err(error_to_string)?;
+        let transaction_dir = profile_entry.path().join("transactions");
+        if !transaction_dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(transaction_dir).map_err(error_to_string)? {
+            let entry = entry.map_err(error_to_string)?;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && deactivation_journal_path(&entry.path()).is_file()
+            {
+                transactions.push(entry.path());
+            }
+        }
+    }
+    transactions.sort();
+    for transaction_root in transactions {
+        let raw = fs::read_to_string(deactivation_journal_path(&transaction_root))
+            .map_err(error_to_string)?;
+        let journal = parse_json_allow_bom::<DeactivationJournal>(&raw).map_err(error_to_string)?;
+        if journal.version != DEACTIVATION_JOURNAL_VERSION {
+            return Err(format!(
+                "Unsupported deactivation journal version {} in {}.",
+                journal.version,
+                transaction_root.to_string_lossy()
+            ));
+        }
+        validate_deactivation_journal_identity(root, &transaction_root, &journal)?;
+        let Some(profile) = profiles.get(&journal.profile_id) else {
+            return Err(format!(
+                "Deactivation recovery retained {} because its game profile is unavailable.",
+                transaction_root.to_string_lossy()
+            ));
+        };
+        if normalize_filesystem_identity(&journal.game_path)
+            != normalize_filesystem_identity(&profile.game_path)
+            || !matches!(
+                game_process_running(Path::new(&profile.game_path)),
+                Ok(false)
+            )
+        {
+            continue;
+        }
+        let state_uncommitted = records.iter().any(|record| {
+            record.profile_id == journal.profile_id
+                && record.id == journal.record_id
+                && deactivation_record_state_is_uncommitted(record, &journal.original_record)
+        });
+        if state_uncommitted
+            && !restore_deactivation_journal(root, profile, &transaction_root, &journal)?
+        {
+            continue;
+        }
+        fs::remove_dir_all(&transaction_root).map_err(error_to_string)?;
+    }
     Ok(())
+}
+
+fn recover_deployment_transactions_once(root: &Path) -> Result<(), String> {
+    recover_deployment_transactions(root)
 }
 
 fn recover_deployment_transactions(root: &Path) -> Result<(), String> {
@@ -22644,13 +28431,12 @@ fn recover_deployment_transactions(root: &Path) -> Result<(), String> {
         .into_iter()
         .map(|profile| (profile.id.clone(), profile))
         .collect::<HashMap<_, _>>();
-    let enabled_installs = read_store::<InstalledModRecord>(&installed_mods_path(root))
+    let installed_records = read_store::<InstalledModRecord>(&installed_mods_path(root))
         .map_err(error_to_string)?
         .items
         .into_iter()
-        .filter(|record| record.enabled)
-        .map(|record| (record.profile_id, record.id))
-        .collect::<HashSet<_>>();
+        .map(|record| ((record.profile_id.clone(), record.id.clone()), record))
+        .collect::<HashMap<_, _>>();
     let profiles_root = root.join("profiles");
     if !profiles_root.is_dir() {
         return Ok(());
@@ -22691,27 +28477,111 @@ fn recover_deployment_transactions(root: &Path) -> Result<(), String> {
                 journal_path.to_string_lossy()
             ));
         }
+        validate_deployment_journal_identity(root, &transaction_root, &journal)?;
 
-        let state_committed = journal.phase == DeploymentJournalPhase::StateCommitted
-            && enabled_installs.contains(&(journal.profile_id.clone(), journal.install_id.clone()));
-        let game_path = if journal.game_path.trim().is_empty() {
-            profiles
-                .get(&journal.profile_id)
-                .map(|profile| PathBuf::from(&profile.game_path))
-        } else {
-            Some(PathBuf::from(&journal.game_path))
-        };
+        let profile = profiles.get(&journal.profile_id);
+        if profile.is_some_and(|profile| {
+            !matches!(
+                game_process_running(Path::new(&profile.game_path)),
+                Ok(false)
+            )
+        }) {
+            continue;
+        }
+        let game_path = profile.map(|profile| PathBuf::from(&profile.game_path));
+        if let (Some(profile), false) = (profile, journal.game_path.trim().is_empty()) {
+            if normalize_filesystem_identity(&journal.game_path)
+                != normalize_filesystem_identity(&profile.game_path)
+            {
+                return Err(format!(
+                    "Deployment recovery retained a journal whose game path no longer matches {}.",
+                    profile_game_label(profile)
+                ));
+            }
+        }
+        let installed_record =
+            installed_records.get(&(journal.profile_id.clone(), journal.install_id.clone()));
+        let record_committed = installed_record.is_some_and(|record| {
+            record.enabled
+                && deployment_journal_matches_record(root, game_path.as_deref(), &journal, record)
+        });
+        if journal.phase == DeploymentJournalPhase::StateCommitted && !record_committed {
+            // The state was committed and this exact deployment was subsequently replaced,
+            // disabled, or removed. Replaying the stale journal would resurrect old files.
+            fs::remove_dir_all(&transaction_root).map_err(error_to_string)?;
+            continue;
+        }
         if recover_deployment_transaction(
             root,
             &transaction_root,
             &journal,
             game_path.as_deref(),
-            state_committed,
+            record_committed,
         )? {
             fs::remove_dir_all(&transaction_root).map_err(error_to_string)?;
         }
     }
     Ok(())
+}
+
+fn validate_deployment_journal_identity(
+    root: &Path,
+    transaction_root: &Path,
+    journal: &DeploymentJournal,
+) -> Result<(), String> {
+    if !is_safe_internal_storage_segment(&journal.profile_id)
+        || !is_safe_internal_storage_segment(&journal.install_id)
+    {
+        return Err("Deployment recovery found an unsafe storage identity.".to_string());
+    }
+    let transaction_id = transaction_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Deployment recovery found an invalid transaction directory.".to_string())?;
+    Uuid::parse_str(transaction_id)
+        .map_err(|_| "Deployment recovery found an invalid transaction identity.".to_string())?;
+    let expected_parent = profile_dir(root, &journal.profile_id).join("transactions");
+    if transaction_root.parent() != Some(expected_parent.as_path()) {
+        return Err(format!(
+            "Deployment recovery journal is outside its owning profile directory: {}",
+            transaction_root.to_string_lossy()
+        ));
+    }
+    Ok(())
+}
+
+fn deployment_journal_matches_record(
+    root: &Path,
+    game_path: Option<&Path>,
+    journal: &DeploymentJournal,
+    record: &InstalledModRecord,
+) -> bool {
+    let profile_root = profile_dir(root, &journal.profile_id);
+    journal.entries.iter().all(|entry| {
+        let target_root = if entry.target_root.eq_ignore_ascii_case("game") {
+            let Some(game_path) = game_path else {
+                return false;
+            };
+            game_path
+        } else if entry.target_root.eq_ignore_ascii_case("profile") {
+            profile_root.as_path()
+        } else {
+            return false;
+        };
+        let Ok(destination) = safe_join(target_root, &entry.target_relative_path) else {
+            return false;
+        };
+        let identity = normalize_filesystem_identity(destination.to_string_lossy().as_ref());
+        let owns_path = record
+            .files_written
+            .iter()
+            .any(|path| normalize_filesystem_identity(path) == identity);
+        let matching_hash = record.written_file_hashes.iter().any(|(path, hash)| {
+            normalize_filesystem_identity(path) == identity
+                && hash.eq_ignore_ascii_case(&entry.expected_sha256)
+        });
+        owns_path && matching_hash
+    })
 }
 
 fn recover_deployment_transaction(
@@ -22735,10 +28605,7 @@ fn recover_deployment_transaction(
                 return Ok(false);
             };
             if !game_path.is_dir() {
-                if roll_forward {
-                    return Ok(false);
-                }
-                continue;
+                return Ok(false);
             }
             game_path
         } else if entry.target_root.eq_ignore_ascii_case("profile") {
@@ -22752,12 +28619,49 @@ fn recover_deployment_transaction(
         fs::create_dir_all(target_root).map_err(error_to_string)?;
         let destination = safe_join(target_root, &entry.target_relative_path)?;
         validate_deployment_containment(target_root, &destination)?;
+        let rollback_backup = if let Some(rollback_file) = &entry.rollback_file {
+            validate_archive_relative_path(rollback_file)?;
+            Some(safe_join(transaction_root, rollback_file)?)
+        } else {
+            None
+        };
 
         if roll_forward {
             validate_archive_relative_path(&entry.staged_file)?;
             let staged = safe_join(transaction_root, &entry.staged_file)?;
-            if destination.is_file() && sha256_file(&destination)? == entry.expected_sha256 {
-                continue;
+            if destination.is_file() {
+                let destination_hash = sha256_file(&destination)?;
+                if destination_hash == entry.expected_sha256 {
+                    // Cleanup can be interrupted after the exact deployment and
+                    // installed record were committed. A rollback copy is no
+                    // longer needed for an already verified destination.
+                    continue;
+                }
+                let destination_is_untouched = match rollback_backup.as_deref() {
+                    Some(backup) if backup.is_file() => sha256_file(backup)? == destination_hash,
+                    Some(_) => {
+                        return Err(format!(
+                            "Interrupted deployment is missing its rollback copy: {}",
+                            entry.rollback_file.as_deref().unwrap_or_default()
+                        ));
+                    }
+                    None => false,
+                };
+                if !destination_is_untouched {
+                    // State was committed, but another actor changed the destination
+                    // before recovery. Keep the newer file and journal for inspection.
+                    return Ok(false);
+                }
+            } else if destination.exists() {
+                return Ok(false);
+            } else if rollback_backup
+                .as_deref()
+                .is_some_and(|backup| !backup.is_file())
+            {
+                return Err(format!(
+                    "Interrupted deployment is missing its rollback copy: {}",
+                    entry.rollback_file.as_deref().unwrap_or_default()
+                ));
             }
             if !staged.is_file() {
                 return Err(format!(
@@ -22778,17 +28682,40 @@ fn recover_deployment_transaction(
                     entry.target_relative_path
                 ));
             }
-        } else if let Some(rollback_file) = &entry.rollback_file {
-            validate_archive_relative_path(rollback_file)?;
-            let backup = safe_join(transaction_root, rollback_file)?;
-            if !backup.is_file() {
-                return Err(format!(
-                    "Interrupted deployment is missing its rollback copy: {rollback_file}"
-                ));
+        } else {
+            if let Some(backup) = rollback_backup {
+                if !backup.is_file() {
+                    return Err(format!(
+                        "Interrupted deployment is missing its rollback copy: {}",
+                        entry.rollback_file.as_deref().unwrap_or_default()
+                    ));
+                }
+                let backup_hash = sha256_file(&backup)?;
+                if destination.is_file() {
+                    let destination_hash = sha256_file(&destination)?;
+                    if destination_hash == backup_hash {
+                        // This entry was never applied, or an earlier recovery pass
+                        // already restored it. Continue rolling back the other entries.
+                        continue;
+                    }
+                    if destination_hash != entry.expected_sha256 {
+                        // The destination changed after the interrupted deployment. It
+                        // may be a user edit or a newer manager write; keep it and the
+                        // journal rather than destroying that newer state.
+                        return Ok(false);
+                    }
+                } else if destination.exists() {
+                    return Ok(false);
+                }
+                replace_file_from_path(&backup, &destination)?;
+            } else if destination.is_file() {
+                if sha256_file(&destination)? != entry.expected_sha256 {
+                    return Ok(false);
+                }
+                fs::remove_file(&destination).map_err(error_to_string)?;
+            } else if destination.exists() {
+                return Ok(false);
             }
-            replace_file_from_path(&backup, &destination)?;
-        } else if destination.exists() {
-            fs::remove_file(&destination).map_err(error_to_string)?;
         }
     }
     Ok(true)
@@ -24373,6 +30300,16 @@ mod tests {
 
         fs::write(&destination, b"partial").unwrap();
         journal.phase = DeploymentJournalPhase::StateCommitted;
+        assert!(!recover_deployment_transaction(
+            &root,
+            &transaction_root,
+            &journal,
+            Some(&game_root),
+            true,
+        )
+        .unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"partial");
+        fs::remove_file(&destination).unwrap();
         assert!(recover_deployment_transaction(
             &root,
             &transaction_root,
@@ -24382,6 +30319,175 @@ mod tests {
         )
         .unwrap());
         assert_eq!(fs::read(&destination).unwrap(), b"new");
+
+        let multi_transaction_root = profile_dir(&root, "profile").join("transactions/multi-file");
+        fs::create_dir_all(&multi_transaction_root).unwrap();
+        let first_destination = game_root.join("Mods/first.dll");
+        let second_destination = game_root.join("Mods/second.dll");
+        fs::write(&first_destination, b"first-new").unwrap();
+        fs::write(&second_destination, b"second-old").unwrap();
+        fs::write(multi_transaction_root.join("staged-0.bin"), b"first-new").unwrap();
+        fs::write(multi_transaction_root.join("rollback-0.bin"), b"first-old").unwrap();
+        fs::write(multi_transaction_root.join("staged-1.bin"), b"second-new").unwrap();
+        fs::write(multi_transaction_root.join("rollback-1.bin"), b"second-old").unwrap();
+        let multi_journal = DeploymentJournal {
+            version: DEPLOYMENT_JOURNAL_VERSION,
+            profile_id: "profile".to_string(),
+            install_id: "multi-install".to_string(),
+            game_path: game_root.to_string_lossy().to_string(),
+            phase: DeploymentJournalPhase::Applying,
+            entries: vec![
+                DeploymentJournalEntry {
+                    target_root: "game".to_string(),
+                    target_relative_path: "Mods/first.dll".to_string(),
+                    staged_file: "staged-0.bin".to_string(),
+                    rollback_file: Some("rollback-0.bin".to_string()),
+                    expected_sha256: sha256_file(&multi_transaction_root.join("staged-0.bin"))
+                        .unwrap(),
+                },
+                DeploymentJournalEntry {
+                    target_root: "game".to_string(),
+                    target_relative_path: "Mods/second.dll".to_string(),
+                    staged_file: "staged-1.bin".to_string(),
+                    rollback_file: Some("rollback-1.bin".to_string()),
+                    expected_sha256: sha256_file(&multi_transaction_root.join("staged-1.bin"))
+                        .unwrap(),
+                },
+            ],
+        };
+        assert!(recover_deployment_transaction(
+            &root,
+            &multi_transaction_root,
+            &multi_journal,
+            Some(&game_root),
+            false,
+        )
+        .unwrap());
+        assert_eq!(fs::read(&first_destination).unwrap(), b"first-old");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second-old");
+
+        fs::write(&first_destination, b"first-new").unwrap();
+        fs::write(&second_destination, b"second-old").unwrap();
+        assert!(recover_deployment_transaction(
+            &root,
+            &multi_transaction_root,
+            &multi_journal,
+            Some(&game_root),
+            true,
+        )
+        .unwrap());
+        assert_eq!(fs::read(&first_destination).unwrap(), b"first-new");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second-new");
+
+        fs::remove_dir_all(&game_root).unwrap();
+        assert!(!recover_deployment_transaction(
+            &root,
+            &multi_transaction_root,
+            &multi_journal,
+            Some(&game_root),
+            false,
+        )
+        .unwrap());
+        assert!(multi_transaction_root.join("rollback-0.bin").is_file());
+        assert!(multi_transaction_root.join("rollback-1.bin").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_deployment_recovery_finishes_partial_cleanup_only_for_exact_files() {
+        let root = temp_game_dir("deployment-partial-commit-cleanup");
+        let game_root = root.join("game");
+        let first_destination = game_root.join("Mods/first.dll");
+        let second_destination = game_root.join("Mods/second.dll");
+        fs::create_dir_all(first_destination.parent().unwrap()).unwrap();
+        fs::write(&first_destination, b"first-new").unwrap();
+        fs::write(&second_destination, b"second-new").unwrap();
+
+        let mut profile = test_profile(
+            "partial-commit-cleanup",
+            "Partial Commit Cleanup",
+            "unity-mono",
+            "bepinex",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record = test_installed_record(&profile.id, "installed", None, true);
+        let first_path = first_destination.to_string_lossy().to_string();
+        let second_path = second_destination.to_string_lossy().to_string();
+        let first_hash = sha256_file(&first_destination).unwrap();
+        let second_hash = sha256_file(&second_destination).unwrap();
+        record.files_written = vec![first_path.clone(), second_path.clone()];
+        record.written_file_hashes = HashMap::from([
+            (first_path, first_hash.clone()),
+            (second_path, second_hash.clone()),
+        ]);
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record],
+            },
+        )
+        .unwrap();
+
+        let transaction_root = profile_dir(&root, &profile.id)
+            .join("transactions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(transaction_root.join("rollback")).unwrap();
+        fs::write(transaction_root.join("rollback/1.bin"), b"second-old").unwrap();
+        let journal = DeploymentJournal {
+            version: DEPLOYMENT_JOURNAL_VERSION,
+            profile_id: profile.id.clone(),
+            install_id: "installed".to_string(),
+            game_path: profile.game_path.clone(),
+            phase: DeploymentJournalPhase::StateCommitted,
+            entries: vec![
+                DeploymentJournalEntry {
+                    target_root: "game".to_string(),
+                    target_relative_path: "Mods/first.dll".to_string(),
+                    staged_file: "stage/0.bin".to_string(),
+                    rollback_file: Some("rollback/0.bin".to_string()),
+                    expected_sha256: first_hash,
+                },
+                DeploymentJournalEntry {
+                    target_root: "game".to_string(),
+                    target_relative_path: "Mods/second.dll".to_string(),
+                    staged_file: "stage/1.bin".to_string(),
+                    rollback_file: Some("rollback/1.bin".to_string()),
+                    expected_sha256: second_hash,
+                },
+            ],
+        };
+        write_deployment_journal(&transaction_root, &journal).unwrap();
+
+        assert!(!transaction_root.join("rollback/0.bin").exists());
+        assert!(transaction_root.join("rollback/1.bin").is_file());
+        recover_deployment_transactions(&root).unwrap();
+        assert_eq!(fs::read(&first_destination).unwrap(), b"first-new");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second-new");
+        assert!(!transaction_root.exists());
+
+        let unsafe_transaction_root = profile_dir(&root, &profile.id)
+            .join("transactions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&unsafe_transaction_root).unwrap();
+        fs::write(&first_destination, b"changed-after-commit").unwrap();
+        write_deployment_journal(&unsafe_transaction_root, &journal).unwrap();
+        let error = recover_deployment_transactions(&root).unwrap_err();
+        assert!(error.contains("missing its rollback copy"));
+        assert_eq!(
+            fs::read(&first_destination).unwrap(),
+            b"changed-after-commit"
+        );
+        assert!(unsafe_transaction_root.is_dir());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -24397,16 +30503,109 @@ mod tests {
             "ue4ss",
         );
         profile.game_path = game_root.to_string_lossy().to_string();
-        let previous = test_installed_record(
+        let mut previous = test_installed_record(
             &profile.id,
             "previous-version",
             Some("nexus:example"),
             false,
         );
+        let existing = test_installed_record(
+            &profile.id,
+            "already-installed-same-package",
+            Some("nexus:example"),
+            false,
+        );
+        let config_path = game_root.join("Config/Example.ini");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, b"user-edited=true\n").unwrap();
+        previous.config_files = vec![config_path.to_string_lossy().to_string()];
+        let config_snapshots = snapshot_record_configs(&profile, &previous).unwrap();
         let checkpoint = StoreFile {
             version: 1,
-            items: vec![previous.clone()],
+            items: vec![previous.clone(), existing.clone()],
         };
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: vec![existing.clone()],
+            },
+        )
+        .unwrap();
+        let journal = begin_replacement_journal(
+            &root,
+            &profile,
+            &previous.id,
+            "nexus:example",
+            checkpoint,
+            &config_snapshots,
+        )
+        .unwrap();
+
+        recover_replacement_transactions(&root).unwrap();
+
+        let recovered = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
+        assert_eq!(recovered.items.len(), 2);
+        assert!(recovered
+            .items
+            .iter()
+            .any(|record| record.id == previous.id));
+        assert!(recovered
+            .items
+            .iter()
+            .any(|record| record.id == existing.id));
+        assert_eq!(fs::read(&config_path).unwrap(), b"user-edited=true\n");
+        assert!(installed_mod_receipt_path(&root, &profile, &previous.id).is_file());
+        assert!(!journal.exists());
+        assert!(!journal.with_extension("files").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_backup_rollback_distinguishes_pre_rotation_and_rotated_empty_state() {
+        let root = temp_game_dir("target-backup-rotation-marker");
+        let active_root = root.join("active");
+        let pre_rotation = root.join("pre-rotation");
+        fs::create_dir_all(&active_root).unwrap();
+        fs::create_dir_all(&pre_rotation).unwrap();
+        fs::write(active_root.join("original.bin"), b"original").unwrap();
+
+        rollback_target_switch_backup_rotation_paths(&active_root, None, &pre_rotation).unwrap();
+        assert_eq!(
+            fs::read(active_root.join("original.bin")).unwrap(),
+            b"original"
+        );
+        assert!(!pre_rotation.exists());
+
+        let rotated = root.join("rotated");
+        fs::create_dir_all(&rotated).unwrap();
+        fs::write(
+            rotated.join(TARGET_SWITCH_BACKUP_ROTATION_MARKER),
+            b"ready\n",
+        )
+        .unwrap();
+        fs::write(active_root.join("replacement.bin"), b"replacement").unwrap();
+        rollback_target_switch_backup_rotation_paths(&active_root, None, &rotated).unwrap();
+        assert!(!active_root.exists());
+        assert!(!rotated.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applying_install_graph_journal_rolls_back_provisional_records_after_restart() {
+        let root = temp_game_dir("install-graph-recovery");
+        let game_root = root.join("game");
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile("graph-recovery", "Graph Recovery", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
         write_store(
             &profiles_path(&root),
             &StoreFile {
@@ -24423,18 +30622,118 @@ mod tests {
             },
         )
         .unwrap();
-        let journal =
-            begin_replacement_journal(&root, &profile, &previous.id, "nexus:example", checkpoint)
-                .unwrap();
 
-        recover_replacement_transactions(&root).unwrap();
+        let transaction = begin_install_graph_transaction(&root, &profile).unwrap();
+        let provisional = test_installed_record(&profile.id, "provisional-dependency", None, false);
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![provisional],
+            },
+        )
+        .unwrap();
+
+        recover_install_graph_transactions(&root).unwrap();
 
         let recovered = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
-        assert_eq!(recovered.items.len(), 1);
-        assert_eq!(recovered.items[0].id, previous.id);
-        assert!(installed_mod_receipt_path(&root, &profile, &previous.id).is_file());
-        assert!(!journal.exists());
+        assert!(recovered.items.is_empty());
+        assert!(!transaction.journal_path.exists());
+        assert!(!install_graph_transactions_dir(&root).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_contained_bundle_orders_providers_and_rejects_missing_or_cyclic_graphs() {
+        let profile = test_profile(
+            "bundle-dependency-order",
+            "Bundle Dependency Order",
+            "unity-mono",
+            "bepinex",
+        );
+        let mut provider = test_installed_record(
+            &profile.id,
+            "provider",
+            Some("thunderstore:Team/Library"),
+            true,
+        );
+        provider.package_provider = Some("thunderstore".to_string());
+        provider.package_version = Some("1.0.0".to_string());
+        provider.dependency_string = Some("Team-Library-1.0.0".to_string());
+
+        let mut dependent = test_installed_record(&profile.id, "dependent", None, true);
+        dependent.dependencies = vec![parse_thunderstore_dependency("Team-Library-1.0.0")];
+        let bundle = |record: InstalledModRecord| ProfileBundleMod {
+            record,
+            source_relative_path: "source.zip".to_string(),
+            source_is_directory: false,
+        };
+
+        let ordered = order_self_contained_bundle_mods(
+            &profile,
+            vec![bundle(dependent.clone()), bundle(provider.clone())],
+        )
+        .unwrap();
+        assert_eq!(ordered[0].record.id, provider.id);
+        assert_eq!(ordered[1].record.id, dependent.id);
+
+        let missing = order_self_contained_bundle_mods(&profile, vec![bundle(dependent.clone())])
+            .unwrap_err();
+        assert!(missing.contains("missing the bundled provider"));
+
+        let target = |id: &str, relative_path: &str| InstallTargetOption {
+            id: id.to_string(),
+            label: id.to_string(),
+            relative_path: relative_path.to_string(),
+            scope: "hosted-server".to_string(),
+            recommended: false,
+        };
+        let mut server_one_provider = provider.clone();
+        server_one_provider.id = "provider-server-one".to_string();
+        server_one_provider.install_targets =
+            vec![target("hosted-server-one", "ServerOne/BepInEx/plugins")];
+        server_one_provider.selected_install_target_id = Some("hosted-server-one".to_string());
+        let mut server_two_provider = provider.clone();
+        server_two_provider.id = "provider-server-two".to_string();
+        server_two_provider.install_targets =
+            vec![target("hosted-server-two", "ServerTwo/BepInEx/plugins")];
+        server_two_provider.selected_install_target_id = Some("hosted-server-two".to_string());
+        let mut server_two_dependent = dependent.clone();
+        server_two_dependent.id = "dependent-server-two".to_string();
+        server_two_dependent.install_targets =
+            vec![target("hosted-server-two", "ServerTwo/BepInEx/plugins")];
+        server_two_dependent.selected_install_target_id = Some("hosted-server-two".to_string());
+
+        let route_ordered = order_self_contained_bundle_mods(
+            &profile,
+            vec![
+                bundle(server_two_dependent.clone()),
+                bundle(server_one_provider.clone()),
+                bundle(server_two_provider.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(route_ordered[0].record.id, server_one_provider.id);
+        assert_eq!(route_ordered[1].record.id, server_two_provider.id);
+        assert_eq!(route_ordered[2].record.id, server_two_dependent.id);
+        let wrong_route = order_self_contained_bundle_mods(
+            &profile,
+            vec![bundle(server_two_dependent), bundle(server_one_provider)],
+        )
+        .unwrap_err();
+        assert!(wrong_route.contains("missing the bundled provider"));
+
+        let mut first = provider.clone();
+        first.dependencies = vec![parse_thunderstore_dependency("Team-Dependent-1.0.0")];
+        let mut second = dependent;
+        second.package_id = Some("thunderstore:Team/Dependent".to_string());
+        second.package_provider = Some("thunderstore".to_string());
+        second.package_version = Some("1.0.0".to_string());
+        second.dependency_string = Some("Team-Dependent-1.0.0".to_string());
+        let cyclic =
+            order_self_contained_bundle_mods(&profile, vec![bundle(first), bundle(second)])
+                .unwrap_err();
+        assert!(cyclic.contains("circular dependency graph"));
     }
 
     #[test]
@@ -24461,6 +30760,14 @@ mod tests {
             Some("nexus:example"),
             false,
         );
+        let config_path = game_root.join("Config/Example.ini");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, b"user-edited=true\n").unwrap();
+        let config_snapshots = vec![ConfigSnapshot {
+            path: config_path.clone(),
+            bytes: b"user-edited=true\n".to_vec(),
+        }];
+        fs::write(&config_path, b"replacement-default=false\n").unwrap();
         let checkpoint = StoreFile {
             version: 1,
             items: vec![previous.clone()],
@@ -24484,17 +30791,31 @@ mod tests {
         let previous_package_dir = profile_package_dir(&root, &profile.id, &previous.id);
         fs::create_dir_all(&previous_package_dir).unwrap();
         fs::write(previous_package_dir.join("stale.bin"), b"stale").unwrap();
-        let journal =
-            begin_replacement_journal(&root, &profile, &previous.id, "nexus:example", checkpoint)
-                .unwrap();
+        let journal = begin_replacement_journal(
+            &root,
+            &profile,
+            &previous.id,
+            "nexus:example",
+            checkpoint,
+            &config_snapshots,
+        )
+        .unwrap();
+        mark_replacement_journal_ready(&journal, &replacement.id).unwrap();
+        commit_replacement_journals(&root, &profile, std::slice::from_ref(&journal)).unwrap();
 
         recover_replacement_transactions(&root).unwrap();
 
         let recovered = read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
         assert_eq!(recovered.items.len(), 1);
         assert_eq!(recovered.items[0].id, replacement.id);
+        assert_eq!(fs::read(&config_path).unwrap(), b"user-edited=true\n");
+        assert!(recovered.items[0]
+            .config_files
+            .iter()
+            .any(|path| Path::new(path) == config_path));
         assert!(!previous_package_dir.exists());
         assert!(!journal.exists());
+        assert!(!journal.with_extension("files").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -24543,6 +30864,8 @@ mod tests {
             package_id: None,
             package_provider: None,
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -24559,6 +30882,9 @@ mod tests {
             enabled,
             last_status: (if enabled { "installed" } else { "disabled" }).to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&store_root),
@@ -24682,6 +31008,8 @@ mod tests {
             package_id: Some("runtime:test".to_string()),
             package_provider: Some("test".to_string()),
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -24701,6 +31029,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&store_root),
@@ -24737,6 +31068,8 @@ mod tests {
             package_id: Some("external-script:mods/external.as".to_string()),
             package_provider: Some("local".to_string()),
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -24753,6 +31086,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
 
         assert!(!record_is_mod_garrison_owned(&record));
@@ -25380,6 +31716,8 @@ mod tests {
             package_id: None,
             package_provider: None,
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -25396,6 +31734,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&root),
@@ -25549,7 +31890,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_ellipsis_route_is_repaired_before_directory_creation() {
+    fn existing_ellipsis_route_is_normalized_without_directory_creation() {
         let parent = temp_game_dir("palworld-existing-route-repair");
         let root = parent.join("Palworld");
         fs::create_dir_all(root.join("Pal/Content/Paks")).unwrap();
@@ -25581,7 +31922,8 @@ mod tests {
         assert!(outcome.warnings.is_empty());
         assert_eq!(knowledge.routes.len(), 1);
         assert_eq!(knowledge.routes[0].relative_path, "Pal/Content/Paks/~mods");
-        assert!(root.join("Pal/Content/Paks/~mods").is_dir());
+        assert!(outcome.created_routes.is_empty());
+        assert!(!root.join("Pal/Content/Paks/~mods").exists());
 
         let _ = fs::remove_dir_all(parent);
     }
@@ -25613,11 +31955,15 @@ mod tests {
 
         let plan = ue4ss_plan(&scanned, &profile).unwrap();
 
-        assert_eq!(plan.mappings.len(), 1);
-        assert_eq!(
-            plan.mappings[0].target_relative_path,
-            "RSDragonwilds/Binaries/Win64/ue4ss/Mods/CooldownRemover/Scripts/main.lua"
-        );
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path
+                == "RSDragonwilds/Binaries/Win64/ue4ss/Mods/CooldownRemover/Scripts/main.lua"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path
+                == "RSDragonwilds/Binaries/Win64/ue4ss/Mods/CooldownRemover/enabled.txt"
+                && mapping.generated_content.as_deref() == Some("")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -25648,11 +31994,15 @@ mod tests {
 
         let plan = ue4ss_plan(&scanned, &profile).unwrap();
 
-        assert_eq!(plan.mappings.len(), 1);
-        assert_eq!(
-            plan.mappings[0].target_relative_path,
-            "Pal/Binaries/Win64/ue4ss/Mods/QuickDepositToChests/scripts/main.lua"
-        );
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path
+                == "Pal/Binaries/Win64/ue4ss/Mods/QuickDepositToChests/scripts/main.lua"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path
+                == "Pal/Binaries/Win64/ue4ss/Mods/QuickDepositToChests/enabled.txt"
+                && mapping.generated_content.as_deref() == Some("")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -25709,6 +32059,204 @@ mod tests {
     }
 
     #[test]
+    fn fomod_and_competing_option_packages_fail_closed() {
+        let root = temp_game_dir("fomod-block");
+        fs::create_dir_all(root.join("FutureGame/Content/Paks")).unwrap();
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "Future Unreal Game",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = root.to_string_lossy().to_string();
+
+        let fomod = ScannedArchive {
+            archive_path: "C:/Downloads/FomodPak.zip".to_string(),
+            archive_name: "FomodPak.zip".to_string(),
+            entries: vec![
+                ArchiveEntry {
+                    path: "fomod/ModuleConfig.xml".to_string(),
+                    logical_path: "fomod/ModuleConfig.xml".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+                ArchiveEntry {
+                    path: "Payload/Future.pak".to_string(),
+                    logical_path: "Payload/Future.pak".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+            ],
+            manifest: None,
+            package_identity: None,
+        };
+        let analysis = analyze_scanned_archive(fomod, &profile);
+        assert!(analysis.recommended_plan.is_none());
+        assert!(analysis.compatibility.reason.contains("FOMOD"));
+
+        let variants = ScannedArchive {
+            archive_path: "C:/Downloads/Variants.zip".to_string(),
+            archive_name: "Variants.zip".to_string(),
+            entries: [
+                "Options/Performance/Future.pak",
+                "Options/Quality/Future.pak",
+            ]
+            .into_iter()
+            .map(|path| ArchiveEntry {
+                path: path.to_string(),
+                logical_path: path.to_string(),
+                size: 1,
+                is_directory: false,
+            })
+            .collect(),
+            manifest: None,
+            package_identity: None,
+        };
+        let analysis = analyze_scanned_archive(variants, &profile);
+        assert!(analysis.recommended_plan.is_none());
+        assert!(analysis
+            .compatibility
+            .reason
+            .contains("competing component variants"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recommended_plan_cannot_silently_drop_flat_companion_assets() {
+        let profile = test_profile(
+            "flat-companion-coverage",
+            "Flat Companion Coverage",
+            "unity-mono",
+            "bepinex",
+        );
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/FlatPlugin.zip".to_string(),
+            archive_name: "FlatPlugin.zip".to_string(),
+            entries: ["FlatPlugin.dll", "FlatPlugin.json"]
+                .into_iter()
+                .map(|path| ArchiveEntry {
+                    path: path.to_string(),
+                    logical_path: path.to_string(),
+                    size: 1,
+                    is_directory: false,
+                })
+                .collect(),
+            manifest: None,
+            package_identity: None,
+        };
+
+        let blocked = analyze_scanned_archive(scanned, &profile);
+        assert!(blocked.recommended_plan.is_none());
+        assert!(blocked.compatibility.reason.contains("installed partially"));
+        let bepinex = blocked
+            .plans
+            .iter()
+            .find(|plan| plan.adapter_id == "bepinex")
+            .unwrap();
+        assert!(bepinex.requires_confirmation);
+        assert!(bepinex
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("FlatPlugin.json")));
+
+        let nested = ScannedArchive {
+            archive_path: "C:/Downloads/NestedPlugin.zip".to_string(),
+            archive_name: "NestedPlugin.zip".to_string(),
+            entries: [
+                "BepInEx/plugins/NestedPlugin.dll",
+                "BepInEx/plugins/NestedPlugin.json",
+            ]
+            .into_iter()
+            .map(|path| ArchiveEntry {
+                path: path.to_string(),
+                logical_path: path.to_string(),
+                size: 1,
+                is_directory: false,
+            })
+            .collect(),
+            manifest: None,
+            package_identity: None,
+        };
+        let accepted = analyze_scanned_archive(nested, &profile);
+        assert_eq!(
+            accepted
+                .recommended_plan
+                .as_ref()
+                .map(|plan| plan.adapter_id.as_str()),
+            Some("bepinex")
+        );
+        assert_eq!(accepted.recommended_plan.unwrap().mappings.len(), 2);
+    }
+
+    #[test]
+    fn mixed_ue4ss_and_unreal_payloads_use_one_partitioned_plan() {
+        let root = temp_game_dir("mixed-ue4ss-pak");
+        fs::create_dir_all(root.join("FutureGame/Binaries/Win64/ue4ss/Mods")).unwrap();
+        fs::create_dir_all(root.join("FutureGame/Content/Paks")).unwrap();
+        let mut profile = test_profile(
+            "future-unreal-game",
+            "Future Unreal Game",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = root.to_string_lossy().to_string();
+        let paths = [
+            "Scripts/main.lua",
+            "Payload/Future.pak",
+            "Payload/Future.ucas",
+            "Payload/Future.utoc",
+            "Payload/Future.sig",
+            "Payload/Unrelated.sig",
+        ];
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/MixedFutureMod.zip".to_string(),
+            archive_name: "MixedFutureMod.zip".to_string(),
+            entries: paths
+                .into_iter()
+                .map(|path| ArchiveEntry {
+                    path: path.to_string(),
+                    logical_path: path.to_string(),
+                    size: 1,
+                    is_directory: false,
+                })
+                .collect(),
+            manifest: None,
+            package_identity: None,
+        };
+
+        let analysis = analyze_scanned_archive(scanned, &profile);
+        let plan = analysis.recommended_plan.unwrap();
+        assert_eq!(plan.adapter_name, "UE4SS + Unreal Pak");
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path.contains("/ue4ss/Mods/")
+                && mapping.target_relative_path.ends_with("/Scripts/main.lua")
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping
+                .target_relative_path
+                .ends_with("/Content/Paks/~mods/Future.pak")
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping
+                .target_relative_path
+                .ends_with("/Content/Paks/~mods/Future.sig")
+        }));
+        assert!(!plan
+            .mappings
+            .iter()
+            .any(|mapping| mapping.target_relative_path.ends_with("Unrelated.sig")));
+        assert!(!plan.mappings.iter().any(|mapping| {
+            mapping.target_relative_path.contains("/ue4ss/Mods/")
+                && (mapping.target_relative_path.ends_with(".pak")
+                    || mapping.target_relative_path.ends_with(".ucas")
+                    || mapping.target_relative_path.ends_with(".utoc"))
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ue4ss_runtime_plan_preserves_an_existing_alternate_bootstrap() {
         let root = temp_game_dir("ue4ss-alternate-bootstrap");
         let win64 = root.join("FutureGame/Binaries/Win64");
@@ -25760,7 +32308,7 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_routes_require_independent_mod_consensus_before_creation() {
+    fn catalogue_route_consensus_never_creates_game_directories() {
         let root = temp_game_dir("route-consensus");
         fs::create_dir_all(root.join("R5")).unwrap();
         let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
@@ -25790,29 +32338,30 @@ mod tests {
 
         let mut consensus = build_profile_route_knowledge(&profile, &[first, second], Vec::new());
         let consensus_outcome = apply_profile_route_knowledge(&profile, &mut consensus);
+        assert!(consensus_outcome.created_routes.is_empty());
         assert!(consensus_outcome
-            .created_routes
+            .expected_routes
             .contains(&"R5/Content/Paks/~mods".to_string()));
         assert!(consensus_outcome
-            .created_routes
+            .expected_routes
             .contains(&"R5/Builds/WindowsServer/R5/Content/Paks/~mods".to_string()));
-        assert!(root.join("R5/Content/Paks/~mods").is_dir());
-        assert!(root
+        assert!(!root.join("R5/Content/Paks/~mods").exists());
+        assert!(!root
             .join("R5/Builds/WindowsServer/R5/Content/Paks/~mods")
-            .is_dir());
+            .exists());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn selected_pak_mod_instructions_prepare_and_use_all_internal_routes() {
+    fn selected_pak_mod_instructions_prepare_verified_plan_without_creating_routes() {
         let game_root = temp_game_dir("selected-pak-routes-game");
         let store_root = temp_game_dir("selected-pak-routes-store");
         fs::create_dir_all(game_root.join("R5")).unwrap();
         fs::create_dir_all(&store_root).unwrap();
         let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
         profile.game_path = game_root.to_string_lossy().to_string();
-        let scanned = scanned_package("MoreResources.pak", None);
+        let scanned = scanned_package_files(&["MoreResources.pak"]);
         let document = ProviderRouteDocument {
             provider: "Nexus Mods".to_string(),
             mod_id: "nexus:windrose/44".to_string(),
@@ -25825,20 +32374,66 @@ mod tests {
             .to_string(),
         };
 
-        let outcome = prepare_package_install_routes(&store_root, &profile, &scanned, &document);
-        let plan = unreal_pak_plan(&scanned, &profile).unwrap();
+        let analysis = analyze_scanned_archive(scanned.clone(), &profile);
+        let mut plan = analysis.recommended_plan.unwrap();
+        let outcome =
+            prepare_package_install_routes(&store_root, &profile, &scanned, &document, &mut plan);
         let targets = plan
             .mappings
             .iter()
             .map(|mapping| mapping.target_relative_path.clone())
             .collect::<Vec<_>>();
 
-        assert_eq!(outcome.created_routes.len(), 2);
+        assert!(outcome.created_routes.is_empty());
+        assert!(!game_root.join("R5/Content/Paks/~mods").exists());
+        assert!(!game_root
+            .join("R5/Builds/WindowsServer/R5/Content/Paks/~mods")
+            .exists());
         assert!(targets.contains(&"R5/Content/Paks/~mods/MoreResources.pak".to_string()));
         assert!(targets.contains(
             &"R5/Builds/WindowsServer/R5/Content/Paks/~mods/MoreResources.pak".to_string()
         ));
         assert_eq!(targets.len(), 2);
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn provider_prose_cannot_poison_a_real_nested_pak_root() {
+        let game_root = temp_game_dir("provider-route-poison-game");
+        let store_root = temp_game_dir("provider-route-poison-store");
+        fs::create_dir_all(game_root.join("Project/Content/Paks")).unwrap();
+        fs::create_dir_all(&store_root).unwrap();
+        fs::write(
+            game_root.join("Project/Content/Paks/Project-Windows.pak"),
+            b"base game payload",
+        )
+        .unwrap();
+        let mut profile = test_profile("future-project", "Future Project", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let scanned = scanned_package_files(&["VerifiedMod.pak"]);
+        let document = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:future-project/7".to_string(),
+            mod_name: "Poisoned Instructions".to_string(),
+            text: "Install to Content\\Paks\\~mods".to_string(),
+        };
+
+        // Archive analysis must happen before provider prose is considered.
+        let analysis = analyze_scanned_archive(scanned.clone(), &profile);
+        let mut plan = analysis.recommended_plan.unwrap();
+        let outcome =
+            prepare_package_install_routes(&store_root, &profile, &scanned, &document, &mut plan);
+        let targets = plan
+            .mappings
+            .iter()
+            .map(|mapping| mapping.target_relative_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(outcome.created_routes.is_empty());
+        assert!(!game_root.join("Content/Paks/~mods").exists());
+        assert_eq!(targets, vec!["Project/Content/Paks/~mods/VerifiedMod.pak"]);
 
         let _ = fs::remove_dir_all(store_root);
         let _ = fs::remove_dir_all(game_root);
@@ -25884,6 +32479,287 @@ mod tests {
 
         let _ = fs::remove_dir_all(reframework_root);
         let _ = fs::remove_dir_all(bepinex_root);
+    }
+
+    #[test]
+    fn scoped_three_way_bepinex_payloads_stay_in_matching_targets() {
+        let root = temp_game_dir("scoped-three-way-bepinex");
+        fs::create_dir_all(root.join("Client/BepInEx/plugins")).unwrap();
+        fs::create_dir_all(root.join("Server/BepInEx/plugins")).unwrap();
+        fs::create_dir_all(root.join("DedicatedServer/BepInEx/plugins")).unwrap();
+        let mut profile = test_profile("test", "Test", "unity-mono", "bepinex");
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = scanned_package_files(&[
+            "Client/plugins/ScopeMod.dll",
+            "Server/plugins/ScopeMod.dll",
+            "DedicatedServer/plugins/ScopeMod.dll",
+        ]);
+
+        let plan = bepinex_plan(&scanned, &profile).unwrap();
+
+        assert_eq!(plan.mappings.len(), 3);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Client/plugins/ScopeMod.dll"
+                && mapping.target_relative_path == "Client/BepInEx/plugins/ScopeMod.dll"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Server/plugins/ScopeMod.dll"
+                && mapping.target_relative_path == "Server/BepInEx/plugins/ScopeMod.dll"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "DedicatedServer/plugins/ScopeMod.dll"
+                && mapping.target_relative_path == "DedicatedServer/BepInEx/plugins/ScopeMod.dll"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_bepinex_runtime_deploys_to_every_verified_executable_root() {
+        let store_root = temp_game_dir("bepinex-runtime-multi-root-store");
+        let game_root = store_root.join("game");
+        touch(&game_root, "Client/ClientGame.exe");
+        fs::create_dir_all(game_root.join("Client/ClientGame_Data")).unwrap();
+        touch(&game_root, "Server/ServerGame.exe");
+        fs::create_dir_all(game_root.join("Server/ServerGame_Data")).unwrap();
+        let mut profile = test_profile(
+            "multi-root-unity",
+            "Multi Root Unity",
+            "unity-mono",
+            "bepinex",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let source = store_root.join("BepInEx.zip");
+        let output = File::create(&source).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "BepInEx/core/BepInEx.dll", b"runtime core").unwrap();
+        add_bytes_to_zip(&mut zip, "winhttp.dll", b"runtime injector").unwrap();
+        add_bytes_to_zip(&mut zip, "doorstop_config.ini", b"runtime config").unwrap();
+        zip.finish().unwrap();
+
+        let analysis =
+            analyze_scanned_archive(scan_import_source(&store_root, &source).unwrap(), &profile);
+        let plan = analysis.recommended_plan.unwrap();
+        assert_eq!(
+            runtime_supplied_by_plan(&profile, &plan).as_deref(),
+            Some("bepinex")
+        );
+        for root in ["Client", "Server"] {
+            assert!(bepinex_runtime_mappings_cover_root(
+                &plan.mappings,
+                "bepinex",
+                &format!("{root}/BepInEx")
+            ));
+        }
+        assert!(!plan
+            .mappings
+            .iter()
+            .any(|mapping| mapping.target_relative_path == "BepInEx/core/BepInEx.dll"));
+
+        install_archive_impl(
+            &store_root,
+            &profile,
+            source.to_string_lossy().as_ref(),
+            Some("BepInEx.zip"),
+            None,
+            &plan,
+        )
+        .unwrap();
+        for root in ["Client", "Server"] {
+            assert_eq!(
+                fs::read(game_root.join(root).join("BepInEx/core/BepInEx.dll")).unwrap(),
+                b"runtime core"
+            );
+            assert_eq!(
+                fs::read(game_root.join(root).join("winhttp.dll")).unwrap(),
+                b"runtime injector"
+            );
+            assert_eq!(
+                fs::read(game_root.join(root).join("doorstop_config.ini")).unwrap(),
+                b"runtime config"
+            );
+        }
+        assert!(!game_root.join("BepInEx").exists());
+
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn scoped_bepinex_runtime_variants_pair_roots_or_fail_closed() {
+        let root = temp_game_dir("scoped-bepinex-runtime");
+        touch(&root, "Client/ClientGame.exe");
+        fs::create_dir_all(root.join("Client/ClientGame_Data")).unwrap();
+        touch(&root, "Server/ServerGame.exe");
+        fs::create_dir_all(root.join("Server/ServerGame_Data")).unwrap();
+        let mut profile = test_profile("scoped-runtime", "Scoped Runtime", "unity-mono", "bepinex");
+        profile.game_path = root.to_string_lossy().to_string();
+
+        let client_only = scanned_package_files(&[
+            "Client/BepInEx/core/BepInEx.dll",
+            "Client/winhttp.dll",
+            "Client/doorstop_config.ini",
+        ]);
+        let blocked = analyze_scanned_archive(client_only, &profile);
+        assert!(blocked.recommended_plan.is_none());
+        let blocked_plan = blocked
+            .plans
+            .iter()
+            .find(|plan| plan.adapter_id == "bepinex")
+            .unwrap();
+        assert!(blocked_plan.requires_confirmation);
+        assert!(blocked_plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Server/BepInEx")));
+        assert!(!blocked_plan.mappings.iter().any(|mapping| {
+            mapping.source_path.starts_with("Client/")
+                && mapping.target_relative_path.starts_with("Server/")
+        }));
+
+        let paired = scanned_package_files(&[
+            "Client/BepInEx/core/BepInEx.dll",
+            "Client/winhttp.dll",
+            "Client/doorstop_config.ini",
+            "Server/BepInEx/core/BepInEx.dll",
+            "Server/winhttp.dll",
+            "Server/doorstop_config.ini",
+        ]);
+        let accepted = analyze_scanned_archive(paired, &profile);
+        let plan = accepted.recommended_plan.unwrap();
+        assert!(!plan.requires_confirmation);
+        assert!(bepinex_runtime_mappings_cover_root(
+            &plan.mappings,
+            "bepinex",
+            "Client/BepInEx"
+        ));
+        assert!(bepinex_runtime_mappings_cover_root(
+            &plan.mappings,
+            "bepinex",
+            "Server/BepInEx"
+        ));
+        assert!(!plan.mappings.iter().any(|mapping| {
+            (mapping.source_path.starts_with("Client/")
+                && mapping.target_relative_path.starts_with("Server/"))
+                || (mapping.source_path.starts_with("Server/")
+                    && mapping.target_relative_path.starts_with("Client/"))
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_three_way_reframework_payloads_stay_in_matching_targets() {
+        let root = temp_game_dir("scoped-three-way-reframework");
+        fs::create_dir_all(root.join("Client/reframework/autorun")).unwrap();
+        fs::create_dir_all(root.join("Server/reframework/autorun")).unwrap();
+        fs::create_dir_all(root.join("DedicatedServer/reframework/autorun")).unwrap();
+        let mut profile = test_profile("test", "Test", "re-engine", "reframework");
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = scanned_package_files(&[
+            "Client/scripts/ScopeMod.lua",
+            "Server/scripts/ScopeMod.lua",
+            "DedicatedServer/scripts/ScopeMod.lua",
+        ]);
+
+        let plan = reframework_plan(&scanned, &profile).unwrap();
+
+        assert_eq!(plan.mappings.len(), 3);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Client/scripts/ScopeMod.lua"
+                && mapping.target_relative_path == "Client/reframework/autorun/ScopeMod.lua"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Server/scripts/ScopeMod.lua"
+                && mapping.target_relative_path == "Server/reframework/autorun/ScopeMod.lua"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "DedicatedServer/scripts/ScopeMod.lua"
+                && mapping.target_relative_path
+                    == "DedicatedServer/reframework/autorun/ScopeMod.lua"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_three_way_native_script_payloads_stay_in_matching_targets() {
+        let root = temp_game_dir("scoped-three-way-native-script");
+        fs::create_dir_all(root.join("Client/Hercules/Script/Mods")).unwrap();
+        fs::create_dir_all(root.join("Server/Hercules/Script/Mods")).unwrap();
+        fs::create_dir_all(root.join("DedicatedServer/Hercules/Script/Mods")).unwrap();
+        let mut profile = test_profile("test", "Test", "unreal", "none");
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = scanned_package_files(&[
+            "Client/ScopeMod.as",
+            "Server/ScopeMod.as",
+            "DedicatedServer/ScopeMod.as",
+        ]);
+
+        let plan = native_script_plan(&scanned, &profile).unwrap();
+
+        assert_eq!(plan.mappings.len(), 3);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Client/ScopeMod.as"
+                && mapping.target_relative_path == "Client/Hercules/Script/Mods/ScopeMod.as"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Server/ScopeMod.as"
+                && mapping.target_relative_path == "Server/Hercules/Script/Mods/ScopeMod.as"
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "DedicatedServer/ScopeMod.as"
+                && mapping.target_relative_path
+                    == "DedicatedServer/Hercules/Script/Mods/ScopeMod.as"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_target_scope_does_not_infer_multiplayer_or_cross_server_variants() {
+        assert_eq!(
+            source_install_target_scope("Server/Mods/ScopeMod.dll"),
+            Some("hosted-server")
+        );
+        assert_eq!(
+            source_install_target_scope("DedicatedServer/Mods/ScopeMod.dll"),
+            Some("dedicated-server")
+        );
+        assert_eq!(
+            install_target_scope_from_path("HostedServer/BepInEx"),
+            "hosted-server"
+        );
+        assert_eq!(
+            source_install_target_scope("Multiplayer/Mods/ScopeMod.dll"),
+            None
+        );
+        let multiplayer_payload = ArchiveEntry {
+            path: "Multiplayer/Mods/ScopeMod.dll".to_string(),
+            logical_path: "Multiplayer/Mods/ScopeMod.dll".to_string(),
+            size: 1,
+            is_directory: false,
+        };
+        assert_eq!(
+            source_payload_path_for_install_target(&multiplayer_payload),
+            "Multiplayer/Mods/ScopeMod.dll"
+        );
+        assert!(!source_scope_matches_target_scope(
+            Some("hosted-server"),
+            "dedicated-server"
+        ));
+        assert!(!source_scope_matches_target_scope(
+            Some("dedicated-server"),
+            "hosted-server"
+        ));
     }
 
     #[test]
@@ -26429,6 +33305,8 @@ mod tests {
             dependency_string: None,
             package_provider: Some("nexus".to_string()),
             package_version: Some("1.2".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             icon_url: None,
             adapter_id: "future-runtime".to_string(),
@@ -26453,6 +33331,9 @@ mod tests {
                 warnings: Vec::new(),
                 requires_confirmation: false,
             }),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&store_root),
@@ -26540,6 +33421,8 @@ mod tests {
             dependency_string: None,
             package_provider: None,
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             icon_url: None,
             adapter_id: "future-runtime".to_string(),
@@ -26569,6 +33452,9 @@ mod tests {
                 warnings: Vec::new(),
                 requires_confirmation: false,
             }),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&store_root),
@@ -26614,6 +33500,8 @@ mod tests {
             dependency_string: None,
             package_provider: Some("nexus".to_string()),
             package_version: Some("1.2".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             icon_url: None,
             adapter_id: "future-runtime".to_string(),
@@ -26646,6 +33534,9 @@ mod tests {
                 warnings: Vec::new(),
                 requires_confirmation: false,
             }),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(&store_root),
@@ -26741,6 +33632,8 @@ mod tests {
             package_id: None,
             package_provider: None,
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -26760,6 +33653,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
 
         let discovered = discover_profile_config_files(&profile);
@@ -26796,6 +33692,8 @@ mod tests {
             package_id: None,
             package_provider: None,
             package_version: None,
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -26812,6 +33710,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
 
         let discovered = discover_profile_config_files(&profile);
@@ -26877,6 +33778,147 @@ mod tests {
 
         assert!(updated.contains("[General]\nEnabled = false"));
         assert!(updated.contains("[Other]\nEnabled = true"));
+    }
+
+    #[test]
+    fn config_edit_updates_managed_hash_store_and_receipt() {
+        let root = temp_game_dir("config-edit-receipt");
+        let game_root = root.join("game");
+        let config_path = game_root.join("BepInEx/config/ExampleMod.cfg");
+        let generated_config_path = game_root.join("BepInEx/config/ExampleMod.generated.cfg");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, b"[General]\nEnabled = true\n").unwrap();
+        fs::write(&generated_config_path, b"[Generated]\nValue = 1\n").unwrap();
+
+        let mut profile = test_profile("config-game", "Config Game", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record = test_installed_record(&profile.id, "example-mod", None, true);
+        record.files_written = vec![config_path.to_string_lossy().to_string()];
+        record.written_file_hashes.insert(
+            config_path.to_string_lossy().to_string(),
+            sha256_file(&config_path).unwrap(),
+        );
+        record.config_files = vec![generated_config_path.to_string_lossy().to_string()];
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record],
+            },
+        )
+        .unwrap();
+
+        let result = update_mod_config_value_impl(
+            &root,
+            &profile,
+            &UpdateModConfigValueInput {
+                profile_id: profile.id.clone(),
+                file_path: config_path.to_string_lossy().to_string(),
+                section: Some("General".to_string()),
+                key: "Enabled".to_string(),
+                value: "false".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(result.raw_preview.contains("Enabled = false"));
+        let stored = read_store::<InstalledModRecord>(&installed_mods_path(&root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == "example-mod")
+            .unwrap();
+        let current_hash = sha256_file(&config_path).unwrap();
+        assert_eq!(
+            managed_record_hash_for_path(&stored, &config_path),
+            Some(current_hash.as_str())
+        );
+        assert!(stored.config_files.iter().any(|path| {
+            normalize_filesystem_identity(path)
+                == normalize_filesystem_identity(generated_config_path.to_string_lossy().as_ref())
+        }));
+        assert!(stored.config_files.iter().any(|path| {
+            normalize_filesystem_identity(path)
+                == normalize_filesystem_identity(config_path.to_string_lossy().as_ref())
+        }));
+
+        let receipt = serde_json::from_str::<InstalledModRecord>(
+            &fs::read_to_string(installed_mod_receipt_path(&root, &profile, "example-mod"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            managed_record_hash_for_path(&receipt, &config_path),
+            managed_record_hash_for_path(&stored, &config_path)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_edit_restores_original_bytes_when_receipt_commit_fails() {
+        let root = temp_game_dir("config-edit-rollback");
+        let game_root = root.join("game");
+        let config_path = game_root.join("BepInEx/config/ExampleMod.cfg");
+        let original_bytes = b"[General]\r\nEnabled = true\r\n";
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, original_bytes).unwrap();
+
+        let mut profile = test_profile("config-game", "Config Game", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record =
+            test_installed_record(&profile.id, "/outside/invalid-config-receipt", None, true);
+        record.files_written = vec![config_path.to_string_lossy().to_string()];
+        record.written_file_hashes.insert(
+            config_path.to_string_lossy().to_string(),
+            sha256_file(&config_path).unwrap(),
+        );
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record],
+            },
+        )
+        .unwrap();
+
+        let error = update_mod_config_value_impl(
+            &root,
+            &profile,
+            &UpdateModConfigValueInput {
+                profile_id: profile.id.clone(),
+                file_path: config_path.to_string_lossy().to_string(),
+                section: Some("General".to_string()),
+                key: "Enabled".to_string(),
+                value: "false".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rolled back"));
+        assert_eq!(fs::read(&config_path).unwrap(), original_bytes);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enabling_merges_existing_and_deployed_config_paths() {
+        let existing = vec![
+            "C:/Games/Test/BepInEx/config/generated.cfg".to_string(),
+            "C:/Games/Test/BepInEx/config/shared.ini".to_string(),
+        ];
+        let deployed = vec![
+            "c:/games/test/bepinex/config/shared.ini".to_string(),
+            "C:/Games/Test/BepInEx/config/shipped.cfg".to_string(),
+            "C:/Games/Test/BepInEx/plugins/Example.dll".to_string(),
+        ];
+
+        let merged = merged_config_files(&existing, &deployed);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0], existing[0]);
+        assert_eq!(merged[1], existing[1]);
+        assert_eq!(merged[2], deployed[1]);
     }
 
     #[test]
@@ -27181,6 +34223,157 @@ mod tests {
 
             assert!(runtime_supplied_by_plan(&profile, &plan).is_none());
         }
+    }
+
+    #[test]
+    fn requested_runtime_metadata_requires_a_verified_runtime_payload() {
+        let store_root = temp_game_dir("runtime-metadata-proof-store");
+        let game_root = store_root.join("game");
+        let source_root = store_root.join("source");
+        fs::create_dir_all(&game_root).unwrap();
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("OrdinaryPlugin.dll"), b"ordinary plugin").unwrap();
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let mut profile = test_profile("runtime-proof", "Runtime Proof", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: "Ordinary plugin fixture.".to_string(),
+            mappings: vec![mapping(
+                "OrdinaryPlugin.dll",
+                "game",
+                "BepInEx/plugins/OrdinaryPlugin.dll",
+                "Ordinary plugin.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let mut visited_dependencies = HashSet::new();
+        let error = install_archive_impl_with_metadata(
+            &store_root,
+            &profile,
+            source_root.to_string_lossy().as_ref(),
+            &plan,
+            InstallOptions {
+                metadata: InstallMetadata {
+                    runtime_id: Some("bepinex".to_string()),
+                    ..InstallMetadata::default()
+                },
+                resolve_dependencies: false,
+                visited_dependencies: &mut visited_dependencies,
+                dependency_depth: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("verified payload does not supply"));
+        assert!(!game_root
+            .join("BepInEx/plugins/OrdinaryPlugin.dll")
+            .exists());
+        assert!(
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn ue4ss_runtime_install_covers_client_and_server_roots_without_target_filtering() {
+        let store_root = temp_game_dir("ue4ss-runtime-multi-root-store");
+        let game_root = store_root.join("game");
+        let client_root = "R5/Binaries/Win64";
+        let server_root = "R5/Builds/WindowsServer/R5/Binaries/Win64";
+        touch(
+            &game_root,
+            &format!("{client_root}/Windrose-Win64-Shipping.exe"),
+        );
+        touch(
+            &game_root,
+            &format!("{server_root}/WindroseServer-Win64-Shipping.exe"),
+        );
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let source = store_root.join("UE4SS.zip");
+        let output = File::create(&source).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "UE4SS.dll", b"runtime core").unwrap();
+        add_bytes_to_zip(&mut zip, "dwmapi.dll", b"runtime bootstrap").unwrap();
+        zip.finish().unwrap();
+        let analysis =
+            analyze_scanned_archive(scan_import_source(&store_root, &source).unwrap(), &profile);
+        let plan = analysis.recommended_plan.unwrap();
+        assert_eq!(
+            runtime_supplied_by_plan(&profile, &plan).as_deref(),
+            Some("ue4ss")
+        );
+        assert!(plan
+            .mappings
+            .iter()
+            .any(|mapping| { mapping.target_relative_path == format!("{client_root}/UE4SS.dll") }));
+        assert!(plan
+            .mappings
+            .iter()
+            .any(|mapping| { mapping.target_relative_path == format!("{server_root}/UE4SS.dll") }));
+
+        let result = install_archive_impl(
+            &store_root,
+            &profile,
+            source.to_string_lossy().as_ref(),
+            Some("UE4SS.zip"),
+            None,
+            &plan,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(game_root.join(client_root).join("UE4SS.dll")).unwrap(),
+            b"runtime core"
+        );
+        assert_eq!(
+            fs::read(game_root.join(server_root).join("UE4SS.dll")).unwrap(),
+            b"runtime core"
+        );
+        let record = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == result.installed_mod_id)
+            .unwrap();
+        assert_eq!(record.runtime_id.as_deref(), Some("ue4ss"));
+        assert!(record.install_target_plan.is_none());
+        assert!(record.install_targets.is_empty());
+        assert!(record.selected_install_target_id.is_none());
+        assert!(record
+            .plan
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .any(|mapping| mapping.target_relative_path.starts_with(server_root)));
+
+        let _ = fs::remove_dir_all(store_root);
     }
 
     #[test]
@@ -28194,6 +35387,183 @@ mod tests {
     }
 
     #[test]
+    fn failed_profile_import_rolls_back_managed_runtime_and_overwritten_config() {
+        let root = temp_game_dir("profile-import-runtime-rollback");
+        let game_root = root.join("game");
+        let transaction_root = root.join("transactions/profile-import-test");
+        let runtime_path = game_root.join("Binaries/Win64/UE4SS.dll");
+        let config_path = game_root.join("Config/UE4SS-settings.ini");
+        fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&transaction_root).unwrap();
+        fs::write(&runtime_path, b"imported runtime").unwrap();
+        fs::write(&config_path, b"imported config").unwrap();
+
+        let mut profile = test_profile(
+            "profile-import-runtime",
+            "Profile Import Runtime",
+            "unreal",
+            "ue4ss",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let mut runtime = test_installed_record(&profile.id, "managed-import-runtime", None, true);
+        runtime.runtime_id = Some("ue4ss".to_string());
+        runtime.files_written = vec![
+            runtime_path.to_string_lossy().to_string(),
+            config_path.to_string_lossy().to_string(),
+        ];
+        runtime.written_file_hashes = HashMap::from([
+            (
+                runtime_path.to_string_lossy().to_string(),
+                sha256_file(&runtime_path).unwrap(),
+            ),
+            (
+                config_path.to_string_lossy().to_string(),
+                sha256_file(&config_path).unwrap(),
+            ),
+        ]);
+        runtime.config_files = vec![config_path.to_string_lossy().to_string()];
+
+        let backup_root = profile_backup_dir(&root, &profile.id, &runtime.id);
+        let runtime_backup = backup_root.join("Binaries/Win64/UE4SS.dll");
+        let config_backup = backup_root.join("Config/UE4SS-settings.ini");
+        fs::create_dir_all(runtime_backup.parent().unwrap()).unwrap();
+        fs::create_dir_all(config_backup.parent().unwrap()).unwrap();
+        fs::write(&runtime_backup, b"original runtime").unwrap();
+        fs::write(&config_backup, b"runtime backup config").unwrap();
+        runtime.backups_written = vec![
+            runtime_backup.to_string_lossy().to_string(),
+            config_backup.to_string_lossy().to_string(),
+        ];
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![runtime],
+            },
+        )
+        .unwrap();
+
+        let config_snapshot = transaction_root.join("config-0.bin");
+        fs::write(&config_snapshot, b"original config").unwrap();
+        let error = rollback_failed_profile_import(
+            &root,
+            &HashSet::new(),
+            &transaction_root,
+            &[DeploymentRollbackEntry {
+                destination: config_path.clone(),
+                immediate_backup: Some(config_snapshot),
+            }],
+            "forced import failure",
+        );
+
+        assert_eq!(error, "forced import failure");
+        assert_eq!(fs::read(&runtime_path).unwrap(), b"original runtime");
+        assert_eq!(fs::read(&config_path).unwrap(), b"original config");
+        assert!(read_store::<GameProfile>(&profiles_path(&root))
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(
+            read_store::<InstalledModRecord>(&installed_mods_path(&root))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(!profile_dir(&root, &profile.id).exists());
+        assert!(!transaction_root.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_profile_import_retains_recovery_data_when_deactivation_is_unsafe() {
+        let root = temp_game_dir("profile-import-retained-recovery");
+        let game_root = root.join("game");
+        let transaction_root = root.join("transactions/profile-import-test");
+        let payload_path = game_root.join("Mods/Imported.dll");
+        fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&transaction_root).unwrap();
+        fs::write(&payload_path, b"original imported payload").unwrap();
+        let expected_payload_hash = sha256_file(&payload_path).unwrap();
+        fs::write(&payload_path, b"user changed the imported payload").unwrap();
+        fs::write(transaction_root.join("recovery-sentinel.bin"), b"recovery").unwrap();
+
+        let mut profile = test_profile(
+            "profile-import-retained",
+            "Retained Import",
+            "unknown",
+            "none",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let mut record = test_installed_record(&profile.id, "unsafe-import", None, true);
+        record.files_written = vec![payload_path.to_string_lossy().to_string()];
+        record.written_file_hashes = HashMap::from([(
+            payload_path.to_string_lossy().to_string(),
+            expected_payload_hash,
+        )]);
+        let backup_path =
+            profile_backup_dir(&root, &profile.id, &record.id).join("Mods/Imported.dll");
+        fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+        fs::write(&backup_path, b"pre-import payload").unwrap();
+        record.backups_written = vec![backup_path.to_string_lossy().to_string()];
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+
+        let error = rollback_failed_profile_import(
+            &root,
+            &HashSet::new(),
+            &transaction_root,
+            &[],
+            "forced import failure",
+        );
+
+        assert!(error.contains("Recovery data and imported profile backups were retained"));
+        assert!(transaction_root.join("recovery-sentinel.bin").is_file());
+        assert!(backup_path.is_file());
+        assert_eq!(
+            fs::read(&payload_path).unwrap(),
+            b"user changed the imported payload"
+        );
+        assert!(read_store::<GameProfile>(&profiles_path(&root))
+            .unwrap()
+            .items
+            .iter()
+            .any(|stored| stored.id == profile.id));
+        assert!(
+            read_store::<InstalledModRecord>(&installed_mods_path(&root))
+                .unwrap()
+                .items
+                .iter()
+                .any(|stored| stored.id == record.id)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn profile_bundle_round_trip_restores_mods_configs_and_steam_identity() {
         let root = temp_game_dir("profile-bundle-round-trip");
         let source_game = root.join("source-game");
@@ -28282,7 +35652,12 @@ mod tests {
             import_profile_bundle_impl(&root, &transferred_bundle_path, &target_game).unwrap();
         assert_eq!(imported.profile.steam_app_id.as_deref(), Some("3041230"));
         assert_eq!(imported.installed_mods.len(), 1);
-        assert_eq!(imported.config_files_written.len(), 1);
+        assert_eq!(
+            imported.config_files_written.len(),
+            1,
+            "bundle import warnings: {:?}",
+            imported.warnings
+        );
         assert!(target_game
             .join("R5/Content/Paks/~mods/FutureMod_P.pak")
             .is_file());
@@ -28295,7 +35670,80 @@ mod tests {
     }
 
     #[test]
-    fn self_contained_profile_bundle_restores_managed_runtime_before_mods() {
+    fn bundle_config_targets_must_match_the_rescanned_package_plan() {
+        let root = temp_game_dir("bundle-config-ownership");
+        let game_root = root.join("game");
+        fs::create_dir_all(game_root.join("Config")).unwrap();
+        let mut profile = test_profile("bundle-config", "Bundle Config", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record =
+            test_installed_record(&profile.id, "future-mod", Some("nexus:future-mod"), true);
+        record.plan = Some(InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Verified package plan.".to_string(),
+            mappings: vec![mapping(
+                "FutureMod_P.pak",
+                "game",
+                "R5/Content/Paks/~mods/FutureMod_P.pak",
+                "Verified pak.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        });
+
+        assert!(verified_record_owns_bundle_config(
+            &profile,
+            &record,
+            "Config/FutureMod.ini"
+        ));
+        assert!(!verified_record_owns_bundle_config(
+            &profile,
+            &record,
+            "Config/Game.ini"
+        ));
+        assert!(!verified_record_owns_bundle_config(
+            &profile,
+            &record,
+            "Config/UnrelatedMod.ini"
+        ));
+        assert!(!verified_record_owns_bundle_config(
+            &profile,
+            &record,
+            "../outside.ini"
+        ));
+
+        let mut hostile_record = record.clone();
+        hostile_record.plan.as_mut().unwrap().mappings = vec![mapping(
+            "Engine.pak",
+            "game",
+            "R5/Content/Paks/~mods/Engine.pak",
+            "Verified pak with a deliberately broad stem.",
+        )];
+        assert!(!verified_record_owns_bundle_config(
+            &profile,
+            &hostile_record,
+            "Config/DefaultEngine.ini"
+        ));
+        hostile_record.plan.as_mut().unwrap().mappings = vec![mapping(
+            "Settings.pak",
+            "game",
+            "R5/Content/Paks/~mods/Settings.pak",
+            "Verified pak with another deliberately broad stem.",
+        )];
+        assert!(!verified_record_owns_bundle_config(
+            &profile,
+            &hostile_record,
+            "Config/GameUserSettings.ini"
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_contained_profile_bundle_restores_runtime_to_every_executable_root() {
         let root = temp_game_dir("self-contained-profile-bundle");
         let source_game = root.join("source-game");
         let steam_library = root.join("steam-library");
@@ -28311,9 +35759,16 @@ mod tests {
         fs::create_dir_all(runtime_source.as_path()).unwrap();
         fs::create_dir_all(mod_source.as_path()).unwrap();
         fs::write(runtime_source.join("UE4SS.dll"), b"shared runtime").unwrap();
+        fs::write(runtime_source.join("dwmapi.dll"), b"shared bootstrap").unwrap();
         fs::write(mod_source.join("FutureMod_P.pak"), b"shared mod").unwrap();
         touch(&source_game, "Binaries/Win64/UE4SS.dll");
+        touch(&source_game, "Binaries/Win64/dwmapi.dll");
         touch(&target_game, "Binaries/Win64/UE4SS.dll");
+        touch(&target_game, "Binaries/Win64/Windrose-Win64-Shipping.exe");
+        touch(
+            &target_game,
+            "R5/Builds/WindowsServer/R5/Binaries/Win64/WindroseServer-Win64-Shipping.exe",
+        );
         fs::write(
             steam_library.join("steamapps/appmanifest_3041230.acf"),
             r#""AppState"
@@ -28356,12 +35811,20 @@ mod tests {
             adapter_name: "UE4SS".to_string(),
             confidence: 1.0,
             summary: "Managed UE4SS runtime".to_string(),
-            mappings: vec![mapping(
-                "UE4SS.dll",
-                "game",
-                "Binaries/Win64/UE4SS.dll",
-                "Managed runtime file",
-            )],
+            mappings: vec![
+                mapping(
+                    "UE4SS.dll",
+                    "game",
+                    "Binaries/Win64/UE4SS.dll",
+                    "Managed runtime file",
+                ),
+                mapping(
+                    "dwmapi.dll",
+                    "game",
+                    "Binaries/Win64/dwmapi.dll",
+                    "Managed runtime bootstrap",
+                ),
+            ],
             dependencies: Vec::new(),
             warnings: Vec::new(),
             requires_confirmation: false,
@@ -28376,6 +35839,8 @@ mod tests {
             dependency_string: Some("github:UE4SS-RE/RE-UE4SS".to_string()),
             package_provider: Some("github-release".to_string()),
             package_version: Some("3.0.1".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             icon_url: None,
             adapter_id: "ue4ss".to_string(),
@@ -28394,6 +35859,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: Some(runtime_plan),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         let mut installed_store =
             read_store::<InstalledModRecord>(&installed_mods_path(&root)).unwrap();
@@ -28430,6 +35898,11 @@ mod tests {
         }));
         assert_eq!(
             fs::read(target_game.join("Binaries/Win64/UE4SS.dll")).unwrap(),
+            b"shared runtime"
+        );
+        assert_eq!(
+            fs::read(target_game.join("R5/Builds/WindowsServer/R5/Binaries/Win64/UE4SS.dll"))
+                .unwrap(),
             b"shared runtime"
         );
         assert_eq!(
@@ -28496,6 +35969,689 @@ mod tests {
         assert!(version_requirement_matches("^5.4.0", "5.4.2333"));
         assert!(!version_requirement_matches("^5.4.0", "6.0.0"));
         assert!(!version_requirement_matches("1.2.3", "1.2.4"));
+    }
+
+    #[test]
+    fn installed_dependency_match_distinguishes_package_identity_from_version() {
+        let profile = test_profile("dependency-match", "Dependency Match", "unknown", "none");
+        let dependency = DependencySpec {
+            id: "thunderstore:Team-SharedLibrary-2.0.0".to_string(),
+            name: "Team/SharedLibrary".to_string(),
+            version: Some("^2.0.0".to_string()),
+            provider: "thunderstore".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: Some("manifest.json".to_string()),
+            notes: None,
+        };
+        let mut wrong_version = test_installed_record(
+            &profile.id,
+            "shared-v1",
+            Some("thunderstore:Team/SharedLibrary"),
+            true,
+        );
+        wrong_version.package_provider = Some("thunderstore".to_string());
+        wrong_version.package_version = Some("1.9.0".to_string());
+
+        let wrong_match =
+            installed_dependency_match(std::slice::from_ref(&wrong_version), &profile, &dependency);
+        assert!(wrong_match.satisfying.is_none());
+        assert_eq!(
+            wrong_match.same_package.map(|record| record.id.as_str()),
+            Some("shared-v1")
+        );
+
+        let mut satisfying = wrong_version.clone();
+        satisfying.id = "shared-v2".to_string();
+        satisfying.package_version = Some("2.3.1".to_string());
+        let records = vec![wrong_version, satisfying];
+        let satisfying_match = installed_dependency_match(&records, &profile, &dependency);
+        assert_eq!(
+            satisfying_match.satisfying.map(|record| record.id.as_str()),
+            Some("shared-v2")
+        );
+    }
+
+    #[test]
+    fn server_target_auto_provisions_dependencies_in_same_route() {
+        let store_root = temp_game_dir("server-target-dependency-store");
+        let game_root = temp_game_dir("server-target-dependency-game");
+        fs::create_dir_all(game_root.join("Client/BepInEx/plugins")).unwrap();
+        fs::create_dir_all(game_root.join("Server/BepInEx/plugins")).unwrap();
+        touch(&game_root, "Server/BepInEx/core/BepInEx.dll");
+        touch(&game_root, "Server/winhttp.dll");
+        touch(&game_root, "Server/doorstop_config.ini");
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut profile = test_profile(
+            "targeted-dependency",
+            "Targeted Dependency",
+            "unity-mono",
+            "bepinex",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let dependency = DependencySpec {
+            id: "component:shared-library".to_string(),
+            name: "Shared Library".to_string(),
+            version: Some("1.0.0".to_string()),
+            provider: "github-release".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: Some("github-release:Example/SharedLibrary".to_string()),
+            notes: None,
+        };
+        let release = ReleaseDependencyRef {
+            source_key: "github-release:Example/SharedLibrary".to_string(),
+            display_name: "Shared Library 1.0.0".to_string(),
+            download_url: "https://example.invalid/SharedLibrary.zip".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let archive_path = store_root
+            .join("cache")
+            .join(sanitize_file_segment(&dependency.provider))
+            .join(sanitize_file_segment(&release.source_key))
+            .join(sanitize_file_segment(&release.version))
+            .join("SharedLibrary.zip");
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        let output = File::create(&archive_path).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "plugins/SharedLibrary.dll", b"server dependency").unwrap();
+        zip.finish().unwrap();
+        let artifact = DownloadArtifactMetadata {
+            source_url: release.download_url.clone(),
+            sha256: sha256_file(&archive_path).unwrap(),
+            size: archive_path.metadata().unwrap().len(),
+            verified_at: now_string(),
+        };
+        fs::write(
+            download_artifact_metadata_path(&archive_path),
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
+        let server_target = test_install_target("bepinex", "Server/BepInEx", "hosted-server");
+        let mut visited = HashSet::new();
+
+        install_release_dependency(
+            &store_root,
+            &profile,
+            &dependency,
+            release,
+            &mut visited,
+            0,
+            Some(&server_target),
+        )
+        .unwrap();
+
+        assert!(game_root
+            .join("Server/BepInEx/plugins/SharedLibrary.dll")
+            .is_file());
+        assert!(!game_root
+            .join("Client/BepInEx/plugins/SharedLibrary.dll")
+            .exists());
+        let records = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items;
+        let installed = records
+            .iter()
+            .find(|record| {
+                record.package_id.as_deref() == Some("github-release:Example/SharedLibrary")
+            })
+            .unwrap();
+        assert_eq!(
+            installed.selected_install_target_id.as_deref(),
+            Some(server_target.id.as_str())
+        );
+        assert!(record_payload_covers_install_target(
+            installed,
+            &server_target
+        ));
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn same_scope_different_root_dependency_is_not_reused_or_replaced() {
+        let store_root = temp_game_dir("same-scope-different-root");
+        fs::create_dir_all(&store_root).unwrap();
+        let profile = test_profile("route-family", "Route Family", "unity-mono", "bepinex");
+        let first_target = test_install_target("bepinex", "ServerOne/BepInEx", "hosted-server");
+        let second_target = test_install_target("bepinex", "ServerTwo/BepInEx", "hosted-server");
+        let dependency = DependencySpec {
+            id: "component:shared-library".to_string(),
+            name: "Shared Library".to_string(),
+            version: Some("1.0.0".to_string()),
+            provider: "github-release".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: Some("github-release:Example/SharedLibrary".to_string()),
+            notes: None,
+        };
+        let existing = with_test_install_target(
+            test_installed_record(
+                &profile.id,
+                "shared-library-server-one",
+                Some("github-release:Example/SharedLibrary"),
+                true,
+            ),
+            &first_target,
+            "ServerOne/BepInEx/plugins/SharedLibrary.dll",
+        );
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![existing.clone()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            refresh_dependency_status_for_target(
+                &store_root,
+                &profile,
+                &dependency,
+                Some(&first_target),
+            )
+            .status,
+            "already-installed"
+        );
+        assert_eq!(
+            refresh_dependency_status_for_target(
+                &store_root,
+                &profile,
+                &dependency,
+                Some(&second_target),
+            )
+            .status,
+            "missing"
+        );
+        assert_eq!(
+            dependency_install_disposition_for_target(
+                std::slice::from_ref(&existing),
+                &profile,
+                &dependency,
+                "github-release:Example/SharedLibrary",
+                "1.0.0",
+                Some(&second_target),
+            )
+            .unwrap(),
+            DependencyInstallDisposition::InstallNew
+        );
+
+        let second_plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: String::new(),
+            mappings: vec![mapping(
+                "plugins/SharedLibrary.dll",
+                "game",
+                "ServerTwo/BepInEx/plugins/SharedLibrary.dll",
+                "Second server root.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let second_metadata = InstallMetadata {
+            package_id: Some("github-release:Example/SharedLibrary".to_string()),
+            install_targets: vec![second_target.clone()],
+            selected_install_target_id: Some(second_target.id.clone()),
+            ..InstallMetadata::default()
+        };
+        assert!(duplicate_installed_mod_reason(
+            &store_root,
+            &profile,
+            &second_plan,
+            "C:/Downloads/SharedLibrary.zip",
+            &second_metadata,
+        )
+        .unwrap()
+        .is_none());
+
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn same_scope_different_root_runtime_is_not_reused() {
+        let game_root = temp_game_dir("same-scope-runtime-roots");
+        touch(&game_root, "ServerOne/Game.exe");
+        touch(&game_root, "ServerOne/BepInEx/core/BepInEx.dll");
+        touch(&game_root, "ServerOne/winhttp.dll");
+        touch(&game_root, "ServerOne/doorstop_config.ini");
+        fs::create_dir_all(game_root.join("ServerTwo/BepInEx")).unwrap();
+        let mut profile = test_profile("runtime-routes", "Runtime Routes", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let first_target = test_install_target("bepinex", "ServerOne/BepInEx", "hosted-server");
+        let second_target = test_install_target("bepinex", "ServerTwo/BepInEx", "hosted-server");
+
+        assert!(runtime_installed_for_target(
+            &profile,
+            "bepinex",
+            &first_target
+        ));
+        assert!(!runtime_installed_for_target(
+            &profile,
+            "bepinex",
+            &second_target
+        ));
+
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn reverse_dependency_guard_rejects_wrong_route_alternative() {
+        let profile = test_profile("reverse-route", "Reverse Route", "unity-mono", "bepinex");
+        let first_target = test_install_target("bepinex", "ServerOne/BepInEx", "hosted-server");
+        let second_target = test_install_target("bepinex", "ServerTwo/BepInEx", "hosted-server");
+        let dependency = DependencySpec {
+            id: "component:shared-library".to_string(),
+            name: "Shared Library".to_string(),
+            version: Some("1.0.0".to_string()),
+            provider: "github-release".to_string(),
+            required: true,
+            status: "already-installed".to_string(),
+            source: Some("github-release:Example/SharedLibrary".to_string()),
+            notes: None,
+        };
+        let provider = with_test_install_target(
+            test_installed_record(
+                &profile.id,
+                "provider-server-one",
+                Some("github-release:Example/SharedLibrary"),
+                true,
+            ),
+            &first_target,
+            "ServerOne/BepInEx/plugins/SharedLibrary.dll",
+        );
+        let wrong_route_alternative = with_test_install_target(
+            test_installed_record(
+                &profile.id,
+                "provider-server-two",
+                Some("github-release:Example/SharedLibrary"),
+                true,
+            ),
+            &second_target,
+            "ServerTwo/BepInEx/plugins/SharedLibrary.dll",
+        );
+        let mut dependent = with_test_install_target(
+            test_installed_record(
+                &profile.id,
+                "dependent-server-one",
+                Some("nexus:example/2"),
+                true,
+            ),
+            &first_target,
+            "ServerOne/BepInEx/plugins/Dependent.dll",
+        );
+        dependent.dependencies = vec![dependency];
+        let records = vec![provider.clone(), wrong_route_alternative, dependent.clone()];
+
+        assert!(
+            ensure_mod_has_no_active_reverse_dependencies(&profile, &records, &provider).is_err()
+        );
+
+        let same_route_alternative = with_test_install_target(
+            test_installed_record(
+                &profile.id,
+                "provider-server-one-alternative",
+                Some("github-release:Example/SharedLibrary"),
+                true,
+            ),
+            &first_target,
+            "ServerOne/BepInEx/plugins/SharedLibraryAlternative.dll",
+        );
+        assert!(ensure_mod_has_no_active_reverse_dependencies(
+            &profile,
+            &[provider.clone(), same_route_alternative, dependent],
+            &provider,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reverse_dependency_guard_blocks_only_the_last_enabled_provider() {
+        let profile = test_profile("reverse-deps", "Reverse Deps", "unknown", "none");
+        let dependency = DependencySpec {
+            id: "thunderstore:Team-SharedLibrary-1.2.0".to_string(),
+            name: "Team/SharedLibrary".to_string(),
+            version: Some("^1.0.0".to_string()),
+            provider: "thunderstore".to_string(),
+            required: true,
+            status: "already-installed".to_string(),
+            source: Some("manifest.json".to_string()),
+            notes: None,
+        };
+        let mut provider = test_installed_record(
+            &profile.id,
+            "shared-library",
+            Some("thunderstore:Team/SharedLibrary"),
+            true,
+        );
+        provider.package_provider = Some("thunderstore".to_string());
+        provider.package_version = Some("1.2.0".to_string());
+        let mut dependent =
+            test_installed_record(&profile.id, "dependent-mod", Some("nexus:dependent"), true);
+        dependent.dependencies = vec![dependency];
+
+        let records = vec![provider.clone(), dependent.clone()];
+        let error = ensure_mod_has_no_active_reverse_dependencies(&profile, &records, &provider)
+            .unwrap_err();
+        assert!(error.contains("dependent-mod"));
+        assert!(error.contains("SharedLibrary"));
+
+        let mut alternative = provider.clone();
+        alternative.id = "shared-library-alternative".to_string();
+        alternative.package_version = Some("1.5.0".to_string());
+        let records = vec![provider.clone(), dependent, alternative];
+        assert!(
+            ensure_mod_has_no_active_reverse_dependencies(&profile, &records, &provider).is_ok()
+        );
+    }
+
+    #[test]
+    fn dependency_replacement_rejects_versions_that_break_active_dependents() {
+        let profile = test_profile("replacement-deps", "Replacement Deps", "unknown", "none");
+        let incoming = DependencySpec {
+            id: "thunderstore:Team-SharedLibrary-2.0.0".to_string(),
+            name: "Team/SharedLibrary".to_string(),
+            version: Some("2.0.0".to_string()),
+            provider: "thunderstore".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: Some("manifest.json".to_string()),
+            notes: None,
+        };
+        let mut existing = test_installed_record(
+            &profile.id,
+            "shared-v1",
+            Some("thunderstore:Team/SharedLibrary"),
+            true,
+        );
+        existing.package_provider = Some("thunderstore".to_string());
+        existing.package_version = Some("1.8.0".to_string());
+        let mut legacy_mod =
+            test_installed_record(&profile.id, "legacy-mod", Some("nexus:legacy"), true);
+        legacy_mod.dependencies = vec![DependencySpec {
+            version: Some("^1.0.0".to_string()),
+            ..incoming.clone()
+        }];
+
+        let records = vec![existing.clone(), legacy_mod.clone()];
+        let error = dependency_install_disposition(
+            &records,
+            &profile,
+            &incoming,
+            "thunderstore:Team/SharedLibrary",
+            "2.0.0",
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy-mod"));
+        assert!(error.contains("would break"));
+
+        legacy_mod.enabled = false;
+        legacy_mod.last_status = "disabled".to_string();
+        assert_eq!(
+            dependency_install_disposition(
+                &[existing, legacy_mod],
+                &profile,
+                &incoming,
+                "thunderstore:Team/SharedLibrary",
+                "2.0.0",
+            )
+            .unwrap(),
+            DependencyInstallDisposition::Replace("shared-v1".to_string())
+        );
+    }
+
+    #[test]
+    fn normal_provider_replacement_preserves_reverse_version_requirements() {
+        let profile = test_profile(
+            "provider-replacement-deps",
+            "Provider Replacement Deps",
+            "unknown",
+            "none",
+        );
+        let mut existing = test_installed_record(
+            &profile.id,
+            "shared-v1",
+            Some("thunderstore:Team/SharedLibrary"),
+            true,
+        );
+        existing.package_provider = Some("thunderstore".to_string());
+        existing.package_version = Some("1.8.0".to_string());
+        let mut replacement = existing.clone();
+        replacement.id = "shared-v2".to_string();
+        replacement.package_version = Some("2.0.0".to_string());
+        let mut dependent =
+            test_installed_record(&profile.id, "legacy-mod", Some("nexus:legacy"), true);
+        dependent.dependencies = vec![DependencySpec {
+            id: "thunderstore:Team-SharedLibrary-1.8.0".to_string(),
+            name: "Team/SharedLibrary".to_string(),
+            version: Some("^1.0.0".to_string()),
+            provider: "thunderstore".to_string(),
+            required: true,
+            status: "already-installed".to_string(),
+            source: Some("manifest.json".to_string()),
+            notes: None,
+        }];
+
+        let records = vec![existing.clone(), dependent];
+        let error = ensure_replacement_preserves_reverse_dependencies(
+            &profile,
+            &records,
+            &existing,
+            &replacement,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy-mod"));
+        assert!(error.contains("would break"));
+
+        replacement.package_version = Some("1.9.0".to_string());
+        assert!(ensure_replacement_preserves_reverse_dependencies(
+            &profile,
+            &records,
+            &existing,
+            &replacement,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn dependency_status_is_recomputed_in_both_directions() {
+        let store_root = temp_game_dir("dependency-status-refresh-store");
+        let game_root = temp_game_dir("dependency-status-refresh-game");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile("status-refresh", "Status Refresh", "unknown", "none");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+        let dependency = DependencySpec {
+            id: "nexus:status-refresh/42".to_string(),
+            name: "Status Refresh Dependency".to_string(),
+            version: Some("^1.0.0".to_string()),
+            provider: "nexus".to_string(),
+            required: true,
+            status: "already-installed".to_string(),
+            source: None,
+            notes: Some(
+                "Keep this note. The component is present, but its installed version could not be verified."
+                    .to_string(),
+            ),
+        };
+
+        let missing = refresh_dependency_status(&store_root, &profile, &dependency);
+        assert_eq!(missing.status, "missing");
+        assert_eq!(missing.notes.as_deref(), Some("Keep this note."));
+
+        let mut installed = test_installed_record(
+            &profile.id,
+            "status-refresh-dependency",
+            Some("nexus:status-refresh/42"),
+            true,
+        );
+        installed.package_version = None;
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![installed.clone()],
+            },
+        )
+        .unwrap();
+        let unverified = refresh_dependency_status(&store_root, &profile, &missing);
+        assert_eq!(unverified.status, "already-installed");
+        assert!(unverified
+            .notes
+            .as_deref()
+            .is_some_and(|notes| notes.contains("could not be verified")));
+
+        installed.package_version = Some("1.4.0".to_string());
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![installed],
+            },
+        )
+        .unwrap();
+        let verified = refresh_dependency_status(&store_root, &profile, &unverified);
+        assert_eq!(verified.status, "already-installed");
+        assert_eq!(verified.notes.as_deref(), Some("Keep this note."));
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn dependency_replacement_cleanup_waits_for_root_graph_commit() {
+        let store_root = temp_game_dir("dependency-deferred-cleanup-store");
+        let game_root = temp_game_dir("dependency-deferred-cleanup-game");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile("deferred-cleanup", "Deferred Cleanup", "unknown", "none");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let package_id = "test:shared-dependency";
+        let mut previous = test_installed_record(&profile.id, "shared-v1", Some(package_id), false);
+        let previous_source =
+            profile_package_dir(&store_root, &profile.id, &previous.id).join("source");
+        fs::create_dir_all(&previous_source).unwrap();
+        fs::write(previous_source.join("Shared.dll"), b"version one").unwrap();
+        previous.archive_path = previous_source.to_string_lossy().to_string();
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![previous.clone()],
+            },
+        )
+        .unwrap();
+
+        let (_, warnings) = run_install_graph_transaction(&store_root, &profile, || {
+            let result = replace_installed_mod_transaction(
+                &store_root,
+                &profile,
+                Some(&previous.id),
+                package_id,
+                || {
+                    let replacement_id = "shared-v2";
+                    let replacement_source =
+                        profile_package_dir(&store_root, &profile.id, replacement_id)
+                            .join("source");
+                    fs::create_dir_all(&replacement_source).map_err(error_to_string)?;
+                    fs::write(replacement_source.join("Shared.dll"), b"version two")
+                        .map_err(error_to_string)?;
+                    let mut replacement =
+                        test_installed_record(&profile.id, replacement_id, Some(package_id), false);
+                    replacement.package_version = Some("2.0.0".to_string());
+                    replacement.archive_path = replacement_source.to_string_lossy().to_string();
+                    write_store(
+                        &installed_mods_path(&store_root),
+                        &StoreFile {
+                            version: 1,
+                            items: vec![replacement],
+                        },
+                    )
+                    .map_err(error_to_string)?;
+                    Ok(InstallResult {
+                        profile_id: profile.id.clone(),
+                        archive_path: replacement_source.to_string_lossy().to_string(),
+                        installed_mod_id: replacement_id.to_string(),
+                        installed_at: now_string(),
+                        files_written: Vec::new(),
+                        backups_written: Vec::new(),
+                        warnings: Vec::new(),
+                    })
+                },
+            )?;
+            assert!(previous_source.exists());
+            assert_eq!(replacement_journal_paths(&store_root)?.len(), 1);
+            Ok(result)
+        })
+        .unwrap();
+
+        assert!(warnings.is_empty());
+        assert!(!profile_package_dir(&store_root, &profile.id, &previous.id).exists());
+        assert!(replacement_journal_paths(&store_root).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn release_dependency_wrong_version_selects_atomic_replacement() {
+        let profile = test_profile(
+            "release-dependency",
+            "Release Dependency",
+            "unknown",
+            "none",
+        );
+        let source = "github-release:Example/Shared#Shared-*.zip";
+        let dependency = DependencySpec {
+            id: "component:shared".to_string(),
+            name: "Shared Component".to_string(),
+            version: Some("2.0.0".to_string()),
+            provider: "github-release".to_string(),
+            required: true,
+            status: "missing".to_string(),
+            source: Some(source.to_string()),
+            notes: None,
+        };
+        let mut existing = test_installed_record(&profile.id, "release-v1", Some(source), true);
+        existing.package_provider = Some("github-release".to_string());
+        existing.package_version = Some("1.0.0".to_string());
+
+        assert_eq!(
+            dependency_install_disposition(
+                std::slice::from_ref(&existing),
+                &profile,
+                &dependency,
+                source,
+                "2.0.0",
+            )
+            .unwrap(),
+            DependencyInstallDisposition::Replace("release-v1".to_string())
+        );
+        existing.package_version = Some("2.0.0".to_string());
+        assert_eq!(
+            dependency_install_disposition(&[existing], &profile, &dependency, source, "2.0.0",)
+                .unwrap(),
+            DependencyInstallDisposition::AlreadySatisfied
+        );
     }
 
     #[test]
@@ -28581,6 +36737,8 @@ mod tests {
             dependency_string: None,
             package_provider: Some("test".to_string()),
             package_version: Some("1.0.0".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: Some(sha256_file(&source).unwrap()),
             icon_url: None,
             adapter_id: "bepinex".to_string(),
@@ -28599,6 +36757,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         assert!(verify_managed_source_integrity(&record, &source).is_ok());
         fs::write(&source, b"tampered managed source").unwrap();
@@ -28630,6 +36791,179 @@ mod tests {
 
         let _ = fs::remove_dir_all(store_root);
         let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn failed_root_graph_restores_replaced_dependency_and_finishes_its_journal() {
+        let store_root = temp_game_dir("dependency-replacement-rollback-store");
+        let game_root = temp_game_dir("dependency-replacement-rollback-game");
+        fs::create_dir_all(&store_root).unwrap();
+        fs::create_dir_all(&game_root).unwrap();
+        let mut profile = test_profile(
+            "replacement-rollback",
+            "Replacement Rollback",
+            "unity-mono",
+            "bepinex",
+        );
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let package_id = "test:shared-dependency";
+        let destination = game_root.join("BepInEx/plugins/Shared.dll");
+        let config_path = game_root.join("BepInEx/config/Shared.cfg");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&destination, b"version one").unwrap();
+        fs::write(&config_path, b"user-setting=true\n").unwrap();
+        let plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: "Shared dependency fixture.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Shared.dll",
+                    "game",
+                    "BepInEx/plugins/Shared.dll",
+                    "Shared dependency.",
+                ),
+                mapping(
+                    "BepInEx/config/Shared.cfg",
+                    "game",
+                    "BepInEx/config/Shared.cfg",
+                    "Shared dependency configuration.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let mut previous = test_installed_record(&profile.id, "shared-v1", Some(package_id), true);
+        let previous_source =
+            profile_package_dir(&store_root, &profile.id, &previous.id).join("source");
+        fs::create_dir_all(&previous_source).unwrap();
+        fs::write(previous_source.join("Shared.dll"), b"version one").unwrap();
+        fs::create_dir_all(previous_source.join("BepInEx/config")).unwrap();
+        fs::write(
+            previous_source.join("BepInEx/config/Shared.cfg"),
+            b"default-setting=false\n",
+        )
+        .unwrap();
+        previous.archive_path = previous_source.to_string_lossy().to_string();
+        previous.package_version = Some("1.0.0".to_string());
+        previous.source_archive_sha256 = Some(sha256_managed_source(&previous_source).unwrap());
+        previous.files_written = vec![
+            destination.to_string_lossy().to_string(),
+            config_path.to_string_lossy().to_string(),
+        ];
+        previous.config_files = vec![config_path.to_string_lossy().to_string()];
+        previous.written_file_hashes = HashMap::from([
+            (
+                destination.to_string_lossy().to_string(),
+                sha256_file(&destination).unwrap(),
+            ),
+            (
+                config_path.to_string_lossy().to_string(),
+                sha256_file(&config_path).unwrap(),
+            ),
+        ]);
+        previous.plan = Some(plan.clone());
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![previous.clone()],
+            },
+        )
+        .unwrap();
+
+        let replacement_id = "shared-v2";
+        let replacement_source =
+            profile_package_dir(&store_root, &profile.id, replacement_id).join("source");
+        let result: Result<((), Vec<String>), String> =
+            run_install_graph_transaction(&store_root, &profile, || {
+                replace_installed_mod_transaction(
+                    &store_root,
+                    &profile,
+                    Some(&previous.id),
+                    package_id,
+                    || {
+                        fs::create_dir_all(&replacement_source).map_err(error_to_string)?;
+                        fs::write(replacement_source.join("Shared.dll"), b"version two")
+                            .map_err(error_to_string)?;
+                        fs::write(&destination, b"version two").map_err(error_to_string)?;
+                        let mut replacement = test_installed_record(
+                            &profile.id,
+                            replacement_id,
+                            Some(package_id),
+                            true,
+                        );
+                        replacement.archive_path = replacement_source.to_string_lossy().to_string();
+                        replacement.package_version = Some("2.0.0".to_string());
+                        replacement.source_archive_sha256 =
+                            Some(sha256_managed_source(&replacement_source)?);
+                        replacement.files_written = vec![destination.to_string_lossy().to_string()];
+                        replacement.written_file_hashes = HashMap::from([(
+                            destination.to_string_lossy().to_string(),
+                            sha256_file(&destination)?,
+                        )]);
+                        replacement.plan = Some(plan.clone());
+                        write_store(
+                            &installed_mods_path(&store_root),
+                            &StoreFile {
+                                version: 1,
+                                items: vec![replacement],
+                            },
+                        )
+                        .map_err(error_to_string)?;
+                        Ok(InstallResult {
+                            profile_id: profile.id.clone(),
+                            archive_path: replacement_source.to_string_lossy().to_string(),
+                            installed_mod_id: replacement_id.to_string(),
+                            installed_at: now_string(),
+                            files_written: vec![destination.to_string_lossy().to_string()],
+                            backups_written: Vec::new(),
+                            warnings: Vec::new(),
+                        })
+                    },
+                )?;
+                assert!(previous_source.exists());
+                Err("the parent package failed after its dependency updated".to_string())
+            });
+
+        let error = result.unwrap_err();
+        assert!(error.contains("parent package failed"));
+        assert_eq!(fs::read(&destination).unwrap(), b"version one");
+        assert_eq!(fs::read(&config_path).unwrap(), b"user-setting=true\n");
+        assert!(previous_source.exists());
+        assert!(!replacement_source.exists());
+        assert!(replacement_journal_paths(&store_root).unwrap().is_empty());
+        let restored = read_store::<InstalledModRecord>(&installed_mods_path(&store_root)).unwrap();
+        assert_eq!(restored.items.len(), 1);
+        assert_eq!(restored.items[0].id, previous.id);
+        assert!(installed_record_files_match(&restored.items[0]));
+
+        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(game_root);
+    }
+
+    #[test]
+    fn managed_folder_integrity_detects_content_and_path_changes() {
+        let root = temp_game_dir("managed-folder-integrity");
+        fs::create_dir_all(root.join("Scripts")).unwrap();
+        fs::write(root.join("Scripts/main.lua"), b"return true").unwrap();
+        let initial = sha256_managed_source(&root).unwrap();
+        assert_eq!(initial, sha256_managed_source(&root).unwrap());
+
+        fs::write(root.join("Scripts/main.lua"), b"return false").unwrap();
+        assert_ne!(initial, sha256_managed_source(&root).unwrap());
+        fs::write(root.join("Scripts/main.lua"), b"return true").unwrap();
+        fs::rename(
+            root.join("Scripts/main.lua"),
+            root.join("Scripts/renamed.lua"),
+        )
+        .unwrap();
+        assert_ne!(initial, sha256_managed_source(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -29073,6 +37407,164 @@ mod tests {
     }
 
     #[test]
+    fn deactivation_fails_before_mutation_when_recorded_backup_is_missing() {
+        let root = temp_game_dir("deactivation-missing-backup");
+        let game_root = root.join("game");
+        let destination = game_root.join("Mods/overwritten.dll");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"managed replacement").unwrap();
+
+        let mut profile = test_profile("missing-backup", "Missing Backup", "unknown", "none");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record = test_installed_record(&profile.id, "missing-backup-record", None, true);
+        record.files_written = vec![destination.to_string_lossy().to_string()];
+        record.written_file_hashes.insert(
+            destination.to_string_lossy().to_string(),
+            sha256_file(&destination).unwrap(),
+        );
+        let missing_backup =
+            profile_backup_dir(&root, &profile.id, &record.id).join("Mods/overwritten.dll");
+        record.backups_written = vec![missing_backup.to_string_lossy().to_string()];
+
+        let error = deactivate_mod_files(&root, &profile, &record).unwrap_err();
+
+        assert!(error.contains("managed overwrite backup is missing"));
+        assert_eq!(fs::read(&destination).unwrap(), b"managed replacement");
+        assert!(!profile_dir(&root, &profile.id)
+            .join("transactions")
+            .exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deactivation_journal_restores_precommit_files_and_accepts_committed_disable() {
+        let run_case = |name: &str, commit_disable: bool| {
+            let root = temp_game_dir(name);
+            let game_root = root.join("game");
+            let managed = game_root.join("Mods/example.dll");
+            fs::create_dir_all(managed.parent().unwrap()).unwrap();
+            fs::write(&managed, b"managed").unwrap();
+            let mut profile = test_profile(name, "Deactivation Recovery", "unknown", "none");
+            profile.game_path = game_root.to_string_lossy().to_string();
+            let mut record = test_installed_record(&profile.id, "managed-record", None, true);
+            record.files_written = vec![managed.to_string_lossy().to_string()];
+            record.written_file_hashes.insert(
+                managed.to_string_lossy().to_string(),
+                sha256_file(&managed).unwrap(),
+            );
+            write_store(
+                &profiles_path(&root),
+                &StoreFile {
+                    version: 1,
+                    items: vec![profile.clone()],
+                },
+            )
+            .unwrap();
+            write_store(
+                &installed_mods_path(&root),
+                &StoreFile {
+                    version: 1,
+                    items: vec![record.clone()],
+                },
+            )
+            .unwrap();
+
+            deactivate_mod_files(&root, &profile, &record).unwrap();
+            assert!(!managed.exists());
+            if commit_disable {
+                record.enabled = false;
+                record.last_status = "disabled".to_string();
+                write_store(
+                    &installed_mods_path(&root),
+                    &StoreFile {
+                        version: 1,
+                        items: vec![record],
+                    },
+                )
+                .unwrap();
+            }
+
+            recover_deactivation_transactions(&root).unwrap();
+            assert_eq!(managed.exists(), !commit_disable);
+            if !commit_disable {
+                assert_eq!(fs::read(&managed).unwrap(), b"managed");
+            }
+            let transactions = profile_dir(&root, &profile.id).join("transactions");
+            assert!(!transactions.exists() || fs::read_dir(transactions).unwrap().next().is_none());
+            let _ = fs::remove_dir_all(root);
+        };
+
+        run_case("deactivation-precommit", false);
+        run_case("deactivation-committed", true);
+    }
+
+    #[test]
+    fn interrupted_runtime_stale_cleanup_restores_retired_files() {
+        let root = temp_game_dir("runtime-stale-recovery");
+        let game_root = root.join("game");
+        let stale = game_root.join("BepInEx/core/obsolete.dll");
+        let replacement = game_root.join("BepInEx/core/current.dll");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"obsolete").unwrap();
+        fs::write(&replacement, b"current").unwrap();
+        let mut profile = test_profile("runtime-stale", "Runtime Stale", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let mut record = test_installed_record(&profile.id, "runtime-record", None, true);
+        record.runtime_id = Some("bepinex".to_string());
+        record.files_written = vec![stale.to_string_lossy().to_string()];
+        record.written_file_hashes.insert(
+            stale.to_string_lossy().to_string(),
+            sha256_file(&stale).unwrap(),
+        );
+        write_store(
+            &profiles_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile {
+                version: 1,
+                items: vec![record.clone()],
+            },
+        )
+        .unwrap();
+        let deployment = DeploymentOutcome {
+            files_written: vec![replacement.to_string_lossy().to_string()],
+            backups_written: Vec::new(),
+            written_file_hashes: HashMap::from([(
+                replacement.to_string_lossy().to_string(),
+                sha256_file(&replacement).unwrap(),
+            )]),
+            transaction_root: root.join("unused-deployment"),
+            rollback_entries: Vec::new(),
+            journal: DeploymentJournal {
+                version: DEPLOYMENT_JOURNAL_VERSION,
+                profile_id: profile.id.clone(),
+                install_id: record.id.clone(),
+                game_path: profile.game_path.clone(),
+                phase: DeploymentJournalPhase::Applying,
+                entries: Vec::new(),
+            },
+        };
+
+        let cleanup = cleanup_stale_runtime_files(&root, &profile, &record, &deployment).unwrap();
+        assert!(!stale.exists());
+        assert!(cleanup
+            .transaction_root
+            .as_ref()
+            .is_some_and(|path| { deactivation_journal_path(path).is_file() }));
+
+        recover_deactivation_transactions(&root).unwrap();
+        assert_eq!(fs::read(&stale).unwrap(), b"obsolete");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_update_rolls_back_when_receipt_persistence_fails() {
         let root = temp_game_dir("runtime-update-rollback");
         let fixture = managed_bepinex_fixture(&root);
@@ -29173,6 +37665,8 @@ mod tests {
             dependency_string: Some("github:BepInEx/BepInEx@1.0.0".to_string()),
             package_provider: Some("github-release".to_string()),
             package_version: Some("1.0.0".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: Some(sha256_file(&old_source).unwrap()),
             icon_url: None,
             adapter_id: "bepinex".to_string(),
@@ -29188,6 +37682,9 @@ mod tests {
             enabled: true,
             last_status: "installed".to_string(),
             plan: Some(old_plan),
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         };
         write_store(
             &installed_mods_path(root),
@@ -29251,6 +37748,846 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deployment_accepts_backslash_zip_members_and_rejects_normalized_collisions() {
+        let root = temp_game_dir("zip-backslash-deployment");
+        let game_root = root.join("game");
+        fs::create_dir_all(&game_root).unwrap();
+        write_store(
+            &installed_mods_path(&root),
+            &StoreFile::<InstalledModRecord> {
+                version: 1,
+                items: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut profile = test_profile("zip-test", "ZIP Test", "unity-mono", "bepinex");
+        profile.game_path = game_root.to_string_lossy().to_string();
+
+        let source = root.join("backslash.zip");
+        let output = File::create(&source).unwrap();
+        let mut zip = ZipWriter::new(output);
+        zip.start_file("BepInEx\\plugins\\Backslash.dll", zip_file_options())
+            .unwrap();
+        zip.write_all(b"plugin").unwrap();
+        zip.finish().unwrap();
+        let plan = InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: "Backslash path fixture".to_string(),
+            mappings: vec![mapping(
+                "BepInEx/plugins/Backslash.dll",
+                "game",
+                "BepInEx/plugins/Backslash.dll",
+                "Test mapping.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let deployment =
+            deploy_plan_transaction(&root, &profile, "backslash", &source, &plan, None).unwrap();
+        assert_eq!(
+            fs::read(game_root.join("BepInEx/plugins/Backslash.dll")).unwrap(),
+            b"plugin"
+        );
+        deployment.commit().unwrap();
+
+        let ambiguous = root.join("ambiguous.zip");
+        let output = File::create(&ambiguous).unwrap();
+        let mut zip = ZipWriter::new(output);
+        zip.start_file("A/B.dll", zip_file_options()).unwrap();
+        zip.write_all(b"first").unwrap();
+        zip.start_file("A\\B.dll", zip_file_options()).unwrap();
+        zip.write_all(b"second").unwrap();
+        zip.finish().unwrap();
+        let ambiguous_plan = InstallPlan {
+            mappings: vec![mapping("A/B.dll", "game", "A/B.dll", "Test mapping.")],
+            ..plan
+        };
+        let error = deploy_plan_transaction(
+            &root,
+            &profile,
+            "ambiguous",
+            &ambiguous,
+            &ambiguous_plan,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous duplicate paths"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dragonwilds_definition_is_explicit_and_provider_ready() {
+        let definition = game_definition_by_steam_app_id("1374490")
+            .expect("Dragonwilds should have an explicit Steam definition");
+
+        assert_eq!(definition.id, "runescape-dragonwilds");
+        assert_eq!(definition.display_name, "RuneScape: Dragonwilds");
+        assert_eq!(
+            definition.nexus_game_domain.as_deref(),
+            Some("runescapedragonwilds")
+        );
+        assert!(definition
+            .supported_adapters
+            .iter()
+            .any(|adapter| adapter == "ue4ss"));
+        assert!(definition
+            .bootstrap_runtimes
+            .iter()
+            .any(|runtime| runtime == "ue4ss"));
+    }
+
+    #[test]
+    fn legacy_installed_mod_records_default_target_and_provider_fields() {
+        let record = test_installed_record("profile", "legacy", None, true);
+        let mut value = serde_json::to_value(record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "providerFileId",
+            "providerVariant",
+            "installTargetPlan",
+            "installTargets",
+            "selectedInstallTargetId",
+        ] {
+            object.remove(field);
+        }
+
+        let restored: InstalledModRecord = serde_json::from_value(value).unwrap();
+
+        assert!(restored.provider_file_id.is_none());
+        assert!(restored.provider_variant.is_none());
+        assert!(restored.install_target_plan.is_none());
+        assert!(restored.install_targets.is_empty());
+        assert!(restored.selected_install_target_id.is_none());
+    }
+
+    #[test]
+    fn mixed_unreal_target_filter_keeps_both_payload_families() {
+        let root = temp_game_dir("mixed-unreal-targets");
+        let client_win64 = "R5/Binaries/Win64";
+        let server_win64 = "R5/Builds/WindowsServer/R5/Binaries/Win64";
+        fs::create_dir_all(root.join(client_win64)).unwrap();
+        fs::create_dir_all(root.join(server_win64)).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let mut plan = InstallPlan {
+            adapter_id: "ue4ss".to_string(),
+            adapter_name: "Composite Unreal Mod".to_string(),
+            confidence: 1.0,
+            summary: "Install UE4SS and pak payloads.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Scripts/main.lua",
+                    "game",
+                    &format!("{client_win64}/ue4ss/Mods/Example/Scripts/main.lua"),
+                    "Client UE4SS payload.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    "R5/Content/Paks/~mods/Example.pak",
+                    "Client pak payload.",
+                ),
+                mapping(
+                    "Scripts/main.lua",
+                    "game",
+                    &format!("{server_win64}/ue4ss/Mods/Example/Scripts/main.lua"),
+                    "Server UE4SS payload.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    "R5/Builds/WindowsServer/R5/Content/Paks/~mods/Example.pak",
+                    "Server pak payload.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let options = plan_install_target_options(&profile, &plan);
+        let client = options
+            .iter()
+            .find(|option| option.scope == "client")
+            .unwrap();
+
+        apply_install_target_option(&mut plan, client).unwrap();
+
+        assert_eq!(plan.mappings.len(), 2);
+        assert!(plan
+            .mappings
+            .iter()
+            .any(|item| item.target_relative_path.ends_with(".lua")));
+        assert!(plan
+            .mappings
+            .iter()
+            .any(|item| item.target_relative_path.ends_with(".pak")));
+        assert!(plan
+            .mappings
+            .iter()
+            .all(|item| !item.target_relative_path.contains("WindowsServer")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn complementary_routes_are_not_exposed_as_exclusive_targets() {
+        let root = temp_game_dir("complementary-target-routes");
+        fs::create_dir_all(root.join("Client/Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("Server/Content/Paks")).unwrap();
+        let mut profile = test_profile("future-unreal", "Future Unreal", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Complementary payloads.".to_string(),
+            mappings: vec![
+                mapping(
+                    "ClientOnly.pak",
+                    "game",
+                    "Client/Content/Paks/~mods/ClientOnly.pak",
+                    "Client-only payload.",
+                ),
+                mapping(
+                    "ServerOnly.pak",
+                    "game",
+                    "Server/Content/Paks/~mods/ServerOnly.pak",
+                    "Server-only payload.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        assert!(plan_install_target_options(&profile, &plan).is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreal_client_and_server_source_folders_are_partitioned_by_target() {
+        let root = temp_game_dir("partitioned-unreal-source");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/PartitionedPak.zip".to_string(),
+            archive_name: "PartitionedPak.zip".to_string(),
+            entries: vec![
+                ArchiveEntry {
+                    path: "Package/Client Files/ClientPayload.pak".to_string(),
+                    logical_path: "Client Files/ClientPayload.pak".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+                ArchiveEntry {
+                    path: "Package/Server Files/ServerPayload.pak".to_string(),
+                    logical_path: "Server Files/ServerPayload.pak".to_string(),
+                    size: 1,
+                    is_directory: false,
+                },
+            ],
+            manifest: None,
+            package_identity: None,
+        };
+
+        let plan = unreal_pak_plan(&scanned, &profile).unwrap();
+        assert_eq!(plan.mappings.len(), 2);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path.contains("Client Files")
+                && mapping.target_relative_path == format!("{client_route}/ClientPayload.pak")
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path.contains("Server Files")
+                && mapping.target_relative_path == format!("{server_route}/ServerPayload.pak")
+        }));
+        assert!(plan.mappings.iter().all(|mapping| {
+            mapping.source_path.contains("Server Files")
+                == mapping.target_relative_path.contains("WindowsServer")
+        }));
+
+        let options = plan_install_target_options(&profile, &plan);
+        assert_eq!(options.len(), 2);
+        assert!(options.iter().any(|target| target.scope == "client"));
+        assert!(options.iter().any(|target| target.scope == "hosted-server"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_ue4ss_source_variants_keep_scripts_and_paks_together() {
+        let root = temp_game_dir("partitioned-mixed-ue4ss-source");
+        let client_win64 = "R5/Binaries/Win64";
+        let server_win64 = "R5/Builds/WindowsServer/R5/Binaries/Win64";
+        fs::create_dir_all(root.join(client_win64)).unwrap();
+        fs::create_dir_all(root.join(server_win64)).unwrap();
+        fs::create_dir_all(root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
+        touch(
+            &root,
+            &format!("{client_win64}/Windrose-Win64-Shipping.exe"),
+        );
+        touch(
+            &root,
+            &format!("{server_win64}/WindroseServer-Win64-Shipping.exe"),
+        );
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = root.to_string_lossy().to_string();
+        let scanned = ScannedArchive {
+            archive_path: "C:/Downloads/VariantBundle.zip".to_string(),
+            archive_name: "VariantBundle.zip".to_string(),
+            entries: [
+                "Package/Client/Scripts/main.lua",
+                "Package/Client/ClientPayload.pak",
+                "Package/Server/Scripts/main.lua",
+                "Package/Server/ServerPayload.pak",
+            ]
+            .into_iter()
+            .map(|path| ArchiveEntry {
+                path: path.to_string(),
+                logical_path: path.strip_prefix("Package/").unwrap_or(path).to_string(),
+                size: 1,
+                is_directory: false,
+            })
+            .collect(),
+            manifest: None,
+            package_identity: None,
+        };
+
+        let analysis = analyze_scanned_archive(scanned, &profile);
+        let mut plan = analysis.recommended_plan.unwrap();
+        assert_eq!(plan.adapter_name, "UE4SS + Unreal Pak");
+        let options = plan_install_target_options(&profile, &plan);
+        assert_eq!(options.len(), 2);
+        let client = options
+            .iter()
+            .find(|target| target.scope == "client")
+            .unwrap();
+        apply_install_target_option(&mut plan, client).unwrap();
+
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Package/Client/Scripts/main.lua"
+                && mapping.target_relative_path.ends_with("/Scripts/main.lua")
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.source_path == "Package/Client/ClientPayload.pak"
+                && mapping.target_relative_path.ends_with("/ClientPayload.pak")
+        }));
+        assert!(plan
+            .mappings
+            .iter()
+            .any(|mapping| mapping.target_relative_path.ends_with("/enabled.txt")));
+        assert!(plan
+            .mappings
+            .iter()
+            .all(|mapping| !mapping.source_path.contains("/Server/")));
+        assert!(plan
+            .mappings
+            .iter()
+            .all(|mapping| !mapping.target_relative_path.contains("WindowsServer")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_prose_cannot_reclassify_a_canonical_server_path_as_client() {
+        let store_root = temp_game_dir("provider-scope-authority");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join(client_route)).unwrap();
+        fs::create_dir_all(game_root.join(server_route)).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let document = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/ambiguous-scope".to_string(),
+            mod_name: "Ambiguous Scope".to_string(),
+            text: format!("Single player and local server users should install to {server_route}."),
+        };
+        let plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Canonical client and server routes.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client route.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Server route.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        let described = provider_install_target_options(&store_root, &profile, &document);
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].scope, "client");
+        let canonical =
+            provider_plan_install_target_options(&store_root, &profile, &document, &plan);
+        assert_eq!(
+            canonical
+                .iter()
+                .find(|target| target.relative_path == server_route)
+                .unwrap()
+                .scope,
+            "hosted-server"
+        );
+        let mut server_only_plan = plan.clone();
+        server_only_plan
+            .mappings
+            .retain(|mapping| mapping.target_relative_path.contains("WindowsServer"));
+        let fallback = provider_plan_install_target_options(
+            &store_root,
+            &profile,
+            &document,
+            &server_only_plan,
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].scope, "hosted-server");
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn sole_provider_described_server_route_is_selected_automatically() {
+        let store_root = temp_game_dir("provider-server-only-selection");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join(client_route)).unwrap();
+        fs::create_dir_all(game_root.join(server_route)).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let document = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/server-only".to_string(),
+            mod_name: "Hosted Server Tools".to_string(),
+            text: format!("For multiplayer, install to {server_route}."),
+        };
+        let plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Canonical client and server routes.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client route.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Server route.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let options = provider_plan_install_target_options(&store_root, &profile, &document, &plan);
+
+        let selected =
+            provider_selected_install_target_id(&store_root, &profile, &document, &options, None)
+                .unwrap();
+        assert_eq!(
+            options
+                .iter()
+                .find(|target| target.id == selected)
+                .unwrap()
+                .scope,
+            "hosted-server"
+        );
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn provider_preflight_target_ids_resolve_to_canonical_plan_targets() {
+        let store_root = temp_game_dir("provider-target-id-store");
+        let game_root = store_root.join("game");
+        let client_mods = "R5/Binaries/Win64/ue4ss/Mods";
+        let server_mods = "R5/Builds/WindowsServer/R5/Binaries/Win64/ue4ss/Mods";
+        fs::create_dir_all(game_root.join(client_mods)).unwrap();
+        fs::create_dir_all(game_root.join(server_mods)).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        let document = ProviderRouteDocument {
+            provider: "Nexus Mods".to_string(),
+            mod_id: "nexus:windrose/1".to_string(),
+            mod_name: "Example".to_string(),
+            text: format!(
+                "For single player install to {client_mods}.\nFor a local server install to {server_mods}."
+            ),
+        };
+        let plan = InstallPlan {
+            adapter_id: "ue4ss".to_string(),
+            adapter_name: "UE4SS".to_string(),
+            confidence: 1.0,
+            summary: "Alternative client and server routes.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Scripts/main.lua",
+                    "game",
+                    &format!("{client_mods}/Example/Scripts/main.lua"),
+                    "Client route.",
+                ),
+                mapping(
+                    "Scripts/main.lua",
+                    "game",
+                    &format!("{server_mods}/Example/Scripts/main.lua"),
+                    "Server route.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let preflight = provider_install_target_options(&store_root, &profile, &document);
+        let requested = preflight
+            .iter()
+            .find(|target| target.scope == "client")
+            .unwrap();
+        let canonical =
+            provider_plan_install_target_options(&store_root, &profile, &document, &plan);
+        let resolved = provider_selected_install_target_id(
+            &store_root,
+            &profile,
+            &document,
+            &canonical,
+            Some(&requested.id),
+        )
+        .unwrap();
+
+        assert_ne!(resolved, requested.id);
+        assert_eq!(
+            canonical
+                .iter()
+                .find(|target| target.id == resolved)
+                .unwrap()
+                .scope,
+            "client"
+        );
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn multi_target_install_defaults_to_client_and_can_switch_to_server() {
+        let store_root = temp_game_dir("target-switch-store");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(game_root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let source = store_root.join("Example.zip");
+        let output = File::create(&source).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "Example.pak", b"target-aware pak").unwrap();
+        zip.finish().unwrap();
+        let full_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Install a target-aware pak.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client route.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Hosted server route.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+
+        let installed = install_archive_impl(
+            &store_root,
+            &profile,
+            source.to_string_lossy().as_ref(),
+            Some("Example.zip"),
+            None,
+            &full_plan,
+        )
+        .unwrap();
+        let client_file = game_root.join(client_route).join("Example.pak");
+        let server_file = game_root.join(server_route).join("Example.pak");
+        assert!(client_file.is_file());
+        assert!(!server_file.exists());
+        let record = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        assert_eq!(record.install_targets.len(), 2);
+        assert_eq!(
+            record.install_target_plan.as_ref().unwrap().mappings.len(),
+            2
+        );
+        assert_eq!(record.plan.as_ref().unwrap().mappings.len(), 1);
+        let server_target = record
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "hosted-server")
+            .unwrap()
+            .id
+            .clone();
+
+        set_mod_install_target_impl(
+            &store_root,
+            &profile,
+            &installed.installed_mod_id,
+            &server_target,
+        )
+        .unwrap();
+
+        assert!(!client_file.exists());
+        assert_eq!(fs::read(&server_file).unwrap(), b"target-aware pak");
+        let switched = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        assert_eq!(
+            switched.selected_install_target_id.as_deref(),
+            Some(server_target.as_str())
+        );
+        assert_eq!(switched.plan.as_ref().unwrap().mappings.len(), 1);
+
+        fs::write(&switched.archive_path, b"tampered managed package").unwrap();
+        let client_target = switched
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "client")
+            .unwrap()
+            .id
+            .clone();
+        let error = set_mod_install_target_impl(
+            &store_root,
+            &profile,
+            &installed.installed_mod_id,
+            &client_target,
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after installation"));
+        assert!(server_file.is_file());
+        assert!(!client_file.exists());
+
+        fs::copy(&source, &switched.archive_path).unwrap();
+        deactivate_mod_files(&store_root, &profile, &switched).unwrap();
+        let mut disabled = switched.clone();
+        disabled.enabled = false;
+        disabled.last_status = "disabled".to_string();
+        commit_installed_mod_records(&store_root, &profile, std::slice::from_ref(&disabled), &[])
+            .unwrap();
+        set_mod_install_target_impl(
+            &store_root,
+            &profile,
+            &installed.installed_mod_id,
+            &client_target,
+        )
+        .unwrap();
+        assert!(!server_file.exists());
+        assert!(!client_file.exists());
+        let disabled = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(
+            disabled.selected_install_target_id.as_deref(),
+            Some(client_target.as_str())
+        );
+        let _ = fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn target_switch_preserves_edited_config_and_recovers_a_predeployment_crash() {
+        let store_root = temp_game_dir("target-switch-config-recovery");
+        let game_root = store_root.join("game");
+        let client_route = "R5/Content/Paks/~mods";
+        let server_route = "R5/Builds/WindowsServer/R5/Content/Paks/~mods";
+        fs::create_dir_all(game_root.join("R5/Content/Paks")).unwrap();
+        fs::create_dir_all(game_root.join("R5/Builds/WindowsServer/R5/Content/Paks")).unwrap();
+        let mut profile = test_profile("windrose", "Windrose", "unreal", "ue4ss");
+        profile.game_path = game_root.to_string_lossy().to_string();
+        write_store(
+            &profiles_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![profile.clone()],
+            },
+        )
+        .unwrap();
+
+        let source = store_root.join("Configurable.zip");
+        let output = File::create(&source).unwrap();
+        let mut zip = ZipWriter::new(output);
+        add_bytes_to_zip(&mut zip, "Example.pak", b"pak").unwrap();
+        add_bytes_to_zip(&mut zip, "Example.ini", b"value=default\n").unwrap();
+        zip.finish().unwrap();
+        let full_plan = InstallPlan {
+            adapter_id: "unreal-pak".to_string(),
+            adapter_name: "Unreal Pak Files".to_string(),
+            confidence: 1.0,
+            summary: "Configurable target fixture.".to_string(),
+            mappings: vec![
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{client_route}/Example.pak"),
+                    "Client payload.",
+                ),
+                mapping(
+                    "Example.ini",
+                    "game",
+                    &format!("{client_route}/Example.ini"),
+                    "Client config.",
+                ),
+                mapping(
+                    "Example.pak",
+                    "game",
+                    &format!("{server_route}/Example.pak"),
+                    "Server payload.",
+                ),
+                mapping(
+                    "Example.ini",
+                    "game",
+                    &format!("{server_route}/Example.ini"),
+                    "Server config.",
+                ),
+            ],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        };
+        let installed = install_archive_impl(
+            &store_root,
+            &profile,
+            source.to_string_lossy().as_ref(),
+            Some("Configurable.zip"),
+            None,
+            &full_plan,
+        )
+        .unwrap();
+        let client_config = game_root.join(client_route).join("Example.ini");
+        let server_config = game_root.join(server_route).join("Example.ini");
+        fs::write(&client_config, b"value=user\n").unwrap();
+        let original = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == installed.installed_mod_id)
+            .unwrap();
+        let server_target = original
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "hosted-server")
+            .unwrap()
+            .id
+            .clone();
+
+        set_mod_install_target_impl(&store_root, &profile, &original.id, &server_target).unwrap();
+        assert!(!client_config.exists());
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        let switched = read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|record| record.id == original.id)
+            .unwrap();
+        assert_eq!(switched.config_files.len(), 1);
+        assert_eq!(
+            PathBuf::from(&switched.config_files[0]),
+            server_config,
+            "target-switch config ownership should move to the selected route"
+        );
+        assert!(!target_switch_transactions_dir(&store_root).exists());
+
+        let snapshots = snapshot_record_configs(&profile, &switched).unwrap();
+        let client_target = switched
+            .install_targets
+            .iter()
+            .find(|target| target.scope == "client")
+            .unwrap();
+        let journal_root = begin_target_switch_journal(
+            &store_root,
+            &profile,
+            &switched,
+            &client_target.id,
+            &snapshots,
+        )
+        .unwrap();
+        deactivate_mod_files_with_policy(
+            &store_root,
+            &profile,
+            &switched,
+            ModifiedFilePolicy::AllowConfigChanges,
+        )
+        .unwrap();
+        let journal_id = journal_root.file_name().unwrap().to_string_lossy();
+        let rotation_root =
+            target_switch_backup_rotation_root(&store_root, &profile.id, &journal_id);
+        let _rotation =
+            InstallTargetBackupRotation::begin(&store_root, &profile, &switched.id, rotation_root)
+                .unwrap();
+
+        recover_target_switch_transactions(&store_root).unwrap();
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        assert!(!client_config.exists());
+        assert!(!target_switch_transactions_dir(&store_root).exists());
+
+        let mut mods_off_profile = profile.clone();
+        mods_off_profile.mods_enabled = false;
+        let error = set_mod_install_target_impl(
+            &store_root,
+            &mods_off_profile,
+            &switched.id,
+            &client_target.id,
+        )
+        .unwrap_err();
+        assert!(error.contains("Turn Mods ON"));
+        assert_eq!(fs::read(&server_config).unwrap(), b"value=user\n");
+        let _ = fs::remove_dir_all(store_root);
+    }
+
     fn test_installed_record(
         profile_id: &str,
         id: &str,
@@ -29266,6 +38603,8 @@ mod tests {
             package_id: package_id.map(str::to_string),
             package_provider: Some("test".to_string()),
             package_version: Some("1.0.0".to_string()),
+            provider_file_id: None,
+            provider_variant: None,
             source_archive_sha256: None,
             dependency_string: None,
             icon_url: None,
@@ -29286,7 +38625,50 @@ mod tests {
                 "disabled".to_string()
             },
             plan: None,
+            install_target_plan: None,
+            install_targets: Vec::new(),
+            selected_install_target_id: None,
         }
+    }
+
+    fn test_install_target(
+        adapter_id: &str,
+        relative_path: &str,
+        scope: &str,
+    ) -> InstallTargetOption {
+        InstallTargetOption {
+            id: install_route_key(adapter_id, relative_path),
+            label: format!("{scope} ({relative_path})"),
+            relative_path: relative_path.to_string(),
+            scope: scope.to_string(),
+            recommended: matches!(scope, "client" | "general"),
+        }
+    }
+
+    fn with_test_install_target(
+        mut record: InstalledModRecord,
+        target: &InstallTargetOption,
+        target_file: &str,
+    ) -> InstalledModRecord {
+        record.adapter_id = "bepinex".to_string();
+        record.plan = Some(InstallPlan {
+            adapter_id: "bepinex".to_string(),
+            adapter_name: "BepInEx".to_string(),
+            confidence: 1.0,
+            summary: String::new(),
+            mappings: vec![mapping(
+                &basename(target_file),
+                "game",
+                target_file,
+                "Target-family test fixture.",
+            )],
+            dependencies: Vec::new(),
+            warnings: Vec::new(),
+            requires_confirmation: false,
+        });
+        record.install_targets = vec![target.clone()];
+        record.selected_install_target_id = Some(target.id.clone());
+        record
     }
 
     fn thunderstore_package_fixture(
@@ -29334,6 +38716,24 @@ mod tests {
             }],
             manifest: None,
             package_identity: identity,
+        }
+    }
+
+    fn scanned_package_files(relative_paths: &[&str]) -> ScannedArchive {
+        ScannedArchive {
+            archive_path: "C:/Downloads/ScopedPackage.zip".to_string(),
+            archive_name: "ScopedPackage.zip".to_string(),
+            entries: relative_paths
+                .iter()
+                .map(|path| ArchiveEntry {
+                    path: (*path).to_string(),
+                    logical_path: (*path).to_string(),
+                    size: 1,
+                    is_directory: false,
+                })
+                .collect(),
+            manifest: None,
+            package_identity: None,
         }
     }
 

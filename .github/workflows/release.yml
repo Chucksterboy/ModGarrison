@@ -57,10 +57,13 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Detects supported foundation runtimes from provider mod requirements during profile creation and Refresh, including UE4SS for The Mound: Omen of Cthulhu.
-            - Bypasses stale positive and negative provider caches on explicit Refresh while rejecting runtimes outside a known game's supported adapters.
-            - Replaces the cosmetic footer status with a real, read-only four-state core health check and Starfold-style ECG control.
-            - Runs health checks after startup, on click, once per visible minute, and when the application returns to the foreground.
+            - Detects Client, Hosted Server, and Dedicated Server archive layouts and exposes a per-mod install-target selector when a package offers real alternatives.
+            - Installs runtimes and nested Nexus, Thunderstore, GitHub release, and BepInBuilds dependencies into the same exact game-root family as the parent mod.
+            - Hardens BepInEx, UE4SS, REFramework, Unreal pak, and native-script routing by verifying archive contents before using provider installation instructions.
+            - Preserves selected provider variants and user-edited configuration files across updates, target switches, disable/enable cycles, and runtime repairs.
+            - Adds atomic recovery for installs, replacements, dependency graphs, target switches, profile imports, runtime cleanup, disable, and removal operations.
+            - Fails closed on ambiguous routes, incomplete companion files, unsafe collisions, missing backups, and tampered recovery data.
+            - Adds explicit RuneScape: Dragonwilds Steam and Nexus mapping while keeping unknown-game detection evidence-based.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
             - Existing profiles, settings, Nexus credentials, portable profile bundles, and installation upgrades remain compatible.
           releaseDraft: true

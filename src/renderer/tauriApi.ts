@@ -247,6 +247,16 @@ export const desktopApi: DesktopApi = {
     invoke<ModActionResult>("disable_mod", { profileId, installedModId }),
   enableMod: (profileId: string, installedModId: string) =>
     invoke<ModActionResult>("enable_mod", { profileId, installedModId }),
+  setModInstallTarget: (
+    profileId: string,
+    installedModId: string,
+    installTargetId: string
+  ) =>
+    invoke<ModActionResult>("set_mod_install_target", {
+      profileId,
+      installedModId,
+      installTargetId
+    }),
   removeMod: (profileId: string, installedModId: string, forceForgetModified = false) =>
     invoke<ModActionResult>("remove_mod", {
       profileId,

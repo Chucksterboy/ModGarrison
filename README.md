@@ -10,9 +10,11 @@ Mod Garrison is a desktop mod manager prototype built around a practical univers
 
 - One app and profile system.
 - Per-game install adapters.
+- Automatic Client, Hosted Server, and Dedicated Server route detection with a per-mod target selector when an archive contains real alternatives.
 - Dependency planning before files are written.
-- Automatic runtime dependency downloads from official providers.
-- Safe installs with backups and uninstall records.
+- Automatic runtime and nested dependency downloads from official providers into the same verified game-root family as the parent mod.
+- Transactional installs, updates, target switches, disable/remove operations, runtime repairs, and profile imports with crash recovery.
+- Fail-closed archive planning for ambiguous routes, incomplete companion files, collisions, and missing or tampered recovery data.
 - Tauri shell with a React frontend and Rust backend commands.
 - Managed per-profile package copies so mods can be disabled and re-enabled even if the original download is removed.
 - Data-driven game definitions for known game IDs, runtime overrides, and config roots.

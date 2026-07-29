@@ -1,6 +1,18 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GameProfile } from "../shared/contracts";
+import type {
+  GameProfile,
+  InstalledModRecord,
+  OnlineModFileOption,
+  OnlineModRecord
+} from "../shared/contracts";
 import { DiscoverView } from "./App";
 
 const profile: GameProfile = {
@@ -16,6 +28,65 @@ const profile: GameProfile = {
   createdAt: "2026-07-28T00:00:00Z",
   updatedAt: "2026-07-28T00:00:00Z"
 };
+
+const onlineMod: OnlineModRecord = {
+  id: "nexus:windrose/42",
+  provider: "nexus",
+  providerLabel: "Nexus Mods",
+  name: "Server Tools",
+  owner: "Example Author",
+  version: "2.0.0",
+  description: "Client and server variants.",
+  categories: [],
+  downloads: 42,
+  ratingScore: 5,
+  dependencyCount: 0,
+  installed: true,
+  installSupported: true
+};
+
+const installedMod: InstalledModRecord = {
+  id: "installed-server-tools",
+  profileId: profile.id,
+  archivePath: "D:/Mods/server-tools.zip",
+  archiveName: "server-tools.zip",
+  displayName: "Server Tools",
+  packageId: onlineMod.id,
+  providerFileId: "server-old",
+  providerVariant: "Dedicated Server",
+  adapterId: "ue4ss",
+  summary: "Server tools",
+  installedAt: "2026-07-28T00:00:00Z",
+  filesWritten: [],
+  backupsWritten: [],
+  dependencies: [],
+  configFiles: [],
+  externallyManaged: false,
+  enabled: true,
+  lastStatus: "installed",
+  installTargets: []
+};
+
+const onlineFiles: OnlineModFileOption[] = [
+  {
+    id: "server-new",
+    name: "Dedicated Server",
+    primary: false,
+    action: "direct"
+  },
+  {
+    id: "client-new",
+    name: "Client",
+    primary: true,
+    action: "direct"
+  },
+  {
+    id: "server-old",
+    name: "Dedicated Server",
+    primary: false,
+    action: "direct"
+  }
+];
 
 function renderDiscover(
   onLoad: ReturnType<typeof vi.fn>,
@@ -102,5 +173,58 @@ describe("Discover refresh behavior", () => {
     expect(
       screen.queryByText("No online provider results were found for this profile.")
     ).toBeNull();
+  });
+});
+
+describe("Discover provider updates", () => {
+  it("adopts the installed variant if installed state arrives after file loading", async () => {
+    const onLoad = vi.fn().mockResolvedValue(true);
+    const onLoadFiles = vi.fn().mockResolvedValue(onlineFiles);
+    const sharedProps = {
+      hasLoaded: true,
+      installCompletionId: 0,
+      installingModId: "",
+      isLoadingInstalledMods: false,
+      isLoading: false,
+      mods: [onlineMod],
+      modPresentations: {},
+      removingModId: "",
+      total: 1,
+      providerWarning: "",
+      profiles: [profile],
+      selectedProfileId: profile.id,
+      onInstall: () => undefined,
+      onLoadFiles,
+      onNeedsAuth: () => undefined,
+      onOpenPage: () => undefined,
+      onLoad,
+      onRemoveInstalledMod: () => undefined,
+      onSelectProfile: () => undefined
+    };
+    const rendered = render(
+      <DiscoverView {...sharedProps} installedMods={[]} />
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show details for Server Tools"
+      })
+    );
+    const client = (await screen.findByRole("radio", {
+      name: /Client/
+    })) as HTMLInputElement;
+    expect(client.checked).toBe(true);
+
+    rendered.rerender(
+      <DiscoverView {...sharedProps} installedMods={[installedMod]} />
+    );
+
+    await waitFor(() => {
+      const serverOptions = screen.getAllByRole("radio", {
+        name: /Dedicated Server/
+      }) as HTMLInputElement[];
+      expect(serverOptions[0].checked).toBe(true);
+      expect(serverOptions[1].checked).toBe(false);
+    });
   });
 });

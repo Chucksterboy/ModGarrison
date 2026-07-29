@@ -5602,6 +5602,64 @@ body {
   white-space: nowrap;
 }
 
+.vault-mod-target-picker {
+  display: grid;
+  min-width: 0;
+  min-height: 22px;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  border: 1px solid rgba(213, 166, 77, 0.24);
+  border-radius: 3px;
+  padding: 2px 5px;
+  background: rgba(5, 9, 10, 0.72);
+  color: #d4ad62;
+}
+
+.vault-mod-target-picker:focus-within {
+  border-color: rgba(232, 190, 105, 0.68);
+  box-shadow: 0 0 0 1px rgba(213, 166, 77, 0.12);
+}
+
+.vault-mod-target-picker > span {
+  color: #837456;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.vault-mod-target-picker select {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #d9d6cc;
+  cursor: pointer;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.vault-mod-target-picker select option {
+  background: #111719;
+  color: #e9e6df;
+}
+
+.vault-mod-target-picker.changing,
+.vault-mod-target-picker:has(select:disabled) {
+  border-color: rgba(103, 179, 151, 0.3);
+  color: #71c9a1;
+  cursor: wait;
+}
+
+.vault-mod-target-picker select:disabled {
+  color: #86938c;
+  cursor: wait;
+}
+
 .vault-mod-toggle {
   position: relative;
   display: flex;
@@ -5692,6 +5750,14 @@ body {
   border-color: rgba(232, 190, 105, 0.62);
   background: rgba(213, 166, 77, 0.1);
   color: #f0d195;
+}
+
+.vault-mod-actions button:disabled,
+.vault-mod-actions button:disabled:hover {
+  border-color: rgba(213, 166, 77, 0.12);
+  background: rgba(255, 255, 255, 0.015);
+  color: #666b66;
+  cursor: wait;
 }
 
 .vault-mod-actions .vault-mod-remove:hover {
@@ -5825,7 +5891,8 @@ body {
   color: #d6ad61;
 }
 
-.vault-mod-target:first-child {
+.vault-mod-target.selected,
+.vault-mod-target.legacy:first-child {
   border-color: rgba(82, 167, 210, 0.48);
   background: rgba(25, 80, 107, 0.16);
   color: #69b9df;
