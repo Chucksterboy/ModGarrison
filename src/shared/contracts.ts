@@ -36,6 +36,8 @@ export type DependencyProvider =
   | "curseforge"
   | "overwolf"
   | "modio"
+  | "gamebanana"
+  | "steam-workshop"
   | "known-runtime"
   | "manual";
 
@@ -143,7 +145,14 @@ export interface InstallPlan {
   requiresConfirmation: boolean;
 }
 
-export type PackageProvider = "thunderstore" | "nexus" | "curseforge" | "unknown";
+export type PackageProvider =
+  | "thunderstore"
+  | "nexus"
+  | "curseforge"
+  | "gamebanana"
+  | "steam-workshop"
+  | "modio"
+  | "unknown";
 
 export interface PackageIdentity {
   provider: PackageProvider;
@@ -274,6 +283,8 @@ export interface AppSettings {
   minimizeToTrayOnClose: boolean;
   nexusApiKey?: string;
   nexusApiKeyConfigured: boolean;
+  modioApiKey?: string;
+  modioApiKeyConfigured: boolean;
 }
 
 export type AppUpdateStatus = "up-to-date" | "available" | "unavailable" | "error";
@@ -291,7 +302,23 @@ export interface AppUpdateInfo {
   message: string;
 }
 
-export type OnlineModProvider = "thunderstore" | "nexus";
+export type OnlineModProvider =
+  | "thunderstore"
+  | "nexus"
+  | "gamebanana"
+  | "steam-workshop"
+  | "modio";
+
+export interface OnlineModProviderOption {
+  id: OnlineModProvider;
+  label: string;
+  /**
+   * Number of provider records already verified as regular mods.
+   * Consumers should use this as an availability signal; providers whose
+   * catalogues are paginated may discover additional records lazily.
+   */
+  modCount: number;
+}
 
 export type OnlineModFileAction = "direct" | "browser" | "auth" | "unsupported";
 
@@ -342,10 +369,14 @@ export interface OnlineModRecord {
 export interface DiscoveryPage {
   items: OnlineModRecord[];
   total: number;
+  indexed: number;
+  complete: boolean;
+  totalIsExact: boolean;
   page: number;
   pageSize: number;
   hasMore: boolean;
   providerWarnings: string[];
+  availableProviders: OnlineModProviderOption[];
 }
 
 export interface ModActionResult {
@@ -466,6 +497,7 @@ export interface DesktopApi {
   getAppSettings(): Promise<AppSettings>;
   updateAppSettings(input: AppSettings): Promise<AppSettings>;
   saveNexusApiKey(apiKey: string): Promise<AppSettings>;
+  saveModioApiKey(apiKey: string): Promise<AppSettings>;
   systemHealth(profileId?: string): Promise<GarrisonCoreHealth>;
   checkAppUpdate(): Promise<AppUpdateInfo>;
   minimizeWindow(): Promise<void>;
@@ -516,8 +548,11 @@ export interface DesktopApi {
     sort: "downloads" | "newest" | "oldest",
     query: string,
     requestId: number,
-    forceRefresh: boolean
+    forceRefresh: boolean,
+    provider: OnlineModProvider | undefined,
+    warmCache: boolean
   ): Promise<DiscoveryPage>;
+  cancelOnlineModDiscovery(profileId: string, requestId: number): Promise<void>;
   listDiscoveredModFiles(
     profileId: string,
     mod: OnlineModRecord

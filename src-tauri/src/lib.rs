@@ -1,4 +1,7 @@
+mod gamebanana;
+mod modio;
 mod operation;
+mod steam_workshop;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -58,8 +61,10 @@ const NEXUS_DISCOVERY_PAGE_SIZE: usize = 40;
 const NEXUS_PENDING_DOWNLOAD_TTL_MINUTES: i64 = 30;
 const MAX_DISCOVERY_PAGE_SIZE: usize = 50;
 const DISCOVERY_PROVIDER_CACHE_MINUTES: u64 = 30;
-const DISCOVERY_PROVIDER_CACHE_MAX_RECORDS: usize = 2_500;
-const DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES: usize = 64;
+const DISCOVERY_PROVIDER_CACHE_MAX_RECORDS: usize = 5_000;
+const DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES: usize = 24;
+const DISCOVERY_PROVIDER_CACHE_MAX_TOTAL_RECORDS: usize = 20_000;
+const DISCOVERY_WARM_BATCH_SIZE: usize = 300;
 const DISCOVERY_CANCELLED_ERROR: &str = "Discovery request was superseded.";
 const FORCE_REMOVAL_REQUIRED_PREFIX: &str = "MOD_GARRISON_FORCE_REMOVAL_REQUIRED:";
 const THUNDERSTORE_CACHE_MAX_ENTRIES: usize = 32;
@@ -106,6 +111,8 @@ const DEPENDENCY_PROVIDER_DEFINITIONS_JSON: &str =
 const NEXUS_KEYRING_SERVICE: &str = "Mod Garrison";
 const LEGACY_NEXUS_KEYRING_SERVICE: &str = "UniLoader";
 const NEXUS_KEYRING_USER: &str = "nexus-api-key";
+const MODIO_KEYRING_SERVICE: &str = "Mod Garrison";
+const MODIO_KEYRING_USER: &str = "modio-api-key";
 const LEGACY_APP_IDENTIFIER: &str = "com.uniloader.desktop";
 
 static STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -198,6 +205,13 @@ struct DiscoveryProviderBatch {
     complete: bool,
 }
 
+#[derive(Debug)]
+struct DiscoveryProviderSnapshotOutcome {
+    snapshot: Option<DiscoveryProviderCacheEntry>,
+    error: Option<String>,
+    extension_failed: bool,
+}
+
 struct NexusDiscoveryFetch<'a> {
     start_offset: usize,
     max_new_results: usize,
@@ -225,6 +239,8 @@ struct DiscoveryQuery<'a> {
     query: &'a str,
     request_id: u64,
     force_refresh: bool,
+    provider: Option<&'a str>,
+    warm_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -744,14 +760,27 @@ pub struct OnlineModFileOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OnlineModProviderOption {
+    id: String,
+    label: String,
+    mod_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoveryPage {
     items: Vec<OnlineModRecord>,
     total: usize,
+    indexed: usize,
+    complete: bool,
+    total_is_exact: bool,
     page: usize,
     page_size: usize,
     has_more: bool,
     #[serde(default)]
     provider_warnings: Vec<String>,
+    #[serde(default)]
+    available_providers: Vec<OnlineModProviderOption>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1230,7 +1259,7 @@ impl ProfileBundleExportOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default)]
@@ -1239,6 +1268,21 @@ pub struct AppSettings {
     nexus_api_key: String,
     #[serde(default)]
     nexus_api_key_configured: bool,
+    #[serde(default, skip_serializing)]
+    modio_api_key: String,
+    #[serde(default)]
+    modio_api_key_configured: bool,
+}
+
+impl std::fmt::Debug for AppSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppSettings")
+            .field("minimize_to_tray_on_close", &self.minimize_to_tray_on_close)
+            .field("nexus_api_key_configured", &self.nexus_api_key_configured)
+            .field("modio_api_key_configured", &self.modio_api_key_configured)
+            .finish()
+    }
 }
 
 impl AppSettings {
@@ -1253,6 +1297,19 @@ impl AppSettings {
 
     fn nexus_api_ready(&self) -> bool {
         self.nexus_api_key().is_some()
+    }
+
+    fn modio_api_key(&self) -> Option<&str> {
+        let trimmed = self.modio_api_key.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    fn modio_api_ready(&self) -> bool {
+        self.modio_api_key().is_some()
     }
 }
 
@@ -1472,7 +1529,9 @@ struct ScannedArchive {
 fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
     let mut settings = read_app_settings(&store_root(&app)?)?;
     settings.nexus_api_key_configured = settings.nexus_api_ready();
+    settings.modio_api_key_configured = settings.modio_api_ready();
     settings.nexus_api_key.clear();
+    settings.modio_api_key.clear();
     Ok(settings)
 }
 
@@ -1486,7 +1545,9 @@ fn update_app_settings(app: AppHandle, input: AppSettings) -> Result<AppSettings
 
     let mut saved = input;
     saved.nexus_api_key.clear();
+    saved.modio_api_key.clear();
     saved.nexus_api_key_configured = read_nexus_api_key()?.is_some();
+    saved.modio_api_key_configured = read_modio_api_key()?.is_some();
     write_app_settings(&root, &saved)?;
     Ok(saved)
 }
@@ -1521,7 +1582,46 @@ fn save_nexus_api_key_impl(app: AppHandle, api_key: String) -> Result<AppSetting
 
     let mut settings = read_app_settings(&root)?;
     settings.nexus_api_key.clear();
+    settings.modio_api_key.clear();
     settings.nexus_api_key_configured = stored_key.is_some();
+    settings.modio_api_key_configured = read_modio_api_key()?.is_some();
+    write_app_settings(&root, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn save_modio_api_key(app: AppHandle, api_key: String) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_modio_api_key_impl(app, api_key))
+        .await
+        .map_err(error_to_string)?
+}
+
+fn save_modio_api_key_impl(app: AppHandle, api_key: String) -> Result<AppSettings, String> {
+    let trimmed = api_key.trim().to_string();
+    if !trimmed.is_empty() {
+        modio::validate_api_key(&trimmed)?;
+    }
+
+    let _operation = lock_mutations()?;
+    let root = store_root(&app)?;
+    write_modio_api_key_override(if trimmed.is_empty() {
+        None
+    } else {
+        Some(&trimmed)
+    })?;
+    let stored_override = read_modio_api_key_override()?;
+    if stored_override.as_deref() != (!trimmed.is_empty()).then_some(trimmed.as_str()) {
+        return Err(
+            "Windows Credential Manager did not retain the mod.io API key. Please try saving it again."
+                .to_string(),
+        );
+    }
+
+    let mut settings = read_app_settings(&root)?;
+    settings.nexus_api_key.clear();
+    settings.modio_api_key.clear();
+    settings.nexus_api_key_configured = read_nexus_api_key()?.is_some();
+    settings.modio_api_key_configured = read_modio_api_key()?.is_some();
     write_app_settings(&root, &settings)?;
     Ok(settings)
 }
@@ -5763,6 +5863,8 @@ async fn discover_online_mods(
     query: String,
     request_id: u64,
     force_refresh: bool,
+    provider: Option<String>,
+    warm_cache: bool,
 ) -> Result<DiscoveryPage, String> {
     operation::begin_discovery(&profile_id, request_id)?;
     let operation_profile_id = profile_id.clone();
@@ -5790,11 +5892,18 @@ async fn discover_online_mods(
                     query: &query,
                     request_id,
                     force_refresh,
+                    provider: provider.as_deref(),
+                    warm_cache,
                 },
             )
         },
     )
     .await
+}
+
+#[tauri::command]
+fn cancel_online_mod_discovery(profile_id: String, request_id: u64) -> Result<(), String> {
+    operation::begin_discovery(&profile_id, request_id)
 }
 
 #[tauri::command]
@@ -5848,6 +5957,35 @@ async fn install_discovered_mod(
                     provider_game_id.as_deref(),
                     selected_file_id.as_deref(),
                     install_target_id.as_deref(),
+                ),
+                "gamebanana" => gamebanana::install(
+                    &root,
+                    &profile,
+                    &mod_id,
+                    version,
+                    provider_game_id.as_deref(),
+                    selected_file_id.as_deref(),
+                    install_target_id.as_deref(),
+                ),
+                "modio" => {
+                    let api_key = settings.modio_api_key().ok_or_else(|| {
+                        "A mod.io application key is not configured in this Mod Garrison build or in Settings."
+                            .to_string()
+                    })?;
+                    modio::install(
+                        &root,
+                        &profile,
+                        api_key,
+                        &mod_id,
+                        version,
+                        provider_game_id.as_deref(),
+                        selected_file_id.as_deref(),
+                        install_target_id.as_deref(),
+                    )
+                }
+                "steam-workshop" => Err(
+                    "Steam Workshop content is managed by Steam. Mod Garrison will not install, move, replace, or remove it."
+                        .to_string(),
                 ),
                 _ => Err(format!(
                     "{} discovery install is not supported in this build.",
@@ -6593,7 +6731,26 @@ async fn preflight_discovered_mod_install(
                     provider_install_target_options(&root, &profile, &document),
                 )
             }
-            _ => (Vec::new(), Vec::new()),
+            "gamebanana" => gamebanana::preflight(&root, &profile, &mod_id)?,
+            "modio" => {
+                let api_key = settings.modio_api_key().ok_or_else(|| {
+                    "A mod.io application key is not configured in this Mod Garrison build or in Settings."
+                        .to_string()
+                })?;
+                modio::preflight(&root, &profile, api_key, &mod_id)?
+            }
+            "steam-workshop" => {
+                return Err(
+                    "Steam Workshop content is already managed by Steam and cannot be installed through Mod Garrison."
+                        .to_string(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "{} discovery preflight is not supported in this build.",
+                    provider_label(&provider)
+                ));
+            }
         };
         let dependencies = dependencies
             .into_iter()
@@ -9220,6 +9377,7 @@ pub fn run() {
             get_app_settings,
             update_app_settings,
             save_nexus_api_key,
+            save_modio_api_key,
             get_cached_steam_artwork,
             scan_steam_games,
             create_steam_profile,
@@ -9241,6 +9399,7 @@ pub fn run() {
             analyze_archive_for_profile,
             install_archive,
             discover_online_mods,
+            cancel_online_mod_discovery,
             list_discovered_mod_files,
             preflight_discovered_mod_install,
             install_discovered_mod,
@@ -13346,6 +13505,9 @@ fn provider_label(provider: &str) -> &str {
         "thunderstore" => "Thunderstore",
         "nexus" => "Nexus Mods",
         "curseforge" => "CurseForge",
+        "gamebanana" => "GameBanana",
+        "steam-workshop" => "Steam Workshop",
+        "modio" => "mod.io",
         _ => provider,
     }
 }
@@ -13785,101 +13947,346 @@ fn discover_online_mods_for_profile(
     let page_size = request.page_size.clamp(1, MAX_DISCOVERY_PAGE_SIZE);
     let offset = (page - 1).saturating_mul(page_size);
     let needed = offset.saturating_add(page_size);
+    let selected_provider = normalized_discovery_provider(request.provider)?;
+    let thunderstore_selected = selected_provider.is_none_or(|provider| provider == "thunderstore");
+    let nexus_selected = selected_provider.is_none_or(|provider| provider == "nexus");
+    let gamebanana_selected = selected_provider.is_none_or(|provider| provider == "gamebanana");
+    let steam_workshop_selected =
+        selected_provider.is_none_or(|provider| provider == "steam-workshop");
+    let modio_selected = selected_provider.is_none_or(|provider| provider == "modio");
+    let warm_batch_size = if selected_provider.is_some() {
+        DISCOVERY_WARM_BATCH_SIZE
+    } else {
+        (DISCOVERY_WARM_BATCH_SIZE / 3).max(page_size)
+    };
     let mut results = Vec::new();
     let mut provider_errors = Vec::new();
     let mut provider_warnings = Vec::new();
+    let mut available_providers = Vec::new();
     let mut provider_total = 0_usize;
+    let mut discovery_complete = true;
+    let mut total_is_exact = true;
     let normalized_query = request.query.trim().to_lowercase();
 
     ensure_discovery_is_current(&profile.id, request.request_id)?;
     if request.force_refresh {
-        clear_cached_provider_mapping("thunderstore", profile);
-        clear_cached_provider_mapping("nexus", profile);
-        clear_discovery_provider_cache_for_profile(&profile.id);
-    }
-
-    let thunderstore_community = thunderstore_community_for_profile(profile);
-    if request.force_refresh {
-        if let Some(community) = thunderstore_community.as_deref() {
-            clear_thunderstore_community_cache(community);
+        if thunderstore_selected {
+            clear_cached_provider_mapping("thunderstore", profile);
+            clear_discovery_provider_cache_for_provider(&profile.id, "thunderstore");
+        }
+        if nexus_selected {
+            clear_cached_provider_mapping("nexus", profile);
+            clear_discovery_provider_cache_for_provider(&profile.id, "nexus");
+        }
+        if gamebanana_selected {
+            clear_cached_provider_mapping("gamebanana", profile);
+            clear_discovery_provider_cache_for_provider(&profile.id, "gamebanana");
+        }
+        if modio_selected {
+            clear_cached_provider_mapping("modio", profile);
+            clear_discovery_provider_cache_for_provider(&profile.id, "modio");
         }
     }
+
+    let thunderstore_community = if thunderstore_selected {
+        if selected_provider.is_some() || request.warm_cache {
+            thunderstore_community_for_profile_with_refresh(profile, request.force_refresh)
+        } else {
+            let bundled = bundled_thunderstore_community_for_profile(profile);
+            if bundled.is_none() {
+                discovery_complete = false;
+                total_is_exact = false;
+            }
+            bundled
+        }
+    } else {
+        None
+    };
     if let Some(community) = thunderstore_community {
-        match discover_thunderstore_community_mods(store_root, profile, &community) {
-            Ok(mut records) => {
-                records.retain(|record| !is_external_mod_manager_listing(record));
-                if !normalized_query.is_empty() {
-                    records.retain(|record| online_mod_matches_query(record, &normalized_query));
-                }
-                provider_total = provider_total.saturating_add(records.len());
-                results.extend(records);
-            }
-            Err(error) => provider_errors.push(format!("Thunderstore: {error}")),
+        if request.force_refresh {
+            clear_thunderstore_community_cache(&community);
         }
-    }
-    ensure_discovery_is_current(&profile.id, request.request_id)?;
-
-    let nexus_resolution =
-        resolve_nexus_mapping_for_discovery(store_root, profile, request.force_refresh);
-    if let Some(warning) = nexus_resolution.warning {
-        provider_warnings.push(warning);
-    }
-    if let Some(mapping) = nexus_resolution.mapping {
-        let domain = mapping.provider_game_id;
-        let cache_key = format!(
-            "nexus:{}:{}:{}:{}",
-            profile.id,
-            domain.to_ascii_lowercase(),
-            request.sort.to_ascii_lowercase(),
-            normalized_query
+        let outcome = load_thunderstore_discovery_snapshot(
+            store_root,
+            profile,
+            &community,
+            request.sort,
+            &normalized_query,
+            needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS),
+            request.warm_cache,
+            warm_batch_size,
+            request.request_id,
         );
-        let fetch_count = needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS);
-        let mut snapshot = cached_discovery_provider_snapshot(&cache_key);
-        let needs_extension = snapshot
-            .as_ref()
-            .is_none_or(|entry| entry.records.len() < fetch_count && !entry.complete);
-        let mut extension_failed = false;
-
-        if needs_extension {
-            let start_offset = snapshot.as_ref().map_or(0, |entry| entry.next_offset);
-            let additional_records = fetch_count
-                .saturating_sub(snapshot.as_ref().map_or(0, |entry| entry.records.len()));
-            match discover_nexus_mods_for_profile(
-                profile,
-                &domain,
-                settings.nexus_api_ready(),
-                NexusDiscoveryFetch {
-                    start_offset,
-                    max_new_results: additional_records,
-                    sort: request.sort,
-                    query: &normalized_query,
-                    request_id: request.request_id,
-                },
-            ) {
-                Ok(batch) => {
-                    snapshot = Some(remember_discovery_provider_batch(&cache_key, batch));
-                }
-                Err(error) => {
-                    extension_failed = true;
-                    if snapshot.is_some() {
-                        provider_errors.push(format!(
-                            "Nexus Mods: {error} Showing the most recent verified catalogue snapshot."
-                        ));
-                    } else {
-                        provider_errors.push(format!("Nexus Mods: {error}"));
-                    }
-                }
-            }
+        let snapshot = outcome.snapshot;
+        if let Some(error) = outcome.error {
+            total_is_exact = false;
+            let message = if snapshot.is_some() {
+                format!(
+                    "Thunderstore: {error} Showing the most recent verified catalogue snapshot."
+                )
+            } else {
+                format!("Thunderstore: {error}")
+            };
+            provider_errors.push(message);
         }
-
         if let Some(snapshot) = snapshot {
-            let available_total = if extension_failed && !snapshot.complete {
+            if !snapshot.records.is_empty() {
+                available_providers.push(OnlineModProviderOption {
+                    id: "thunderstore".to_string(),
+                    label: "Thunderstore".to_string(),
+                    mod_count: snapshot.records.len(),
+                });
+            }
+            discovery_complete &= snapshot.complete
+                || snapshot.records.len() >= DISCOVERY_PROVIDER_CACHE_MAX_RECORDS
+                || outcome.extension_failed;
+            total_is_exact &= snapshot.complete && !outcome.extension_failed;
+            let available_total = if outcome.extension_failed && !snapshot.complete {
                 snapshot.records.len()
             } else {
                 snapshot.total
             };
             provider_total = provider_total.saturating_add(available_total);
             results.extend(snapshot.records);
+        }
+    }
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
+
+    if steam_workshop_selected {
+        match steam_workshop::discover_mods(profile, request.force_refresh) {
+            Ok(mut records) => {
+                if !records.is_empty() {
+                    available_providers.push(OnlineModProviderOption {
+                        id: "steam-workshop".to_string(),
+                        label: "Steam Workshop".to_string(),
+                        mod_count: records.len(),
+                    });
+                }
+                if !normalized_query.is_empty() {
+                    records.retain(|record| online_mod_matches_query(record, &normalized_query));
+                }
+                provider_total = provider_total.saturating_add(records.len());
+                results.extend(records);
+            }
+            Err(error) => {
+                total_is_exact = false;
+                provider_errors.push(format!("Steam Workshop: {error}"));
+            }
+        }
+    }
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
+
+    if nexus_selected {
+        let nexus_resolution = if selected_provider.is_some() || request.warm_cache {
+            resolve_nexus_mapping_for_discovery(store_root, profile, request.force_refresh)
+        } else {
+            known_nexus_mapping_for_discovery(store_root, profile)
+        };
+        if nexus_resolution.mapping.is_none() && selected_provider.is_none() && !request.warm_cache
+        {
+            discovery_complete = false;
+            total_is_exact = false;
+        }
+        if nexus_resolution.mapping.is_none() && nexus_resolution.warning.is_some() {
+            total_is_exact = false;
+        }
+        if let Some(warning) = nexus_resolution.warning {
+            provider_warnings.push(warning);
+        }
+        if let Some(mapping) = nexus_resolution.mapping {
+            let outcome = load_nexus_discovery_snapshot(
+                profile,
+                &mapping.provider_game_id,
+                settings.nexus_api_ready(),
+                request.sort,
+                &normalized_query,
+                needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS),
+                request.warm_cache,
+                warm_batch_size,
+                request.request_id,
+            );
+            let snapshot = outcome.snapshot;
+            if let Some(error) = outcome.error {
+                total_is_exact = false;
+                let message = if snapshot.is_some() {
+                    format!(
+                        "Nexus Mods: {error} Showing the most recent verified catalogue snapshot."
+                    )
+                } else {
+                    format!("Nexus Mods: {error}")
+                };
+                provider_errors.push(message);
+            }
+            if let Some(snapshot) = snapshot {
+                if !snapshot.records.is_empty() {
+                    available_providers.push(OnlineModProviderOption {
+                        id: "nexus".to_string(),
+                        label: "Nexus Mods".to_string(),
+                        // The verified prefix is an honest availability count
+                        // while runtime/tool filtering continues in the background.
+                        mod_count: snapshot.records.len(),
+                    });
+                }
+                discovery_complete &= snapshot.complete
+                    || snapshot.records.len() >= DISCOVERY_PROVIDER_CACHE_MAX_RECORDS
+                    || outcome.extension_failed;
+                total_is_exact &= snapshot.complete && !outcome.extension_failed;
+                let available_total = if outcome.extension_failed && !snapshot.complete {
+                    snapshot.records.len()
+                } else {
+                    snapshot.total
+                };
+                provider_total = provider_total.saturating_add(available_total);
+                results.extend(snapshot.records);
+            }
+        }
+    }
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
+
+    if modio_selected {
+        let api_key = settings.modio_api_key();
+        let modio_resolution = if let Some(api_key) = api_key {
+            if selected_provider.is_some() || request.warm_cache {
+                resolve_modio_mapping_for_discovery(
+                    store_root,
+                    profile,
+                    api_key,
+                    request.force_refresh,
+                )
+            } else {
+                known_persisted_provider_mapping(store_root, "modio", profile)
+            }
+        } else {
+            ProviderGameResolution {
+                mapping: None,
+                warning: None,
+            }
+        };
+        if modio_resolution.mapping.is_none()
+            && api_key.is_some()
+            && selected_provider.is_none()
+            && !request.warm_cache
+        {
+            discovery_complete = false;
+            total_is_exact = false;
+        }
+        if modio_resolution.mapping.is_none() && modio_resolution.warning.is_some() {
+            total_is_exact = false;
+        }
+        if let Some(warning) = modio_resolution.warning {
+            provider_warnings.push(warning);
+        }
+        if let (Some(api_key), Some(mapping)) = (api_key, modio_resolution.mapping) {
+            let game_id = mapping.provider_game_id;
+            let outcome = load_modio_discovery_snapshot(
+                store_root,
+                profile,
+                api_key,
+                &game_id,
+                request.sort,
+                &normalized_query,
+                needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS),
+                request.warm_cache,
+                warm_batch_size,
+                request.request_id,
+            );
+            let snapshot = outcome.snapshot;
+            if let Some(error) = outcome.error {
+                total_is_exact = false;
+                let message = if snapshot.is_some() {
+                    format!("mod.io: {error} Showing the most recent verified catalogue snapshot.")
+                } else {
+                    format!("mod.io: {error}")
+                };
+                provider_errors.push(message);
+            }
+            if let Some(snapshot) = snapshot {
+                if !snapshot.records.is_empty() {
+                    available_providers.push(OnlineModProviderOption {
+                        id: "modio".to_string(),
+                        label: "mod.io".to_string(),
+                        mod_count: snapshot.records.len(),
+                    });
+                }
+                discovery_complete &= snapshot.complete
+                    || snapshot.records.len() >= DISCOVERY_PROVIDER_CACHE_MAX_RECORDS
+                    || outcome.extension_failed;
+                total_is_exact &= snapshot.complete && !outcome.extension_failed;
+                let available_total = if outcome.extension_failed && !snapshot.complete {
+                    snapshot.records.len()
+                } else {
+                    snapshot.total
+                };
+                provider_total = provider_total.saturating_add(available_total);
+                results.extend(snapshot.records);
+            }
+        }
+    }
+    ensure_discovery_is_current(&profile.id, request.request_id)?;
+
+    if gamebanana_selected {
+        let gamebanana_resolution = if selected_provider.is_some() || request.warm_cache {
+            gamebanana::resolve_mapping(store_root, profile, request.force_refresh)
+        } else {
+            known_persisted_provider_mapping(store_root, "gamebanana", profile)
+        };
+        if gamebanana_resolution.mapping.is_none()
+            && selected_provider.is_none()
+            && !request.warm_cache
+        {
+            discovery_complete = false;
+            total_is_exact = false;
+        }
+        if gamebanana_resolution.mapping.is_none() && gamebanana_resolution.warning.is_some() {
+            total_is_exact = false;
+        }
+        if let Some(warning) = gamebanana_resolution.warning {
+            provider_warnings.push(warning);
+        }
+        if let Some(mapping) = gamebanana_resolution.mapping {
+            let outcome = load_gamebanana_discovery_snapshot(
+                store_root,
+                profile,
+                &mapping,
+                request.sort,
+                &normalized_query,
+                needed.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS),
+                request.warm_cache,
+                warm_batch_size,
+                request.request_id,
+            );
+            let snapshot = outcome.snapshot;
+            if let Some(error) = outcome.error {
+                total_is_exact = false;
+                let message = if snapshot.is_some() {
+                    format!(
+                        "GameBanana: {error} Showing the most recent verified catalogue snapshot."
+                    )
+                } else {
+                    format!("GameBanana: {error}")
+                };
+                provider_errors.push(message);
+            }
+            if let Some(snapshot) = snapshot {
+                if !snapshot.records.is_empty() {
+                    available_providers.push(OnlineModProviderOption {
+                        id: "gamebanana".to_string(),
+                        label: "GameBanana".to_string(),
+                        mod_count: snapshot.records.len(),
+                    });
+                }
+                discovery_complete &= snapshot.complete
+                    || snapshot.records.len() >= DISCOVERY_PROVIDER_CACHE_MAX_RECORDS
+                    || outcome.extension_failed;
+                total_is_exact &= snapshot.complete && !outcome.extension_failed;
+                let available_total = if outcome.extension_failed && !snapshot.complete {
+                    snapshot.records.len()
+                } else {
+                    snapshot.total
+                };
+                provider_total = provider_total.saturating_add(available_total);
+                results.extend(snapshot.records);
+            }
         }
     }
     ensure_discovery_is_current(&profile.id, request.request_id)?;
@@ -13895,7 +14302,8 @@ fn discover_online_mods_for_profile(
     });
     provider_total = provider_total.saturating_sub(before_deduplication - results.len());
     sort_online_mods(&mut results, request.sort);
-    if results.is_empty() && !provider_errors.is_empty() {
+    let indexed = results.len();
+    if results.is_empty() && available_providers.is_empty() && !provider_errors.is_empty() {
         return Err(provider_errors.join(" "));
     }
     provider_warnings.extend(provider_errors);
@@ -13909,10 +14317,309 @@ fn discover_online_mods_for_profile(
         has_more: offset.saturating_add(items.len()) < provider_total,
         items,
         total: provider_total,
+        indexed,
+        complete: discovery_complete,
+        total_is_exact,
         page,
         page_size,
         provider_warnings,
+        available_providers,
     })
+}
+
+fn normalized_discovery_provider(provider: Option<&str>) -> Result<Option<&'static str>, String> {
+    let normalized = provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_ascii_lowercase);
+    match normalized.as_deref() {
+        None | Some("all") => Ok(None),
+        Some("thunderstore") => Ok(Some("thunderstore")),
+        Some("nexus") => Ok(Some("nexus")),
+        Some("gamebanana") => Ok(Some("gamebanana")),
+        Some("steam-workshop") => Ok(Some("steam-workshop")),
+        Some("modio") => Ok(Some("modio")),
+        Some(provider) => Err(format!(
+            "Unsupported discovery provider '{provider}'. Choose Thunderstore, Nexus Mods, GameBanana, Steam Workshop, or mod.io."
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_thunderstore_discovery_snapshot(
+    store_root: &Path,
+    profile: &GameProfile,
+    community: &str,
+    sort: &str,
+    query: &str,
+    fetch_count: usize,
+    warm_cache: bool,
+    warm_batch_size: usize,
+    request_id: u64,
+) -> DiscoveryProviderSnapshotOutcome {
+    let cache_key = format!(
+        "thunderstore:{}:{}:{}:{}",
+        profile.id,
+        community.to_ascii_lowercase(),
+        sort.to_ascii_lowercase(),
+        query.to_ascii_lowercase()
+    );
+    let mut snapshot = cached_discovery_provider_snapshot(&cache_key);
+    let fetch_count = progressive_discovery_fetch_count(
+        snapshot.as_ref(),
+        fetch_count,
+        warm_cache,
+        warm_batch_size,
+    );
+    let needs_extension = snapshot
+        .as_ref()
+        .is_none_or(|entry| entry.records.len() < fetch_count && !entry.complete);
+    let mut error = None;
+    let mut extension_failed = false;
+
+    if needs_extension {
+        let start_offset = snapshot.as_ref().map_or(0, |entry| entry.next_offset);
+        let additional_records =
+            fetch_count.saturating_sub(snapshot.as_ref().map_or(0, |entry| entry.records.len()));
+        match discover_thunderstore_community_mods(
+            store_root,
+            profile,
+            community,
+            NexusDiscoveryFetch {
+                start_offset,
+                max_new_results: additional_records,
+                sort,
+                query,
+                request_id,
+            },
+        ) {
+            Ok(batch) => {
+                snapshot = Some(remember_discovery_provider_batch(&cache_key, batch));
+            }
+            Err(fetch_error) => {
+                extension_failed = true;
+                error = Some(fetch_error);
+            }
+        }
+    }
+
+    DiscoveryProviderSnapshotOutcome {
+        snapshot,
+        error,
+        extension_failed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_nexus_discovery_snapshot(
+    profile: &GameProfile,
+    domain: &str,
+    nexus_api_ready: bool,
+    sort: &str,
+    query: &str,
+    fetch_count: usize,
+    warm_cache: bool,
+    warm_batch_size: usize,
+    request_id: u64,
+) -> DiscoveryProviderSnapshotOutcome {
+    let cache_key = format!(
+        "nexus:{}:{}:{}:{}",
+        profile.id,
+        domain.to_ascii_lowercase(),
+        sort.to_ascii_lowercase(),
+        query.to_ascii_lowercase()
+    );
+    let mut snapshot = cached_discovery_provider_snapshot(&cache_key);
+    let fetch_count = progressive_discovery_fetch_count(
+        snapshot.as_ref(),
+        fetch_count,
+        warm_cache,
+        warm_batch_size,
+    );
+    let needs_extension = snapshot
+        .as_ref()
+        .is_none_or(|entry| entry.records.len() < fetch_count && !entry.complete);
+    let mut error = None;
+    let mut extension_failed = false;
+
+    if needs_extension {
+        let start_offset = snapshot.as_ref().map_or(0, |entry| entry.next_offset);
+        let additional_records =
+            fetch_count.saturating_sub(snapshot.as_ref().map_or(0, |entry| entry.records.len()));
+        match discover_nexus_mods_for_profile(
+            profile,
+            domain,
+            nexus_api_ready,
+            NexusDiscoveryFetch {
+                start_offset,
+                max_new_results: additional_records,
+                sort,
+                query,
+                request_id,
+            },
+        ) {
+            Ok(batch) => {
+                snapshot = Some(remember_discovery_provider_batch(&cache_key, batch));
+            }
+            Err(fetch_error) => {
+                extension_failed = true;
+                error = Some(fetch_error);
+            }
+        }
+    }
+
+    DiscoveryProviderSnapshotOutcome {
+        snapshot,
+        error,
+        extension_failed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_modio_discovery_snapshot(
+    store_root: &Path,
+    profile: &GameProfile,
+    api_key: &str,
+    provider_game_id: &str,
+    sort: &str,
+    query: &str,
+    fetch_count: usize,
+    warm_cache: bool,
+    warm_batch_size: usize,
+    request_id: u64,
+) -> DiscoveryProviderSnapshotOutcome {
+    let cache_key = format!(
+        "modio:{}:{}:{}:{}",
+        profile.id,
+        provider_game_id,
+        sort.to_ascii_lowercase(),
+        query.to_ascii_lowercase()
+    );
+    let mut snapshot = cached_discovery_provider_snapshot(&cache_key);
+    let fetch_count = progressive_discovery_fetch_count(
+        snapshot.as_ref(),
+        fetch_count,
+        warm_cache,
+        warm_batch_size,
+    );
+    let needs_extension = snapshot
+        .as_ref()
+        .is_none_or(|entry| entry.records.len() < fetch_count && !entry.complete);
+    let mut error = None;
+    let mut extension_failed = false;
+
+    if needs_extension {
+        let start_offset = snapshot.as_ref().map_or(0, |entry| entry.next_offset);
+        let additional_records =
+            fetch_count.saturating_sub(snapshot.as_ref().map_or(0, |entry| entry.records.len()));
+        match modio::discover_mods(
+            store_root,
+            profile,
+            api_key,
+            provider_game_id,
+            NexusDiscoveryFetch {
+                start_offset,
+                max_new_results: additional_records,
+                sort,
+                query,
+                request_id,
+            },
+        ) {
+            Ok(batch) => {
+                snapshot = Some(remember_discovery_provider_batch(&cache_key, batch));
+            }
+            Err(fetch_error) => {
+                extension_failed = true;
+                error = Some(fetch_error);
+            }
+        }
+    }
+
+    DiscoveryProviderSnapshotOutcome {
+        snapshot,
+        error,
+        extension_failed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_gamebanana_discovery_snapshot(
+    store_root: &Path,
+    profile: &GameProfile,
+    mapping: &ProviderGameMapping,
+    sort: &str,
+    query: &str,
+    fetch_count: usize,
+    warm_cache: bool,
+    warm_batch_size: usize,
+    request_id: u64,
+) -> DiscoveryProviderSnapshotOutcome {
+    let cache_key = format!(
+        "gamebanana:{}:{}:{}:{}",
+        profile.id,
+        mapping.provider_game_id,
+        sort.to_ascii_lowercase(),
+        query.to_ascii_lowercase()
+    );
+    let mut snapshot = cached_discovery_provider_snapshot(&cache_key);
+    let fetch_count = progressive_discovery_fetch_count(
+        snapshot.as_ref(),
+        fetch_count,
+        warm_cache,
+        warm_batch_size,
+    );
+    let needs_extension = snapshot
+        .as_ref()
+        .is_none_or(|entry| entry.records.len() < fetch_count && !entry.complete);
+    let mut error = None;
+    let mut extension_failed = false;
+
+    if needs_extension {
+        let start_offset = snapshot.as_ref().map_or(0, |entry| entry.next_offset);
+        let additional_records =
+            fetch_count.saturating_sub(snapshot.as_ref().map_or(0, |entry| entry.records.len()));
+        match gamebanana::discover_mods(
+            store_root,
+            profile,
+            mapping,
+            NexusDiscoveryFetch {
+                start_offset,
+                max_new_results: additional_records,
+                sort,
+                query,
+                request_id,
+            },
+        ) {
+            Ok(batch) => {
+                snapshot = Some(remember_discovery_provider_batch(&cache_key, batch));
+            }
+            Err(fetch_error) => {
+                extension_failed = true;
+                error = Some(fetch_error);
+            }
+        }
+    }
+
+    DiscoveryProviderSnapshotOutcome {
+        snapshot,
+        error,
+        extension_failed,
+    }
+}
+
+fn progressive_discovery_fetch_count(
+    snapshot: Option<&DiscoveryProviderCacheEntry>,
+    required_count: usize,
+    warm_cache: bool,
+    warm_batch_size: usize,
+) -> usize {
+    let current_count = snapshot.map_or(0, |entry| entry.records.len());
+    let requested_count = if warm_cache {
+        required_count.max(current_count.saturating_add(warm_batch_size))
+    } else {
+        required_count
+    };
+    requested_count.min(DISCOVERY_PROVIDER_CACHE_MAX_RECORDS)
 }
 
 fn remember_discovery_provider_batch(
@@ -13928,15 +14635,6 @@ fn remember_discovery_provider_batch(
         now.duration_since(entry.fetched_at)
             <= Duration::from_secs(DISCOVERY_PROVIDER_CACHE_MINUTES * 60)
     });
-    if cache.len() >= DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES && !cache.contains_key(key) {
-        if let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.fetched_at)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
-    }
 
     if batch.start_offset > 0 {
         if let Some(existing) = cache.get_mut(key) {
@@ -13964,12 +14662,13 @@ fn remember_discovery_provider_batch(
                     existing.complete,
                 );
                 existing.fetched_at = Instant::now();
-                return existing.clone();
+                let updated = existing.clone();
+                prune_discovery_provider_cache(&mut cache, key);
+                return cache.get(key).cloned().unwrap_or(updated);
             }
-
-            if batch.next_offset <= existing.next_offset {
-                return existing.clone();
-            }
+            // Never replace a verified prefix with an overlapping, stale, or
+            // gapped continuation from a superseded request.
+            return existing.clone();
         }
     }
 
@@ -13992,7 +14691,34 @@ fn remember_discovery_provider_batch(
         complete: batch.complete,
     };
     cache.insert(key.to_string(), entry.clone());
-    entry
+    prune_discovery_provider_cache(&mut cache, key);
+    cache.get(key).cloned().unwrap_or(entry)
+}
+
+fn prune_discovery_provider_cache(
+    cache: &mut HashMap<String, DiscoveryProviderCacheEntry>,
+    preserve_key: &str,
+) {
+    loop {
+        let total_records = cache
+            .values()
+            .map(|entry| entry.records.len())
+            .sum::<usize>();
+        if cache.len() <= DISCOVERY_PROVIDER_CACHE_MAX_ENTRIES
+            && total_records <= DISCOVERY_PROVIDER_CACHE_MAX_TOTAL_RECORDS
+        {
+            break;
+        }
+        let Some(oldest) = cache
+            .iter()
+            .filter(|(key, _)| key.as_str() != preserve_key)
+            .min_by_key(|(_, entry)| entry.fetched_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
 }
 
 fn discovery_record_cache_key(record: &OnlineModRecord) -> String {
@@ -14030,8 +14756,8 @@ fn cached_discovery_provider_snapshot(key: &str) -> Option<DiscoveryProviderCach
     Some(entry.clone())
 }
 
-fn clear_discovery_provider_cache_for_profile(profile_id: &str) {
-    let prefix = format!("nexus:{profile_id}:");
+fn clear_discovery_provider_cache_for_provider(profile_id: &str, provider: &str) {
+    let prefix = format!("{}:{profile_id}:", provider.to_ascii_lowercase());
     if let Ok(mut cache) = DISCOVERY_PROVIDER_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -14174,16 +14900,19 @@ fn thunderstore_community_for_profile_with_refresh(
     profile: &GameProfile,
     force_refresh: bool,
 ) -> Option<String> {
-    if let Some(community) = profile
-        .game_id
-        .as_deref()
-        .and_then(game_definition_by_id)
-        .and_then(|definition| definition.thunderstore_community.clone())
-    {
+    if let Some(community) = bundled_thunderstore_community_for_profile(profile) {
         return Some(community);
     }
 
     auto_detect_thunderstore_community(profile, force_refresh)
+}
+
+fn bundled_thunderstore_community_for_profile(profile: &GameProfile) -> Option<String> {
+    profile
+        .game_id
+        .as_deref()
+        .and_then(game_definition_by_id)
+        .and_then(|definition| definition.thunderstore_community.clone())
 }
 
 fn nexus_domain_for_profile(profile: &GameProfile) -> Option<String> {
@@ -14229,6 +14958,11 @@ fn verified_discovery_provider_game(
                     .map(|mapping| mapping.provider_game_id)
             })
             .or_else(|| nexus_domain_for_profile(profile)),
+        "steam-workshop" => steam_workshop::verified_app_id(profile).ok(),
+        "modio" => persisted_provider_game_mapping(store_root, "modio", profile)
+            .ok()
+            .flatten()
+            .map(|mapping| mapping.provider_game_id),
         _ => None,
     }
     .ok_or_else(|| {
@@ -14438,6 +15172,46 @@ fn clear_cached_provider_mapping(provider: &str, profile: &GameProfile) {
     }
 }
 
+fn known_nexus_mapping_for_discovery(
+    store_root: &Path,
+    profile: &GameProfile,
+) -> ProviderGameResolution {
+    if let Some(domain) = bundled_nexus_domain_for_profile(profile) {
+        return ProviderGameResolution {
+            mapping: Some(ProviderGameMapping {
+                provider: "nexus".to_string(),
+                steam_app_id: profile.steam_app_id.clone().unwrap_or_default(),
+                canonical_game_name: canonical_game_name_for_profile(profile),
+                provider_game_id: domain,
+                provider_catalogue_id: None,
+                resolution: "bundled".to_string(),
+                verified_at: now_string(),
+            }),
+            warning: None,
+        };
+    }
+    known_persisted_provider_mapping(store_root, "nexus", profile)
+}
+
+fn known_persisted_provider_mapping(
+    store_root: &Path,
+    provider: &str,
+    profile: &GameProfile,
+) -> ProviderGameResolution {
+    match persisted_provider_game_mapping(store_root, provider, profile) {
+        Ok(mapping) => ProviderGameResolution {
+            mapping,
+            warning: None,
+        },
+        Err(error) => ProviderGameResolution {
+            mapping: None,
+            warning: Some(format!(
+                "Mod Garrison could not read its saved {provider} catalogue mapping: {error}"
+            )),
+        },
+    }
+}
+
 fn resolve_nexus_mapping_for_discovery(
     store_root: &Path,
     profile: &GameProfile,
@@ -14529,6 +15303,65 @@ fn resolve_nexus_mapping_for_discovery(
     }
 }
 
+fn resolve_modio_mapping_for_discovery(
+    store_root: &Path,
+    profile: &GameProfile,
+    api_key: &str,
+    force_refresh: bool,
+) -> ProviderGameResolution {
+    let saved = persisted_provider_game_mapping(store_root, "modio", profile);
+    if !force_refresh {
+        if let Ok(Some(mapping)) = saved.as_ref() {
+            return ProviderGameResolution {
+                mapping: Some(mapping.clone()),
+                warning: None,
+            };
+        }
+    }
+    let persisted_mapping_warning = saved.err().map(|error| {
+        format!("Mod Garrison could not read its saved mod.io provider mapping: {error}")
+    });
+    if force_refresh {
+        clear_cached_provider_mapping("modio", profile);
+    }
+    match modio::resolve_mapping(profile, api_key, force_refresh) {
+        Ok(Some(mapping)) => {
+            let remember_warning = remember_provider_game_mapping(store_root, mapping.clone())
+                .err()
+                .map(|error| {
+                    format!(
+                        "mod.io was linked automatically, but Mod Garrison could not remember the verified mapping: {error}"
+                    )
+                });
+            ProviderGameResolution {
+                mapping: Some(mapping),
+                warning: remember_warning.or(persisted_mapping_warning),
+            }
+        }
+        Ok(None) => {
+            let forget_warning = forget_provider_game_mapping(store_root, "modio", profile)
+                .err()
+                .map(|error| format!(" The obsolete saved mapping could not be removed: {error}"))
+                .unwrap_or_default();
+            ProviderGameResolution {
+                mapping: None,
+                warning: Some(format!(
+                    "mod.io could not be linked automatically for {}.{}",
+                    profile_game_label(profile),
+                    forget_warning
+                )),
+            }
+        }
+        Err(error) => ProviderGameResolution {
+            mapping: None,
+            warning: Some(format!(
+                "mod.io could not verify a catalogue match for {}: {error}",
+                profile_game_label(profile)
+            )),
+        },
+    }
+}
+
 fn unlinked_nexus_catalogue_message(profile: &GameProfile) -> String {
     let canonical_name = canonical_game_name_for_profile(profile);
     let steam_suffix = profile
@@ -14577,7 +15410,10 @@ fn persisted_provider_game_mapping(
             && mapping.steam_app_id == steam_app_id
             && valid_provider_game_id(&mapping.provider_game_id)
     });
-    if let Some(mapping) = mapping.as_ref() {
+    if let Some(mapping) = mapping
+        .as_ref()
+        .filter(|mapping| mapping.provider.eq_ignore_ascii_case("nexus"))
+    {
         if let Some(game_id) = mapping
             .provider_catalogue_id
             .as_deref()
@@ -14661,7 +15497,7 @@ fn forget_provider_game_mapping(
 
 fn valid_provider_game_id(value: &str) -> bool {
     let value = value.trim();
-    (2..=128).contains(&value.len())
+    (1..=128).contains(&value.len())
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
@@ -17774,6 +18610,16 @@ fn runtime_id_for_provider_package(
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
+fn is_known_runtime_provider_package(
+    provider: &str,
+    namespace: Option<&str>,
+    package_name: &str,
+) -> bool {
+    runtime_definitions().iter().any(|definition| {
+        runtime_provider_package_matches(definition, provider, namespace, package_name)
+    })
+}
+
 fn provider_slug_aliases(slug: &str) -> Vec<String> {
     match slug {
         "dragonwilds" | "rsdragonwilds" => vec!["runescapedragonwilds".to_string()],
@@ -17862,26 +18708,89 @@ fn discover_thunderstore_community_mods(
     store_root: &Path,
     profile: &GameProfile,
     community: &str,
-) -> Result<Vec<OnlineModRecord>, String> {
-    let packages = fetch_thunderstore_community_packages(community)?;
+    fetch: NexusDiscoveryFetch<'_>,
+) -> Result<DiscoveryProviderBatch, String> {
+    ensure_discovery_is_current(&profile.id, fetch.request_id)?;
+    let mut packages = fetch_thunderstore_community_packages(community)?;
+    ensure_discovery_is_current(&profile.id, fetch.request_id)?;
     let installed_keys = installed_package_identity_keys(store_root, &profile.id)?;
-
-    let mut records = packages
-        .into_iter()
-        .filter(is_discoverable_thunderstore_package)
-        .filter_map(|package| {
-            thunderstore_package_to_online_mod(profile, community, package, &installed_keys)
-        })
-        .collect::<Vec<_>>();
-
-    records.sort_by(|first, second| {
-        second
-            .downloads
-            .cmp(&first.downloads)
-            .then_with(|| second.rating_score.cmp(&first.rating_score))
-            .then_with(|| first.name.to_lowercase().cmp(&second.name.to_lowercase()))
+    let normalized_query = fetch.query.trim().to_ascii_lowercase();
+    packages.retain(|package| {
+        is_discoverable_thunderstore_package(package)
+            && (normalized_query.is_empty()
+                || package
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&normalized_query)
+                || package
+                    .full_name
+                    .to_ascii_lowercase()
+                    .contains(&normalized_query))
     });
-    Ok(records)
+    packages.sort_by(|first, second| {
+        let tie = || {
+            first
+                .full_name
+                .to_ascii_lowercase()
+                .cmp(&second.full_name.to_ascii_lowercase())
+        };
+        match fetch.sort {
+            "newest" => thunderstore_package_timestamp(second)
+                .cmp(thunderstore_package_timestamp(first))
+                .then_with(tie),
+            "oldest" => thunderstore_package_timestamp(first)
+                .cmp(thunderstore_package_timestamp(second))
+                .then_with(tie),
+            _ => thunderstore_package_downloads(second)
+                .cmp(&thunderstore_package_downloads(first))
+                .then_with(|| second.rating_score.cmp(&first.rating_score))
+                .then_with(tie),
+        }
+    });
+
+    let raw_total = packages.len();
+    let start_offset = fetch.start_offset.min(raw_total);
+    let end_offset = start_offset
+        .saturating_add(fetch.max_new_results)
+        .min(raw_total);
+    let mut records = Vec::new();
+    let mut filtered_out = 0_usize;
+    for package in packages
+        .into_iter()
+        .skip(start_offset)
+        .take(end_offset.saturating_sub(start_offset))
+    {
+        ensure_discovery_is_current(&profile.id, fetch.request_id)?;
+        match thunderstore_package_to_online_mod(profile, community, package, &installed_keys) {
+            Some(record) if !is_external_mod_manager_listing(&record) => records.push(record),
+            _ => filtered_out = filtered_out.saturating_add(1),
+        }
+    }
+
+    Ok(DiscoveryProviderBatch {
+        start_offset: fetch.start_offset,
+        records,
+        raw_total,
+        next_offset: end_offset,
+        filtered_out,
+        complete: end_offset >= raw_total,
+    })
+}
+
+fn thunderstore_package_downloads(package: &ThunderstoreCommunityPackage) -> u64 {
+    package
+        .versions
+        .iter()
+        .map(|version| version.downloads)
+        .sum()
+}
+
+fn thunderstore_package_timestamp(package: &ThunderstoreCommunityPackage) -> &str {
+    package
+        .date_updated
+        .as_deref()
+        .or(package.date_created.as_deref())
+        .unwrap_or_default()
 }
 
 fn fetch_thunderstore_community_packages(
@@ -17948,6 +18857,10 @@ fn clear_thunderstore_community_cache(community: &str) {
 
 fn is_discoverable_thunderstore_package(package: &ThunderstoreCommunityPackage) -> bool {
     if package.is_deprecated || package.has_nsfw_content || package.versions.is_empty() {
+        return false;
+    }
+
+    if is_known_runtime_provider_package("thunderstore", Some(&package.owner), &package.name) {
         return false;
     }
 
@@ -18682,6 +19595,9 @@ fn nexus_mod_to_online_mod(
     if name.is_empty() {
         return None;
     }
+    if is_known_runtime_provider_package("nexus", None, &name) {
+        return None;
+    }
     let dependency_count = node
         .mod_requirements
         .as_ref()
@@ -18807,6 +19723,25 @@ fn list_discovered_mod_files_impl(
         ),
         "thunderstore" => {
             list_thunderstore_mod_versions(store_root, profile, mod_id, supplied_provider_game_id)
+        }
+        "gamebanana" => {
+            gamebanana::list_files(store_root, profile, mod_id, supplied_provider_game_id)
+        }
+        "modio" => {
+            let api_key = settings.modio_api_key().ok_or_else(|| {
+                "A mod.io application key is not configured in this Mod Garrison build or in Settings."
+                    .to_string()
+            })?;
+            modio::list_files(
+                store_root,
+                profile,
+                api_key,
+                mod_id,
+                supplied_provider_game_id,
+            )
+        }
+        "steam-workshop" => {
+            steam_workshop::list_files(store_root, profile, mod_id, supplied_provider_game_id)
         }
         _ => Err(format!(
             "{} does not expose selectable files in this build.",
@@ -21826,6 +22761,15 @@ fn download_release_archive(
 }
 
 fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Result<(), String> {
+    download_url_to_file_with_source_identity(client, url, destination, url)
+}
+
+fn download_url_to_file_with_source_identity(
+    client: &Client,
+    url: &str,
+    destination: &Path,
+    artifact_source: &str,
+) -> Result<(), String> {
     validate_https_url(url)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(error_to_string)?;
@@ -21915,7 +22859,7 @@ fn download_url_to_file(client: &Client, url: &str, destination: &Path) -> Resul
     result?;
 
     let artifact_metadata = DownloadArtifactMetadata {
-        source_url: url.to_string(),
+        source_url: artifact_source.to_string(),
         sha256,
         size: bytes_written,
         verified_at: now_string(),
@@ -27887,17 +28831,33 @@ fn read_app_settings(root: &Path) -> Result<AppSettings, String> {
     let path = settings_path(root);
     ensure_app_settings(&path).map_err(error_to_string)?;
     let mut settings = read_json_with_backup::<AppSettings>(&path).map_err(error_to_string)?;
+    let mut migrated_raw_key = false;
 
     if !settings.nexus_api_key.trim().is_empty() {
         let legacy_key = settings.nexus_api_key.trim().to_string();
         write_nexus_api_key(Some(&legacy_key))?;
         settings.nexus_api_key.clear();
         settings.nexus_api_key_configured = true;
-        write_app_settings(root, &settings)?;
+        migrated_raw_key = true;
+    }
+    if !settings.modio_api_key.trim().is_empty() {
+        let legacy_key = settings.modio_api_key.trim().to_string();
+        let valid_legacy_key = modio::validate_api_key_shape(&legacy_key).is_ok();
+        if valid_legacy_key {
+            write_modio_api_key_override(Some(&legacy_key))?;
+        }
+        settings.modio_api_key.clear();
+        settings.modio_api_key_configured = valid_legacy_key;
+        migrated_raw_key = true;
+    }
+    if migrated_raw_key {
+        rewrite_migrated_app_settings_without_keys(root, &settings)?;
     }
 
     settings.nexus_api_key = read_nexus_api_key()?.unwrap_or_default();
     settings.nexus_api_key_configured = !settings.nexus_api_key.is_empty();
+    settings.modio_api_key = read_modio_api_key()?.unwrap_or_default();
+    settings.modio_api_key_configured = !settings.modio_api_key.is_empty();
     Ok(settings)
 }
 
@@ -27906,11 +28866,29 @@ fn write_app_settings(root: &Path, settings: &AppSettings) -> Result<(), String>
 }
 
 fn write_app_settings_raw(path: &Path, settings: &AppSettings) -> io::Result<()> {
+    let content = serialized_app_settings_without_keys(settings)?;
+    atomic_write(path, &content)
+}
+
+fn rewrite_migrated_app_settings_without_keys(
+    root: &Path,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    let path = settings_path(root);
+    let backup_path = backup_path_for(&path);
+    let content = serialized_app_settings_without_keys(settings).map_err(error_to_string)?;
+    let _guard = lock_store_io().map_err(error_to_string)?;
+    replace_file_bytes_unlocked(&path, &content).map_err(error_to_string)?;
+    replace_file_bytes_unlocked(&backup_path, &content).map_err(error_to_string)
+}
+
+fn serialized_app_settings_without_keys(settings: &AppSettings) -> io::Result<Vec<u8>> {
     let mut persisted = settings.clone();
     persisted.nexus_api_key.clear();
+    persisted.modio_api_key.clear();
     let content = serde_json::to_string_pretty(&persisted)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    atomic_write(path, format!("{}\n", content).as_bytes())
+    Ok(format!("{content}\n").into_bytes())
 }
 
 fn read_nexus_api_key() -> Result<Option<String>, String> {
@@ -27967,6 +28945,75 @@ fn delete_nexus_api_key_from_service(service: &str) -> Result<(), String> {
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(format!("Could not remove the Nexus API key: {error}")),
+    }
+}
+
+fn read_modio_api_key() -> Result<Option<String>, String> {
+    if let Some(value) = read_modio_api_key_override()? {
+        return Ok(Some(value));
+    }
+
+    let Some(value) = option_env!("MOD_GARRISON_MODIO_API_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    modio::validate_api_key_shape(value).map_err(|_| {
+        "This Mod Garrison build contains an invalid mod.io application key.".to_string()
+    })?;
+    Ok(Some(value.to_string()))
+}
+
+fn read_modio_api_key_override() -> Result<Option<String>, String> {
+    let entry =
+        keyring::Entry::new(MODIO_KEYRING_SERVICE, MODIO_KEYRING_USER).map_err(error_to_string)?;
+    match entry.get_password() {
+        Ok(value)
+            if !value.trim().is_empty() && modio::validate_api_key_shape(value.trim()).is_ok() =>
+        {
+            Ok(Some(value.trim().to_string()))
+        }
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read the mod.io API key from Windows Credential Manager: {error}"
+        )),
+    }
+}
+
+fn write_modio_api_key_override(value: Option<&str>) -> Result<(), String> {
+    let entry =
+        keyring::Entry::new(MODIO_KEYRING_SERVICE, MODIO_KEYRING_USER).map_err(error_to_string)?;
+    let result = match value {
+        Some(value) => {
+            modio::validate_api_key_shape(value)?;
+            entry
+                .set_password(value.trim())
+                .map_err(|error| format!("Could not save the mod.io API key securely: {error}"))
+        }
+        None => match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(format!("Could not remove the mod.io API key: {error}")),
+        },
+    };
+    if result.is_ok() {
+        clear_all_modio_provider_caches();
+    }
+    result
+}
+
+fn clear_all_modio_provider_caches() {
+    if let Ok(mut cache) = PROVIDER_MAPPING_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.retain(|key, _| !key.starts_with("modio:"));
+    }
+    if let Ok(mut cache) = DISCOVERY_PROVIDER_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.retain(|key, _| !key.starts_with("modio:"));
     }
 }
 
@@ -30780,6 +31827,141 @@ mod tests {
     }
 
     #[test]
+    fn discovery_runtime_filter_is_categorical_across_provider_runtime_families() {
+        assert!(is_known_runtime_provider_package(
+            "thunderstore",
+            Some("bbepis"),
+            "BepInExPack"
+        ));
+        assert!(is_known_runtime_provider_package(
+            "thunderstore",
+            Some("RuntimeAuthor"),
+            "UE4SS"
+        ));
+        assert!(is_known_runtime_provider_package(
+            "nexus",
+            None,
+            "REFramework for Future RE Engine"
+        ));
+        assert!(is_known_runtime_provider_package(
+            "gamebanana",
+            None,
+            "UE4SS Runtime"
+        ));
+        assert!(is_known_runtime_provider_package(
+            "steam-workshop",
+            None,
+            "BepInEx Pack for Example Game"
+        ));
+        assert!(is_known_runtime_provider_package(
+            "modio",
+            None,
+            "REFramework Runtime"
+        ));
+        // This remains a runtime even when a profile cannot yet distinguish
+        // Mono BepInEx from the IL2CPP build.
+        assert!(is_known_runtime_provider_package(
+            "nexus",
+            None,
+            "BepInEx for Unknown Unity Game"
+        ));
+        assert!(!is_known_runtime_provider_package(
+            "nexus",
+            None,
+            "UE4SS Configuration Manager"
+        ));
+    }
+
+    #[test]
+    fn discovery_provider_filter_accepts_only_registered_catalogues() {
+        assert_eq!(normalized_discovery_provider(None).unwrap(), None);
+        assert_eq!(normalized_discovery_provider(Some(" all ")).unwrap(), None);
+        assert_eq!(
+            normalized_discovery_provider(Some("THUNDERSTORE")).unwrap(),
+            Some("thunderstore")
+        );
+        assert_eq!(
+            normalized_discovery_provider(Some("Nexus")).unwrap(),
+            Some("nexus")
+        );
+        assert_eq!(
+            normalized_discovery_provider(Some("GameBanana")).unwrap(),
+            Some("gamebanana")
+        );
+        assert_eq!(
+            normalized_discovery_provider(Some("Steam-Workshop")).unwrap(),
+            Some("steam-workshop")
+        );
+        assert_eq!(
+            normalized_discovery_provider(Some("MODIO")).unwrap(),
+            Some("modio")
+        );
+        assert!(normalized_discovery_provider(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn persisted_app_settings_never_contain_provider_api_keys() {
+        let root = temp_game_dir("settings-redact-provider-api-keys");
+        let path = settings_path(&root);
+        let settings = AppSettings {
+            minimize_to_tray_on_close: true,
+            nexus_api_key: "nexus-secret-value".to_string(),
+            nexus_api_key_configured: true,
+            modio_api_key: "0123456789abcdef0123456789abcdef".to_string(),
+            modio_api_key_configured: true,
+        };
+
+        write_app_settings_raw(&path, &settings).unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("nexus-secret-value"));
+        assert!(!persisted.contains("0123456789abcdef0123456789abcdef"));
+        assert!(!persisted.contains("nexusApiKey\""));
+        assert!(!persisted.contains("modioApiKey\""));
+        assert!(persisted.contains("\"nexusApiKeyConfigured\": true"));
+        assert!(persisted.contains("\"modioApiKeyConfigured\": true"));
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("nexus-secret-value"));
+        assert!(!debug.contains("0123456789abcdef0123456789abcdef"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_provider_key_migration_sanitizes_primary_and_backup_files() {
+        let root = temp_game_dir("settings-migrate-provider-api-keys");
+        fs::create_dir_all(&root).unwrap();
+        let path = settings_path(&root);
+        let backup_path = backup_path_for(&path);
+        let nexus_key = "legacy-nexus-secret";
+        let modio_key = "0123456789abcdef0123456789abcdef";
+        let legacy = format!(
+            r#"{{
+  "minimizeToTrayOnClose": true,
+  "nexusApiKey": "{nexus_key}",
+  "nexusApiKeyConfigured": false,
+  "modioApiKey": "{modio_key}",
+  "modioApiKeyConfigured": false
+}}
+"#
+        );
+
+        fs::write(&path, b"{corrupt primary").unwrap();
+        fs::write(&backup_path, legacy.as_bytes()).unwrap();
+        let recovered = read_json_with_backup::<AppSettings>(&path).unwrap();
+        assert_eq!(recovered.nexus_api_key, nexus_key);
+        assert_eq!(recovered.modio_api_key, modio_key);
+
+        rewrite_migrated_app_settings_without_keys(&root, &recovered).unwrap();
+        for persisted_path in [&path, &backup_path] {
+            let persisted = fs::read_to_string(persisted_path).unwrap();
+            assert!(!persisted.contains(nexus_key));
+            assert!(!persisted.contains(modio_key));
+            assert!(!persisted.contains("nexusApiKey\""));
+            assert!(!persisted.contains("modioApiKey\""));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn discovery_snapshot_extends_the_verified_prefix_without_duplicates() {
         let key = format!("test-snapshot:{}", Uuid::new_v4());
         let records = (0..65)
@@ -30837,6 +32019,37 @@ mod tests {
         let cached = cached_discovery_provider_snapshot(&key).unwrap();
         assert_eq!(cached.next_offset, 70);
         assert_eq!(cached.records.len(), 65);
+    }
+
+    #[test]
+    fn progressive_discovery_warms_a_bounded_prefix_after_the_visible_page() {
+        assert_eq!(progressive_discovery_fetch_count(None, 20, false, 300), 20);
+
+        let snapshot = DiscoveryProviderCacheEntry {
+            fetched_at: Instant::now(),
+            records: (0..20)
+                .map(|index| {
+                    online_mod_fixture(&format!("Warm Mod {index}"), "Verified provider result")
+                })
+                .collect(),
+            total: 2_600,
+            next_offset: 20,
+            filtered_out: 0,
+            complete: false,
+        };
+        assert_eq!(
+            progressive_discovery_fetch_count(Some(&snapshot), 20, true, 300),
+            320
+        );
+        assert_eq!(
+            progressive_discovery_fetch_count(
+                None,
+                DISCOVERY_PROVIDER_CACHE_MAX_RECORDS + 100,
+                true,
+                300,
+            ),
+            DISCOVERY_PROVIDER_CACHE_MAX_RECORDS
+        );
     }
 
     #[test]

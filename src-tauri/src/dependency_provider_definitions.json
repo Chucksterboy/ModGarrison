@@ -49,11 +49,27 @@
   },
   {
     "id": "modio",
-    "displayName": "Mod.io",
-    "resolver": "browser-handoff",
+    "displayName": "mod.io",
+    "resolver": "modio",
+    "directInstall": true,
+    "dependencyResolution": false,
+    "browserHandoff": false
+  },
+  {
+    "id": "gamebanana",
+    "displayName": "GameBanana",
+    "resolver": "gamebanana",
+    "directInstall": true,
+    "dependencyResolution": false,
+    "browserHandoff": false
+  },
+  {
+    "id": "steam-workshop",
+    "displayName": "Steam Workshop",
+    "resolver": "steam-managed",
     "directInstall": false,
     "dependencyResolution": false,
-    "browserHandoff": true
+    "browserHandoff": false
   },
   {
     "id": "manual",

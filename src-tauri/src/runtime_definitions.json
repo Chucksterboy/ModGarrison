@@ -20,6 +20,21 @@
         "provider": "nexus",
         "namespacePatterns": [],
         "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "gamebanana",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "steam-workshop",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "modio",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
       }
     ],
     "detectionRules": [
@@ -67,6 +82,21 @@
       },
       {
         "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "gamebanana",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "steam-workshop",
+        "namespacePatterns": [],
+        "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
+      },
+      {
+        "provider": "modio",
         "namespacePatterns": [],
         "packagePatterns": ["BepInEx", "BepInEx Pack", "BepInExPack", "BepInExPack *", "BepInEx Pack *"]
       }
@@ -122,6 +152,21 @@
         "provider": "nexus",
         "namespacePatterns": [],
         "packagePatterns": ["UE4SS", "RE-UE4SS", "RE UE4SS", "UE4SS Loader", "UE4SS Runtime"]
+      },
+      {
+        "provider": "gamebanana",
+        "namespacePatterns": [],
+        "packagePatterns": ["UE4SS", "RE-UE4SS", "RE UE4SS", "UE4SS Loader", "UE4SS Runtime"]
+      },
+      {
+        "provider": "steam-workshop",
+        "namespacePatterns": [],
+        "packagePatterns": ["UE4SS", "RE-UE4SS", "RE UE4SS", "UE4SS Loader", "UE4SS Runtime"]
+      },
+      {
+        "provider": "modio",
+        "namespacePatterns": [],
+        "packagePatterns": ["UE4SS", "RE-UE4SS", "RE UE4SS", "UE4SS Loader", "UE4SS Runtime"]
       }
     ],
     "detectionRules": [
@@ -149,6 +194,21 @@
       },
       {
         "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["REFramework", "REFramework Runtime"]
+      },
+      {
+        "provider": "gamebanana",
+        "namespacePatterns": [],
+        "packagePatterns": ["REFramework", "REFramework Runtime"]
+      },
+      {
+        "provider": "steam-workshop",
+        "namespacePatterns": [],
+        "packagePatterns": ["REFramework", "REFramework Runtime"]
+      },
+      {
+        "provider": "modio",
         "namespacePatterns": [],
         "packagePatterns": ["REFramework", "REFramework Runtime"]
       }

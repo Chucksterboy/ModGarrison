@@ -60,6 +60,8 @@ import {
   ModConfigEntry,
   ModConfigFile,
   OnlineModFileOption,
+  OnlineModProvider,
+  OnlineModProviderOption,
   OnlineModRecord,
   ProfileImportResult,
   ProfileRefreshResult,
@@ -87,7 +89,8 @@ const emptyProfileInput: CreateProfileInput = {
 
 const defaultAppSettings: AppSettings = {
   minimizeToTrayOnClose: false,
-  nexusApiKeyConfigured: false
+  nexusApiKeyConfigured: false,
+  modioApiKeyConfigured: false
 };
 
 const defaultThemeId = "neon-circuit";
@@ -157,6 +160,19 @@ interface PendingNexusInstall {
   modId: string;
 }
 
+interface ActiveDiscoveryRequest {
+  profileId: string;
+  requestId: number;
+}
+
+interface DiscoveryLoadCriteria {
+  profileId: string;
+  page: number;
+  sort: OnlineSortMode;
+  query: string;
+  provider?: OnlineModProvider;
+}
+
 interface Notice {
   motionId: number;
   kind: NoticeKind;
@@ -196,6 +212,8 @@ type ForceRemovalPrompt =
 
 const discoverPageSize = 20;
 const nexusApiKeysUrl = "https://www.nexusmods.com/settings/api-keys";
+const modioTermsUrl = "https://mod.io/legal/terms?no_links=true";
+const modioPrivacyUrl = "https://mod.io/legal/privacy?no_links=true";
 const forceRemovalRequiredPrefix = "MOD_GARRISON_FORCE_REMOVAL_REQUIRED:";
 const startupSplashPulseMs = 2700;
 const startupSplashFadeMs = 420;
@@ -206,6 +224,89 @@ const maxInstalledModProfileCaches = 12;
 const maxArtworkRefreshProfiles = 48;
 const maxProcessedNxmLinks = 128;
 const maxStoredModPresentations = 400;
+const discoveryWarmDelayMs = 1500;
+
+type DiscoveryWarmTask = () => Promise<boolean>;
+
+interface PendingDiscoveryWarmTask {
+  generation: number;
+  task: DiscoveryWarmTask;
+}
+
+/**
+ * Keeps background catalogue warming bounded to one request at a time.
+ * Foreground actions start a new generation, which drops queued work and makes
+ * any response from an older generation ineligible to update the UI.
+ */
+export class ProgressiveDiscoveryCoordinator {
+  private generation = 0;
+  private requestSequence = 0;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private running = false;
+  private pending: PendingDiscoveryWarmTask | null = null;
+
+  constructor(private readonly delayMs = discoveryWarmDelayMs) {}
+
+  beginSession(): number {
+    this.cancelSession();
+    return this.generation;
+  }
+
+  cancelSession(): void {
+    this.generation += 1;
+    this.pending = null;
+    if (this.timer !== null) {
+      globalThis.clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  isCurrent(generation: number): boolean {
+    return generation === this.generation;
+  }
+
+  nextRequestId(): number {
+    this.requestSequence += 1;
+    return this.requestSequence;
+  }
+
+  schedule(generation: number, task: DiscoveryWarmTask): void {
+    if (!this.isCurrent(generation)) {
+      return;
+    }
+    this.pending = { generation, task };
+    this.armPendingTask();
+  }
+
+  private armPendingTask(): void {
+    if (this.running || this.timer !== null || !this.pending) {
+      return;
+    }
+
+    const pending = this.pending;
+    this.pending = null;
+    this.timer = globalThis.setTimeout(() => {
+      this.timer = null;
+      if (!this.isCurrent(pending.generation)) {
+        this.armPendingTask();
+        return;
+      }
+
+      this.running = true;
+      void pending
+        .task()
+        .then((continueWarming) => {
+          if (continueWarming && this.isCurrent(pending.generation)) {
+            this.pending = pending;
+          }
+        }, () => undefined)
+        .finally(() => {
+          this.running = false;
+          this.armPendingTask();
+        });
+    }, this.delayMs);
+  }
+}
 
 function forceRemovalDetail(error: unknown): string | null {
   const message = String(error);
@@ -254,6 +355,12 @@ export function App() {
   const [removingDiscoverModId, setRemovingDiscoverModId] = useState("");
   const [onlineMods, setOnlineMods] = useState<OnlineModRecord[]>([]);
   const [onlineModTotal, setOnlineModTotal] = useState(0);
+  const [onlineModIndexed, setOnlineModIndexed] = useState(0);
+  const [onlineModComplete, setOnlineModComplete] = useState(true);
+  const [onlineModTotalIsExact, setOnlineModTotalIsExact] = useState(true);
+  const [discoverAvailableProviders, setDiscoverAvailableProviders] = useState<
+    OnlineModProviderOption[]
+  >([]);
   const [discoverProviderWarning, setDiscoverProviderWarning] = useState("");
   const [modSortMode, setModSortMode] = useState<ModSortMode>("newest");
   const [installedModQuery, setInstalledModQuery] = useState("");
@@ -268,6 +375,7 @@ export function App() {
   const [isInstalling, setIsInstalling] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isDiscoveringMods, setIsDiscoveringMods] = useState(false);
+  const [isWarmingDiscovery, setIsWarmingDiscovery] = useState(false);
   const [installingOnlineModId, setInstallingOnlineModId] = useState<string>("");
   const [changingInstallTargetModId, setChangingInstallTargetModId] = useState<string>("");
   const [onlineInstallCompletionId, setOnlineInstallCompletionId] = useState(0);
@@ -305,13 +413,20 @@ export function App() {
   const installedModsByProfile = useRef(new Map<string, InstalledModRecord[]>());
   const artworkRefreshAttemptedProfiles = useRef(new Set<string>());
   const discoverInstalledModsRequestSequence = useRef(0);
-  const discoveryRequestSequence = useRef(0);
+  const discoveryCoordinatorRef = useRef<ProgressiveDiscoveryCoordinator | null>(null);
+  const activeDiscoveryRequestRef = useRef<ActiveDiscoveryRequest | null>(null);
+  const activeViewRef = useRef<ViewMode>(activeView);
   const processedNxmLinks = useRef(new Set<string>());
   const pendingNexusInstallRef = useRef<PendingNexusInstall | null>(null);
   const pendingNexusInstallTimeoutRef = useRef<number | null>(null);
   const installSoundPlayers = useRef<Record<InstallSoundKind, HTMLAudioElement> | null>(null);
   const gameLaunchStateRef = useRef<GameLaunchState>("idle");
   const gameLaunchDeadlineRef = useRef(0);
+
+  if (!discoveryCoordinatorRef.current) {
+    discoveryCoordinatorRef.current = new ProgressiveDiscoveryCoordinator();
+  }
+  activeViewRef.current = activeView;
 
   function setNotice(nextNotice: NoticeInput | null) {
     setNoticeState(nextNotice ? { ...nextNotice, motionId: ++noticeSequence.current } : null);
@@ -790,6 +905,20 @@ export function App() {
 
   useEffect(() => {
     if (activeView !== "discover") {
+      cancelDiscoverySession();
+    }
+  }, [activeView]);
+
+  useEffect(
+    () => () => {
+      discoveryCoordinatorRef.current?.cancelSession();
+      bestEffortCancelActiveDiscovery();
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (activeView !== "discover") {
       return;
     }
 
@@ -906,13 +1035,53 @@ export function App() {
     setSelectedProfileId(profileId);
   }
 
+  function bestEffortCancelActiveDiscovery(replacementRequestId?: number) {
+    const activeRequest = activeDiscoveryRequestRef.current;
+    if (!activeRequest) {
+      return;
+    }
+
+    activeDiscoveryRequestRef.current = null;
+    const cancelRequestId =
+      replacementRequestId ?? discoveryCoordinatorRef.current!.nextRequestId();
+    void api
+      .cancelOnlineModDiscovery(activeRequest.profileId, cancelRequestId)
+      .catch(() => undefined);
+  }
+
+  function cancelDiscoverySession(updateLoadingState = true) {
+    discoveryCoordinatorRef.current!.cancelSession();
+    bestEffortCancelActiveDiscovery();
+    if (updateLoadingState) {
+      setIsDiscoveringMods(false);
+      setIsWarmingDiscovery(false);
+    }
+  }
+
+  function beginDiscoverySession() {
+    const coordinator = discoveryCoordinatorRef.current!;
+    const generation = coordinator.beginSession();
+    const requestId = coordinator.nextRequestId();
+    // Reusing the next request ID for same-profile cancellation and discovery
+    // keeps either command ordering safe: both make older work stale.
+    bestEffortCancelActiveDiscovery(requestId);
+    setIsWarmingDiscovery(false);
+    return { coordinator, generation, requestId };
+  }
+
   function selectDiscoverProfile(profileId: string) {
     if (discoverProfileIdRef.current !== profileId) {
-      discoveryRequestSequence.current += 1;
+      cancelDiscoverySession();
       discoverInstalledModsRequestSequence.current += 1;
       discoverProfileIdRef.current = profileId;
-      setIsDiscoveringMods(false);
       setIsLoadingDiscoverInstalledMods(false);
+      setDiscoverLoadedProfileId("");
+      setOnlineMods([]);
+      setOnlineModTotal(0);
+      setOnlineModIndexed(0);
+      setOnlineModComplete(true);
+      setOnlineModTotalIsExact(true);
+      setDiscoverAvailableProviders([]);
       setDiscoverProviderWarning("");
     }
     setDiscoverProfileId(profileId);
@@ -1073,6 +1242,44 @@ export function App() {
       setNotice({
         kind: "error",
         title: "Nexus settings failed",
+        detail: String(caughtError)
+      });
+      throw caughtError;
+    }
+  }
+
+  async function saveModioApiKey(apiKey: string) {
+    try {
+      const savedSettings = await api.saveModioApiKey(apiKey);
+      setAppSettings(savedSettings);
+      // Provider records remain authoritative for paid, authenticated, and
+      // otherwise restricted files. Reload Discovery instead of turning every
+      // mod.io record into an installable item when the application key changes.
+      cancelDiscoverySession();
+      setDiscoverLoadedProfileId("");
+      setOnlineMods([]);
+      setOnlineModTotal(0);
+      setOnlineModIndexed(0);
+      setOnlineModComplete(true);
+      setOnlineModTotalIsExact(true);
+      setDiscoverAvailableProviders([]);
+      setDiscoverProviderWarning("");
+      const overrideSaved = Boolean(apiKey.trim());
+      setStatus(overrideSaved ? "mod.io API key override saved" : "mod.io API key override cleared");
+      setNotice({
+        kind: "success",
+        title: overrideSaved ? "mod.io override saved" : "mod.io override cleared",
+        detail: overrideSaved
+          ? "The developer override is stored securely in Windows Credential Manager."
+          : savedSettings.modioApiKeyConfigured
+            ? "The local override was cleared. This build's application key remains available."
+            : "The saved mod.io application key override was removed."
+      });
+    } catch (caughtError) {
+      setError(String(caughtError));
+      setNotice({
+        kind: "error",
+        title: "mod.io settings failed",
         detail: String(caughtError)
       });
       throw caughtError;
@@ -1690,14 +1897,129 @@ export function App() {
     }
   }
 
+  function discoverySessionIsCurrent(generation: number, profileId: string) {
+    return (
+      discoveryCoordinatorRef.current!.isCurrent(generation) &&
+      discoverProfileIdRef.current === profileId &&
+      activeViewRef.current === "discover"
+    );
+  }
+
+  function applyDiscoveryPage(
+    result: DiscoveryPage,
+    profileId: string,
+    provider?: OnlineModProvider
+  ) {
+    const currentPageItems = result.items.slice(0, discoverPageSize);
+    rememberOnlineModPresentations(currentPageItems);
+    setOnlineMods(currentPageItems);
+    setOnlineModTotal(result.total);
+    setOnlineModIndexed(result.indexed);
+    setOnlineModComplete(result.complete);
+    setOnlineModTotalIsExact(result.totalIsExact);
+    setDiscoverAvailableProviders((current) => {
+      if (!provider) {
+        return result.availableProviders;
+      }
+
+      const merged = new Map(current.map((option) => [option.id, option]));
+      result.availableProviders.forEach((option) => merged.set(option.id, option));
+      return Array.from(merged.values());
+    });
+    setDiscoverLoadedProfileId(profileId);
+    setDiscoverProviderWarning(result.providerWarnings.filter(Boolean).join(" "));
+  }
+
+  function clearActiveDiscoveryRequest(profileId: string, requestId: number) {
+    const activeRequest = activeDiscoveryRequestRef.current;
+    if (
+      activeRequest?.profileId === profileId &&
+      activeRequest.requestId === requestId
+    ) {
+      activeDiscoveryRequestRef.current = null;
+    }
+  }
+
+  function scheduleOnlineModWarm(
+    criteria: DiscoveryLoadCriteria,
+    generation: number
+  ) {
+    const coordinator = discoveryCoordinatorRef.current!;
+    if (!discoverySessionIsCurrent(generation, criteria.profileId)) {
+      return;
+    }
+
+    setIsWarmingDiscovery(true);
+    coordinator.schedule(generation, async () => {
+      if (!discoverySessionIsCurrent(generation, criteria.profileId)) {
+        return false;
+      }
+
+      const requestId = coordinator.nextRequestId();
+      activeDiscoveryRequestRef.current = {
+        profileId: criteria.profileId,
+        requestId
+      };
+      try {
+        const result = await api.discoverOnlineMods(
+          criteria.profileId,
+          criteria.page,
+          discoverPageSize,
+          criteria.sort,
+          criteria.query,
+          requestId,
+          false,
+          criteria.provider,
+          true
+        );
+        if (!discoverySessionIsCurrent(generation, criteria.profileId)) {
+          return false;
+        }
+
+        applyDiscoveryPage(result, criteria.profileId, criteria.provider);
+        if (result.complete) {
+          setIsWarmingDiscovery(false);
+          setStatus(
+            result.providerWarnings.some(Boolean)
+              ? "Discovery ready with warnings"
+              : "Discovery ready"
+          );
+          return false;
+        }
+        return true;
+      } catch (caughtError) {
+        if (discoverySessionIsCurrent(generation, criteria.profileId)) {
+          const warmWarning = `Background indexing paused: ${String(caughtError)}`;
+          setDiscoverProviderWarning((current) =>
+            current ? `${current} ${warmWarning}` : warmWarning
+          );
+          setIsWarmingDiscovery(false);
+          setStatus("Discovery ready with warnings");
+        }
+        return false;
+      } finally {
+        clearActiveDiscoveryRequest(criteria.profileId, requestId);
+      }
+    });
+  }
+
   async function loadOnlineMods(
     profileId: string,
     page = 1,
     sort: OnlineSortMode = "downloads",
     query = "",
-    forceRefresh = false
+    forceRefresh = false,
+    provider?: OnlineModProvider
   ): Promise<boolean> {
-    const requestId = ++discoveryRequestSequence.current;
+    const { coordinator, generation, requestId } = beginDiscoverySession();
+    const criteria: DiscoveryLoadCriteria = {
+      profileId,
+      page,
+      sort,
+      query,
+      provider
+    };
+    activeDiscoveryRequestRef.current = { profileId, requestId };
     setError("");
     setIsDiscoveringMods(true);
     setStatus("Discovering online mods");
@@ -1709,38 +2031,42 @@ export function App() {
         sort,
         query,
         requestId,
-        forceRefresh
+        forceRefresh,
+        provider,
+        false
       );
-      if (
-        requestId !== discoveryRequestSequence.current ||
-        discoverProfileIdRef.current !== profileId
-      ) {
+      if (!discoverySessionIsCurrent(generation, profileId)) {
         return false;
       }
-      rememberOnlineModPresentations(result.items);
-      setOnlineMods(result.items);
-      setOnlineModTotal(result.total);
-      setDiscoverLoadedProfileId(profileId);
+
+      applyDiscoveryPage(result, profileId, provider);
       const providerWarning = result.providerWarnings.filter(Boolean).join(" ");
-      setDiscoverProviderWarning(providerWarning ?? "");
-      setStatus(providerWarning ? "Discovery ready with warnings" : "Discovery ready");
+      setStatus(
+        providerWarning
+          ? "Discovery ready with warnings"
+          : result.complete
+            ? "Discovery ready"
+            : "Indexing online mods"
+      );
       const profile = profiles.find((item) => item.id === profileId);
       setNotice({
         kind: providerWarning ? "warning" : "success",
         title: providerWarning ? "Discovery partially updated" : "Discovery updated",
         detail: [
-          `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`,
+          result.complete && result.totalIsExact
+            ? `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`
+            : `${profile?.name ?? "Selected profile"}: indexed ${result.indexed} mod(s), with approximately ${result.total} currently reported.`,
           providerWarning
         ]
           .filter(Boolean)
           .join(" ")
       });
+      if (!result.complete) {
+        scheduleOnlineModWarm(criteria, generation);
+      }
       return true;
     } catch (caughtError) {
-      if (
-        requestId !== discoveryRequestSequence.current ||
-        discoverProfileIdRef.current !== profileId
-      ) {
+      if (!discoverySessionIsCurrent(generation, profileId)) {
         return false;
       }
       setError(String(caughtError));
@@ -1752,10 +2078,8 @@ export function App() {
       });
       return false;
     } finally {
-      if (
-        requestId === discoveryRequestSequence.current &&
-        discoverProfileIdRef.current === profileId
-      ) {
+      clearActiveDiscoveryRequest(profileId, requestId);
+      if (coordinator.isCurrent(generation) && discoverProfileIdRef.current === profileId) {
         setIsDiscoveringMods(false);
       }
     }
@@ -2907,7 +3231,15 @@ export function App() {
           />
         ) : renderedView === "discover" ? (
           <DiscoverView
+            availableProviders={
+              discoverLoadedProfileId === discoverProfileId
+                ? discoverAvailableProviders
+                : []
+            }
             hasLoaded={discoverLoadedProfileId === discoverProfileId}
+            indexed={
+              discoverLoadedProfileId === discoverProfileId ? onlineModIndexed : 0
+            }
             installCompletionId={onlineInstallCompletionId}
             installedMods={
               discoverInstalledModsProfileId === discoverProfileId ? discoverInstalledMods : []
@@ -2918,10 +3250,17 @@ export function App() {
               Boolean(discoverProfileId && discoverInstalledModsProfileId !== discoverProfileId)
             }
             isLoading={isDiscoveringMods}
+            isWarming={isWarmingDiscovery}
             mods={displayedOnlineMods}
             modPresentations={modPresentations}
             removingModId={removingDiscoverModId}
             total={discoverLoadedProfileId === discoverProfileId ? onlineModTotal : 0}
+            complete={
+              discoverLoadedProfileId === discoverProfileId ? onlineModComplete : true
+            }
+            totalIsExact={
+              discoverLoadedProfileId === discoverProfileId ? onlineModTotalIsExact : true
+            }
             providerWarning={
               discoverLoadedProfileId === discoverProfileId ? discoverProviderWarning : ""
             }
@@ -2931,8 +3270,8 @@ export function App() {
             onLoadFiles={loadOnlineModFiles}
             onNeedsAuth={openNexusAuthSettings}
             onOpenPage={(url) => void openExternalUrl(url)}
-            onLoad={(page, sort, query, forceRefresh) =>
-              loadOnlineMods(discoverProfileId, page, sort, query, forceRefresh)
+            onLoad={(page, sort, query, forceRefresh, provider) =>
+              loadOnlineMods(discoverProfileId, page, sort, query, forceRefresh, provider)
             }
             onRemoveInstalledMod={(mod) => void removeDiscoverInstalledMod(mod)}
             onSelectProfile={selectDiscoverProfile}
@@ -2943,6 +3282,7 @@ export function App() {
             nexusAttentionId={nexusSettingsAttentionId}
             onOpenDiagnostics={() => void openDiagnosticsFolder()}
             onOpenExternalUrl={(url) => void openExternalUrl(url)}
+            onSaveModioApiKey={saveModioApiKey}
             onSaveNexusApiKey={saveNexusApiKey}
             onUpdateSettings={updateAppSetting}
           />
@@ -3796,16 +4136,21 @@ function StartupSplash({ phase }: { phase: StartupSplashPhase }) {
 }
 
 interface DiscoverViewProps {
+  availableProviders: OnlineModProviderOption[];
+  complete: boolean;
   hasLoaded: boolean;
+  indexed: number;
   installCompletionId: number;
   installedMods: InstalledModRecord[];
   installingModId: string;
   isLoadingInstalledMods: boolean;
   isLoading: boolean;
+  isWarming: boolean;
   mods: OnlineModRecord[];
   modPresentations: StoredModPresentations;
   removingModId: string;
   total: number;
+  totalIsExact: boolean;
   providerWarning: string;
   profiles: GameProfile[];
   selectedProfileId: string;
@@ -3821,23 +4166,29 @@ interface DiscoverViewProps {
     page: number,
     sort: OnlineSortMode,
     query: string,
-    forceRefresh: boolean
+    forceRefresh: boolean,
+    provider?: OnlineModProvider
   ): Promise<boolean>;
   onRemoveInstalledMod(mod: InstalledModRecord): void;
   onSelectProfile(profileId: string): void;
 }
 
 export function DiscoverView({
+  availableProviders,
+  complete,
   hasLoaded,
+  indexed,
   installCompletionId,
   installedMods,
   installingModId,
   isLoadingInstalledMods,
   isLoading,
+  isWarming,
   mods,
   modPresentations,
   removingModId,
   total,
+  totalIsExact,
   providerWarning,
   profiles,
   selectedProfileId,
@@ -3852,13 +4203,33 @@ export function DiscoverView({
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [sortMode, setSortMode] = useState<OnlineSortMode>("downloads");
+  const [selectedProvider, setSelectedProvider] = useState<
+    OnlineModProvider | "all"
+  >("all");
   const [expandedModId, setExpandedModId] = useState("");
   const onLoadRef = useRef(onLoad);
   const sortModeRef = useRef(sortMode);
+  const selectedProviderRef = useRef<OnlineModProvider | undefined>(undefined);
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
-  const pageCount = Math.max(1, Math.ceil(total / discoverPageSize));
-  const currentPage = Math.min(page, pageCount);
+  const selectableProviders = useMemo(
+    () =>
+      availableProviders
+        .filter((provider) => provider.modCount > 0)
+        .filter(
+          (provider, index, providers) =>
+            providers.findIndex((candidate) => candidate.id === provider.id) === index
+        ),
+    [availableProviders]
+  );
   const visibleMods = mods;
+  const totalIsFinal = complete && totalIsExact;
+  const currentPageEnd = (page - 1) * discoverPageSize + visibleMods.length;
+  const pageableTotal = totalIsFinal ? total : Math.max(indexed, currentPageEnd);
+  const pageCount = Math.max(1, Math.ceil(pageableTotal / discoverPageSize));
+  const currentPage = Math.min(page, pageCount);
+  const discoveryCountTitle = totalIsFinal
+    ? `${total} total online mods`
+    : `${indexed} indexed; approximately ${total} total online mods`;
 
   useEffect(() => {
     onLoadRef.current = onLoad;
@@ -3872,8 +4243,33 @@ export function DiscoverView({
     setPage(1);
     setQuery("");
     setSortMode("downloads");
+    setSelectedProvider("all");
+    selectedProviderRef.current = undefined;
     setExpandedModId("");
   }, [selectedProfileId]);
+
+  useEffect(() => {
+    if (
+      selectedProvider === "all" ||
+      selectableProviders.some((provider) => provider.id === selectedProvider)
+    ) {
+      return;
+    }
+
+    setSelectedProvider("all");
+    selectedProviderRef.current = undefined;
+    setPage(1);
+    setExpandedModId("");
+    if (hasLoaded && selectedProfileId) {
+      void onLoadRef.current(1, sortModeRef.current, query.trim(), false);
+    }
+  }, [
+    hasLoaded,
+    query,
+    selectableProviders,
+    selectedProfileId,
+    selectedProvider
+  ]);
 
   useEffect(() => {
     if (expandedModId && !mods.some((mod) => mod.id === expandedModId)) {
@@ -3893,15 +4289,39 @@ export function DiscoverView({
     }
     const timeout = window.setTimeout(() => {
       setPage(1);
-      void onLoadRef.current(1, sortModeRef.current, query.trim(), false);
+      void onLoadRef.current(
+        1,
+        sortModeRef.current,
+        query.trim(),
+        false,
+        selectedProviderRef.current
+      );
     }, 300);
     return () => window.clearTimeout(timeout);
   }, [hasLoaded, query, selectedProfileId]);
 
   async function changeSort(nextSort: OnlineSortMode) {
     setExpandedModId("");
-    if (await onLoad(1, nextSort, query.trim(), false)) {
+    if (
+      await onLoad(
+        1,
+        nextSort,
+        query.trim(),
+        false,
+        selectedProviderRef.current
+      )
+    ) {
       setSortMode(nextSort);
+      setPage(1);
+    }
+  }
+
+  async function changeProvider(nextProvider: OnlineModProvider | "all") {
+    const provider = nextProvider === "all" ? undefined : nextProvider;
+    setExpandedModId("");
+    if (await onLoad(1, sortMode, query.trim(), false, provider)) {
+      selectedProviderRef.current = provider;
+      setSelectedProvider(nextProvider);
       setPage(1);
     }
   }
@@ -3909,7 +4329,15 @@ export function DiscoverView({
   async function changePage(nextPage: number) {
     const safePage = Math.max(1, Math.min(pageCount, nextPage));
     setExpandedModId("");
-    if (await onLoad(safePage, sortMode, query.trim(), false)) {
+    if (
+      await onLoad(
+        safePage,
+        sortMode,
+        query.trim(),
+        false,
+        selectedProviderRef.current
+      )
+    ) {
       setPage(safePage);
     }
   }
@@ -3926,64 +4354,112 @@ export function DiscoverView({
               : "Select a profile to load provider results"}
           </span>
         </div>
-        <button
-          className="secondary-button"
-          disabled={!selectedProfileId || isLoading}
-          onClick={() => {
-            setExpandedModId("");
-            void onLoad(currentPage, sortMode, query.trim(), true);
-          }}
-          type="button"
-        >
-          <RefreshCw size={16} />
-          {isLoading ? "Loading" : hasLoaded ? "Refresh" : "Load Online Mods"}
-        </button>
       </div>
 
       <section className="work-panel discover-controls">
-        <label className="transfer-field">
-          Profile
-          <select
-            value={selectedProfileId}
-            onChange={(event) => {
-              setExpandedModId("");
-              onSelectProfile(event.target.value);
-            }}
-          >
-            {profiles.map((profile) => (
-              <option key={profile.id} value={profile.id}>
-                {profile.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="discover-search">
-          <Search size={17} />
-          <input
-            value={query}
-            onChange={(event) => {
-              setExpandedModId("");
-              setQuery(event.target.value);
-            }}
-            placeholder="Search online mods"
-          />
-          {query ? (
-            <button
-              onClick={() => {
+        <div className="discover-filter-controls">
+          <label className="transfer-field">
+            Profile
+            <select
+              value={selectedProfileId}
+              onChange={(event) => {
                 setExpandedModId("");
-                setQuery("");
+                onSelectProfile(event.target.value);
               }}
-              title="Clear search"
-              type="button"
             >
-              X
-            </button>
+              {profiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {selectableProviders.length > 0 ? (
+            <label className="transfer-field discover-provider-field">
+              Provider
+              <select
+                aria-label="Choose provider"
+                disabled={isLoading}
+                value={selectedProvider}
+                onChange={(event) =>
+                  void changeProvider(
+                    event.target.value as OnlineModProvider | "all"
+                  )
+                }
+              >
+                <option value="all">All Providers</option>
+                {selectableProviders.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           ) : null}
-        </label>
-        <div className="discover-provider-pill" title={`${total} total online mods`}>
-          <Compass size={17} />
-          <span>Total Mods</span>
-          <strong>{formatCompactNumber(total)}</strong>
+          <label className="discover-search">
+            <Search size={17} />
+            <input
+              value={query}
+              onChange={(event) => {
+                setExpandedModId("");
+                setQuery(event.target.value);
+              }}
+              placeholder="Search online mods"
+            />
+            {query ? (
+              <button
+                onClick={() => {
+                  setExpandedModId("");
+                  setQuery("");
+                }}
+                title="Clear search"
+                type="button"
+              >
+                X
+              </button>
+            ) : null}
+          </label>
+        </div>
+        <div className="discover-summary-actions">
+          <div
+            aria-busy={isWarming}
+            className="discover-provider-pill"
+            title={discoveryCountTitle}
+          >
+            {isWarming ? (
+              <RefreshCw className="spin-icon" size={17} />
+            ) : (
+              <Compass size={17} />
+            )}
+            <span>{totalIsFinal ? "Total Mods" : "Indexed"}</span>
+            <strong>
+              {totalIsFinal
+                ? formatCompactNumber(total)
+                : `${formatCompactNumber(indexed)} / ~${formatCompactNumber(total)}`}
+            </strong>
+          </div>
+          <button
+            className="secondary-button discover-refresh-button"
+            disabled={!selectedProfileId || isLoading}
+            onClick={() => {
+              setExpandedModId("");
+              void onLoad(
+                currentPage,
+                sortMode,
+                query.trim(),
+                hasLoaded,
+                selectedProviderRef.current
+              );
+            }}
+            type="button"
+          >
+            <RefreshCw size={16} />
+            {isLoading
+              ? "Loading"
+              : hasLoaded
+                ? "Refresh Mods"
+                : "Load Online Mods"}
+          </button>
         </div>
         <div className="sort-toggle discover-sort" aria-label="Sort online mods">
           <button
@@ -4012,7 +4488,7 @@ export function DiscoverView({
 
       <div className="discover-content-grid">
         <section className="discover-results" aria-label="Online mod results">
-          {total > discoverPageSize ? (
+          {pageableTotal > discoverPageSize ? (
             <DiscoveryPagination
               currentPage={currentPage}
               isLoading={isLoading}
@@ -4062,7 +4538,7 @@ export function DiscoverView({
               <p>No online mods match that search.</p>
             </div>
           ) : null}
-          {total > discoverPageSize ? (
+          {pageableTotal > discoverPageSize ? (
             <DiscoveryPagination
               currentPage={currentPage}
               isLoading={isLoading}
@@ -4257,35 +4733,46 @@ function OnlineModCard({
   const fileSelectionTouchedRef = useRef(false);
   const installedModRef = useRef(installedMod);
   installedModRef.current = installedMod;
+  const isSteamManaged = mod.provider === "steam-workshop";
   const needsAuth = !mod.installSupported && mod.provider === "nexus";
-  const installDisabled = installing || (!mod.installSupported && !needsAuth);
+  const pageUrl = mod.packageUrl ?? mod.websiteUrl;
+  const installDisabled =
+    installing ||
+    (isSteamManaged ? !pageUrl : !mod.installSupported && !needsAuth);
   const replacementSelection: OnlineInstallSelection | undefined = installedMod
     ? {
         replaceInstalledModId: installedMod.id,
         installTargetId: installedMod.selectedInstallTargetId
       }
     : undefined;
-  const pageUrl = mod.packageUrl ?? mod.websiteUrl;
   const selectedFile = files.find((file) => file.id === selectedFileId);
-  const installTitle = !mod.installSupported
-    ? (mod.installNote ?? `${mod.providerLabel} direct install is not available yet.`)
-    : undefined;
-  const statusLabel = mod.installed
-    ? "Installed"
-    : installing
-      ? "Installing"
-      : needsAuth
-        ? "Needs auth"
+  const installTitle = isSteamManaged
+    ? "Open this item in Steam Workshop. Steam owns its subscription, download, updates, and removal."
+    : !mod.installSupported
+      ? (mod.installNote ?? `${mod.providerLabel} direct install is not available yet.`)
+      : undefined;
+  const statusLabel = isSteamManaged
+    ? "Steam-managed"
+    : mod.installed
+      ? "Installed"
+      : installing
+        ? "Installing"
+        : needsAuth
+          ? "Needs auth"
+          : mod.installSupported
+            ? "Available"
+            : "Unavailable";
+  const installLabel = isSteamManaged
+    ? "Open in Steam"
+    : mod.installed
+      ? "Update"
+      : installing
+        ? "Installing"
         : mod.installSupported
-          ? "Available"
-          : "Unavailable";
-  const installLabel = mod.installed
-    ? "Update"
-    : installing
-      ? "Installing"
-      : mod.installSupported
-        ? "Install"
-        : "Needs Auth";
+          ? "Install"
+          : needsAuth
+            ? "Needs Auth"
+            : "Unavailable";
   const selectedActionLabel = mod.installed
     ? "Update Selected"
     : installing
@@ -4329,7 +4816,7 @@ function OnlineModCard({
   ]);
 
   useEffect(() => {
-    if (!expanded || needsAuth || fileLoadState !== "idle") {
+    if (!expanded || isSteamManaged || needsAuth || fileLoadState !== "idle") {
       return;
     }
 
@@ -4353,9 +4840,15 @@ function OnlineModCard({
         setFileLoadError(String(caughtError));
         setFileLoadState("error");
       });
-  }, [expanded, fileLoadState, mod, needsAuth, onLoadFiles]);
+  }, [expanded, fileLoadState, isSteamManaged, mod, needsAuth, onLoadFiles]);
 
   function runSummaryAction() {
+    if (isSteamManaged) {
+      if (pageUrl) {
+        onOpenPage(pageUrl);
+      }
+      return;
+    }
     if (needsAuth) {
       onNeedsAuth();
       return;
@@ -4371,7 +4864,7 @@ function OnlineModCard({
 
   return (
     <article
-      className={`online-mod-card${mod.installed ? " installed" : ""}${expanded ? " expanded" : ""}`}
+      className={`online-mod-card${mod.installed ? " installed" : ""}${isSteamManaged ? " steam-managed" : ""}${expanded ? " expanded" : ""}`}
     >
       <div className="online-mod-summary">
         <div className="online-mod-icon">
@@ -4391,23 +4884,51 @@ function OnlineModCard({
           <strong>{formatCompactNumber(mod.downloads)}</strong>
         </div>
         <span className="online-mod-row-version">v{mod.version || "Unknown"}</span>
-        <span className={mod.installed ? "online-mod-row-state installed" : "online-mod-row-state"}>
-          {mod.installed ? <CheckCircle2 size={17} /> : null}
+        <span
+          className={
+            isSteamManaged
+              ? "online-mod-row-state steam-managed"
+              : mod.installed
+                ? "online-mod-row-state installed"
+                : "online-mod-row-state"
+          }
+        >
+          {isSteamManaged ? (
+            <ExternalLink size={16} />
+          ) : mod.installed ? (
+            <CheckCircle2 size={17} />
+          ) : null}
           {statusLabel}
         </span>
         <button
           aria-label={`${installLabel} ${mod.name}`}
-          className={needsAuth ? "online-mod-icon-button auth" : "online-mod-icon-button"}
+          className={
+            isSteamManaged
+              ? "online-mod-icon-button steam-managed"
+              : needsAuth
+                ? "online-mod-icon-button auth"
+                : "online-mod-icon-button"
+          }
           disabled={installDisabled}
           onClick={runSummaryAction}
           title={
-            mod.provider === "nexus" && mod.installSupported
-              ? `Choose a file for ${mod.name}`
-              : (installTitle ?? `${installLabel} ${mod.name}`)
+            isSteamManaged
+              ? installTitle
+              : mod.provider === "nexus" && mod.installSupported
+                ? `Choose a file for ${mod.name}`
+                : (installTitle ?? `${installLabel} ${mod.name}`)
           }
           type="button"
         >
-          {needsAuth ? <Settings2 size={18} /> : mod.installed ? <RefreshCw size={18} /> : <Download size={18} />}
+          {isSteamManaged ? (
+            <ExternalLink size={18} />
+          ) : needsAuth ? (
+            <Settings2 size={18} />
+          ) : mod.installed ? (
+            <RefreshCw size={18} />
+          ) : (
+            <Download size={18} />
+          )}
         </button>
         <button
           aria-expanded={expanded}
@@ -4428,7 +4949,7 @@ function OnlineModCard({
         <div className="online-mod-details">
           <div className="online-mod-description">
             <p>{mod.description || "The provider did not include a description for this mod."}</p>
-            {mod.installNote ? <small>{mod.installNote}</small> : null}
+            {mod.installNote && !isSteamManaged ? <small>{mod.installNote}</small> : null}
           </div>
           <dl className="online-mod-detail-grid">
             <div>
@@ -4467,12 +4988,23 @@ function OnlineModCard({
           <section className="online-mod-file-section" aria-label={`Files for ${mod.name}`}>
             <div className="online-mod-file-heading">
               <div>
-                <span>Install file</span>
-                <strong>Choose the release or variant you want</strong>
+                <span>{isSteamManaged ? "Steam Workshop" : "Install file"}</span>
+                <strong>
+                  {isSteamManaged
+                    ? "Steam owns this download"
+                    : "Choose the release or variant you want"}
+                </strong>
               </div>
-              {files.length > 0 ? <small>{files.length} available</small> : null}
+              {!isSteamManaged && files.length > 0 ? (
+                <small>{files.length} available</small>
+              ) : null}
             </div>
-            {needsAuth ? (
+            {isSteamManaged ? (
+              <div className="online-mod-file-message steam-managed">
+                <ExternalLink size={15} />
+                Steam manages this item's subscription, download, updates, and removal.
+              </div>
+            ) : needsAuth ? (
               <div className="online-mod-file-message warning">
                 Add your Nexus API key in Settings to load this mod's available files.
               </div>
@@ -4527,10 +5059,10 @@ function OnlineModCard({
                 })}
               </div>
             ) : null}
-            {selectedFile?.description ? (
+            {!isSteamManaged && selectedFile?.description ? (
               <p className="online-mod-file-description">{selectedFile.description}</p>
             ) : null}
-            {selectedFile?.action === "browser" ? (
+            {!isSteamManaged && selectedFile?.action === "browser" ? (
               <div className="online-mod-file-message warning">
                 Click Slow download, then Open via Mod Garrison for automated installs.
               </div>
@@ -4542,44 +5074,59 @@ function OnlineModCard({
               <p>{mod.categories.length > 0 ? mod.categories.join(", ") : "No categories provided"}</p>
             </div>
             <div className="online-mod-detail-actions">
-              {pageUrl ? (
+              {isSteamManaged ? (
                 <button
-                  className="secondary-button compact-button"
-                  onClick={() => onOpenPage(pageUrl)}
+                  className="primary-button compact-button"
+                  disabled={!pageUrl}
+                  onClick={() => (pageUrl ? onOpenPage(pageUrl) : undefined)}
+                  title={installTitle}
                   type="button"
                 >
                   <ExternalLink size={15} />
-                  Page
+                  Open in Steam
                 </button>
-              ) : null}
-              <button
-                className={
-                  needsAuth || selectedFile?.action === "browser"
-                    ? "secondary-button compact-button auth-button"
-                    : "primary-button compact-button"
-                }
-                disabled={needsAuth ? false : selectedActionDisabled}
-                onClick={() =>
-                  needsAuth
-                    ? onNeedsAuth()
-                    : selectedFile
-                      ? onInstall(mod, selectedFile, replacementSelection)
-                      : undefined
-                }
-                title={installTitle}
-                type="button"
-              >
-                {needsAuth ? (
-                  <Settings2 size={15} />
-                ) : selectedFile?.action === "browser" ? (
-                  <ExternalLink size={15} />
-                ) : mod.installed ? (
-                  <RefreshCw size={15} />
-                ) : (
-                  <Download size={15} />
-                )}
-                {needsAuth ? "Add API Key" : selectedActionLabel}
-              </button>
+              ) : (
+                <>
+                  {pageUrl ? (
+                    <button
+                      className="secondary-button compact-button"
+                      onClick={() => onOpenPage(pageUrl)}
+                      type="button"
+                    >
+                      <ExternalLink size={15} />
+                      Page
+                    </button>
+                  ) : null}
+                  <button
+                    className={
+                      needsAuth || selectedFile?.action === "browser"
+                        ? "secondary-button compact-button auth-button"
+                        : "primary-button compact-button"
+                    }
+                    disabled={needsAuth ? false : selectedActionDisabled}
+                    onClick={() =>
+                      needsAuth
+                        ? onNeedsAuth()
+                        : selectedFile
+                          ? onInstall(mod, selectedFile, replacementSelection)
+                          : undefined
+                    }
+                    title={installTitle}
+                    type="button"
+                  >
+                    {needsAuth ? (
+                      <Settings2 size={15} />
+                    ) : selectedFile?.action === "browser" ? (
+                      <ExternalLink size={15} />
+                    ) : mod.installed ? (
+                      <RefreshCw size={15} />
+                    ) : (
+                      <Download size={15} />
+                    )}
+                    {needsAuth ? "Add API Key" : selectedActionLabel}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -4725,6 +5272,7 @@ interface SettingsViewProps {
   nexusAttentionId: number;
   onOpenDiagnostics(): void;
   onOpenExternalUrl(url: string): void;
+  onSaveModioApiKey(apiKey: string): Promise<void>;
   onSaveNexusApiKey(apiKey: string): Promise<void>;
   onUpdateSettings(settings: AppSettings): Promise<void>;
 }
@@ -4734,11 +5282,14 @@ function SettingsView({
   nexusAttentionId,
   onOpenDiagnostics,
   onOpenExternalUrl,
+  onSaveModioApiKey,
   onSaveNexusApiKey,
   onUpdateSettings
 }: SettingsViewProps) {
   const [nexusApiKeyDraft, setNexusApiKeyDraft] = useState("");
   const [isSavingNexusKey, setIsSavingNexusKey] = useState(false);
+  const [modioApiKeyDraft, setModioApiKeyDraft] = useState("");
+  const [isSavingModioKey, setIsSavingModioKey] = useState(false);
 
   async function submitNexusApiKey() {
     setIsSavingNexusKey(true);
@@ -4747,6 +5298,16 @@ function SettingsView({
       setNexusApiKeyDraft("");
     } finally {
       setIsSavingNexusKey(false);
+    }
+  }
+
+  async function submitModioApiKey() {
+    setIsSavingModioKey(true);
+    try {
+      await onSaveModioApiKey(modioApiKeyDraft);
+      setModioApiKeyDraft("");
+    } finally {
+      setIsSavingModioKey(false);
     }
   }
 
@@ -4866,6 +5427,85 @@ function SettingsView({
             <span>Paste the key into Mod Garrison.</span>
           </li>
         </ol>
+      </section>
+
+      <section className="work-panel settings-panel">
+        <div className="panel-title-row">
+          <div>
+            <p className="eyebrow">Provider</p>
+            <h3>mod.io</h3>
+          </div>
+          <Compass size={20} />
+        </div>
+
+        <p className="muted">
+          Official Mod Garrison builds use one application API key. Individual users do not need
+          to create or paste their own key.
+        </p>
+        <label className="settings-field">
+          <span>Developer or local API key override</span>
+          <input
+            autoComplete="off"
+            placeholder={
+              appSettings.modioApiKeyConfigured
+                ? "Application access configured"
+                : "Optional developer key override"
+            }
+            type="password"
+            value={modioApiKeyDraft}
+            onChange={(event) => setModioApiKeyDraft(event.target.value)}
+          />
+        </label>
+        <div className="settings-key-actions">
+          <button
+            className="secondary-button"
+            disabled={
+              isSavingModioKey ||
+              (!modioApiKeyDraft.trim() && !appSettings.modioApiKeyConfigured)
+            }
+            onClick={() => void submitModioApiKey()}
+            type="button"
+          >
+            {isSavingModioKey
+              ? "Saving"
+              : modioApiKeyDraft.trim()
+                ? "Save Override"
+                : "Clear Override"}
+          </button>
+        </div>
+        <p
+          className={
+            appSettings.modioApiKeyConfigured
+              ? "settings-status connected"
+              : "settings-status"
+          }
+        >
+          {appSettings.modioApiKeyConfigured
+            ? "mod.io application access is configured for this build."
+            : "mod.io application access is not configured in this build."}
+        </p>
+        <p className="settings-policy-links">
+          Provider policies:{" "}
+          <a
+            href={modioTermsUrl}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenExternalUrl(modioTermsUrl);
+            }}
+          >
+            Terms
+          </a>
+          <span aria-hidden="true"> · </span>
+          <a
+            href={modioPrivacyUrl}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenExternalUrl(modioPrivacyUrl);
+            }}
+          >
+            Privacy
+          </a>
+        </p>
       </section>
     </div>
   );
