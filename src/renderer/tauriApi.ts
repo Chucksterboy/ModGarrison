@@ -39,6 +39,8 @@ export const desktopApi: DesktopApi = {
     invoke<AppSettings>("update_app_settings", { input }),
   saveNexusApiKey: (apiKey: string) =>
     invoke<AppSettings>("save_nexus_api_key", { apiKey }),
+  saveModioApiKey: (apiKey: string) =>
+    invoke<AppSettings>("save_modio_api_key", { apiKey }),
   systemHealth: (profileId?: string) =>
     invoke<GarrisonCoreHealth>("system_health", { profileId }),
   checkAppUpdate: () => invoke<AppUpdateInfo>("check_app_update"),
@@ -177,7 +179,17 @@ export const desktopApi: DesktopApi = {
     }),
   installArchive: (request: InstallRequest) =>
     invoke<InstallResult>("install_archive", { request }),
-  discoverOnlineMods: (profileId, page, pageSize, sort, query, requestId, forceRefresh) =>
+  discoverOnlineMods: (
+    profileId,
+    page,
+    pageSize,
+    sort,
+    query,
+    requestId,
+    forceRefresh,
+    provider,
+    warmCache
+  ) =>
     invoke<DiscoveryPage>("discover_online_mods", {
       profileId,
       page,
@@ -185,7 +197,14 @@ export const desktopApi: DesktopApi = {
       sort,
       query,
       requestId,
-      forceRefresh
+      forceRefresh,
+      provider,
+      warmCache
+    }),
+  cancelOnlineModDiscovery: (profileId, requestId) =>
+    invoke<void>("cancel_online_mod_discovery", {
+      profileId,
+      requestId
     }),
   listDiscoveredModFiles: (profileId: string, mod: OnlineModRecord) =>
     invoke<OnlineModFileOption[]>("list_discovered_mod_files", {

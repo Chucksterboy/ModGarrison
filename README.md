@@ -40,7 +40,14 @@ Mod Garrison can automatically resolve these loader/runtime dependencies:
 - UE4SS from official GitHub releases.
 - REFramework from official GitHub releases, using game-specific stable assets when a supported RE Engine game is detected and the generic nightly asset as a fallback.
 
-Source platforms such as Nexus Mods, CurseForge/Overwolf, Thunderstore, and Mod.io are not all equivalent. Thunderstore archives expose dependency metadata directly in the ZIP. Nexus and CurseForge integrations need their API/auth/download rules handled explicitly rather than scraped or bypassed.
+Source platforms are handled according to their documented capabilities:
+
+- Thunderstore supports direct discovery, download, installation, and package dependency metadata.
+- Nexus Mods uses its official API, with the browser/NXM handoff when required by Nexus account and download rules.
+- GameBanana supports direct discovery and archive downloads through its public API.
+- mod.io supports direct downloads from officially available, free catalogues that permit read-only API-key access; user-authenticated or restricted catalogues are not bypassed.
+- Steam Workshop lists only content already downloaded or subscribed through Steam. Steam remains responsible for acquiring and updating Workshop items.
+- CurseForge/Overwolf remains subject to its provider-specific API and download rules and is not scraped.
 
 ### Runtime Registry Extensions
 
@@ -65,7 +72,7 @@ The Desktop shortcut points at `Start-Mod-Garrison.cmd`. It starts a release bui
 
 ## Current State
 
-This is a working foundation, not a finished public mod manager. It can create game profiles, detect game engines/loaders from a selected game folder, scan imported ZIP archives, detect common mod layouts, build an install plan, download supported runtime dependencies, and install files with backups. Nexus, CurseForge/Overwolf, and Mod.io source-provider integrations should be added through their official API/auth flows.
+This is a working foundation, not a finished public mod manager. It can create game profiles, detect game engines/loaders from a selected game folder, scan imported ZIP archives, detect common mod layouts, build an install plan, download supported runtime dependencies, discover supported provider catalogues, and install files with backups. Provider behavior remains limited to the official API, authentication, distribution, and download capabilities described above.
 
 The React frontend lives in `src/renderer`. The Tauri/Rust backend lives in `src-tauri`.
 
@@ -88,6 +95,15 @@ git push origin v0.2.1
 The GitHub Actions release workflow validates the project, builds the single
 Windows NSIS `.exe` installer, publishes the release, and uploads its SHA-256
 checksum.
+
+Official builds receive mod.io read-only application access from the
+`MOD_GARRISON_MODIO_API_KEY` repository secret and the account-specific API path
+from the `MOD_GARRISON_MODIO_API_BASE` repository variable. The API path should
+be copied from [mod.io API Access](https://mod.io/me/access) and must use an
+official `https://*.modapi.io/v1` endpoint. End users do not need to supply a
+key, authenticate with mod.io, or accept an in-app consent prompt for this
+read-only, non-user-authenticated catalogue flow; Settings links to mod.io's
+Terms of Use and Privacy Policy.
 
 ## Future Game Support
 
