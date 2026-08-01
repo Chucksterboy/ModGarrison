@@ -325,6 +325,78 @@ pub(super) fn discover_mods(
     })
 }
 
+pub(super) fn available_mod_documents(
+    profile: &GameProfile,
+    api_key: &str,
+    mapping: &ProviderGameMapping,
+    requested_limit: usize,
+) -> Result<Vec<ProviderRouteDocument>, String> {
+    validate_api_key_shape(api_key)?;
+    validate_numeric_id(&mapping.provider_game_id, "mod.io game")?;
+    let steam_app_id = profile
+        .steam_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Automatic mod.io metadata learning requires a verified Steam App ID.".to_string()
+        })?;
+    if !mapping.provider.eq_ignore_ascii_case("modio") || mapping.steam_app_id != steam_app_id {
+        return Err(
+            "The saved mod.io game mapping does not match this verified Steam profile.".to_string(),
+        );
+    }
+
+    let limit = requested_limit
+        .min(PROFILE_RUNTIME_SAMPLE_SIZE.max(PROFILE_ROUTE_SAMPLE_SIZE))
+        .min(MODIO_MAX_PAGE_SIZE);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let client = provider_client()?;
+    let provider_game = fetch_game_by_id(&client, api_key, &mapping.provider_game_id)?;
+    let verified_game = verified_steam_game_for_profile(profile)?;
+    let candidates = provider_name_candidates(profile);
+    if provider_game.id.to_string() != mapping.provider_game_id
+        || !modio_game_matches_profile(&provider_game, &candidates, &verified_game.app_id)
+    {
+        return Err(
+            "The saved mod.io catalogue no longer matches the selected Steam game.".to_string(),
+        );
+    }
+
+    let url = format!(
+        "{}/games/{}/mods",
+        modio_api_base()?,
+        sanitize_url_path_segment(&mapping.provider_game_id)
+    );
+    let page = parse_json::<ModioCollection<ModioMod>>(
+        send_get(
+            &client,
+            &url,
+            api_key,
+            &[
+                ("_offset", "0".to_string()),
+                ("_limit", limit.to_string()),
+                ("_sort", modio_sort("downloads").to_string()),
+                ("revenue_type", "0".to_string()),
+            ],
+        )?,
+        "mod metadata",
+    )?;
+    Ok(page
+        .data
+        .into_iter()
+        .filter(|item| mod_is_discoverable_metadata(item, &mapping.provider_game_id))
+        .map(|item| {
+            let primary_file = item.modfile.as_ref();
+            provider_document(&mapping.provider_game_id, &item, primary_file)
+        })
+        .take(limit)
+        .collect())
+}
+
 pub(super) fn list_files(
     store_root: &Path,
     profile: &GameProfile,
@@ -343,8 +415,12 @@ pub(super) fn list_files(
     ensure_api_key_downloads_supported(api_key, &game_id)?;
     let details = fetch_mod(api_key, &game_id, numeric_mod_id)?;
     ensure_public_free_mod(&details, &game_id)?;
-    let files = fetch_mod_files(api_key, &game_id, numeric_mod_id)?;
-    let primary_file_id = details.modfile.map(|file| file.id);
+    let files = include_primary_file(
+        fetch_mod_files(api_key, &game_id, numeric_mod_id)?,
+        details.modfile.as_ref(),
+        numeric_mod_id,
+    );
+    let primary_file_id = details.modfile.as_ref().map(|file| file.id);
     Ok(files
         .into_iter()
         .filter(|file| file.mod_id == numeric_mod_id && file_is_installable(file))
@@ -357,6 +433,7 @@ pub(super) fn preflight(
     profile: &GameProfile,
     api_key: &str,
     mod_id: &str,
+    selected_file_id: Option<&str>,
 ) -> Result<(Vec<DependencySpec>, Vec<InstallTargetOption>), String> {
     let (game_id, numeric_mod_id) = parse_online_mod_id(mod_id)?;
     let provider_game_id =
@@ -364,8 +441,14 @@ pub(super) fn preflight(
     ensure_api_key_downloads_supported(api_key, &game_id)?;
     let details = fetch_mod(api_key, &game_id, numeric_mod_id)?;
     ensure_public_free_mod(&details, &provider_game_id)?;
+    ensure_dependencies_supported(&details)?;
     let files = fetch_mod_files(api_key, &game_id, numeric_mod_id)?;
-    let file = choose_file(&files, numeric_mod_id, None)?;
+    let file = choose_file(
+        &files,
+        numeric_mod_id,
+        selected_file_id,
+        details.modfile.as_ref(),
+    )?;
     let document = provider_document(&provider_game_id, &details, Some(&file));
     let provided_runtime = runtime_id_for_provider_package(profile, "modio", None, &details.name);
     let dependencies =
@@ -397,8 +480,14 @@ pub(super) fn install(
     ensure_api_key_downloads_supported(api_key, &game_id)?;
     let details = fetch_mod(api_key, &game_id, numeric_mod_id)?;
     ensure_public_free_mod(&details, &provider_game_id)?;
+    ensure_dependencies_supported(&details)?;
     let files = fetch_mod_files(api_key, &game_id, numeric_mod_id)?;
-    let file = choose_file(&files, numeric_mod_id, selected_file_id)?;
+    let file = choose_file(
+        &files,
+        numeric_mod_id,
+        selected_file_id,
+        details.modfile.as_ref(),
+    )?;
     let archive_path = download_file(store_root, &game_id, numeric_mod_id, &file)?;
     let package_id = format!("modio:{game_id}/{numeric_mod_id}");
     let provider_document = provider_document(&provider_game_id, &details, Some(&file));
@@ -412,6 +501,7 @@ pub(super) fn install(
     let scanned = scan_import_source(store_root, &archive_path)?;
     let analysis =
         analyze_scanned_archive_with_identity(scanned.clone(), profile, Some(source_identity));
+    let install_source_path = analysis.archive_path.clone();
     let package_identity = analysis.package_identity.clone();
     let mut plan = analysis
         .recommended_plan
@@ -428,12 +518,6 @@ pub(super) fn install(
         description_runtime_dependencies(profile, &provider_document.text, None),
     );
     plan.warnings.extend(route_outcome.warnings);
-    if details.dependencies {
-        plan.warnings.push(
-            "mod.io reports additional mod dependencies. Mod Garrison did not install them automatically because mod.io recommends game-specific moderation of dependency links."
-                .to_string(),
-        );
-    }
     let install_targets =
         provider_plan_install_target_options(store_root, profile, &provider_document, &plan);
     let selected_install_target_id = provider_selected_install_target_id(
@@ -450,13 +534,12 @@ pub(super) fn install(
         ));
     }
 
-    let archive_path_string = archive_path.to_string_lossy().to_string();
     let mut visited_dependencies = HashSet::new();
     let details_icon_url = mod_logo_url(&details);
-    install_archive_impl_with_metadata(
+    let install_result = install_archive_impl_with_metadata(
         store_root,
         profile,
-        &archive_path_string,
+        &install_source_path,
         &plan,
         InstallOptions {
             metadata: InstallMetadata {
@@ -479,7 +562,15 @@ pub(super) fn install(
             visited_dependencies: &mut visited_dependencies,
             dependency_depth: 0,
         },
-    )
+    );
+    if install_result.is_ok() {
+        cleanup_successful_provider_artifacts(
+            store_root,
+            &archive_path,
+            Path::new(&install_source_path),
+        );
+    }
+    install_result
 }
 
 pub(super) fn parse_online_mod_id(mod_id: &str) -> Result<(String, u64), String> {
@@ -610,14 +701,7 @@ fn mod_to_online_record(
     installed_keys: &HashSet<String>,
     direct_install_supported: bool,
 ) -> Option<OnlineModRecord> {
-    if item.id == 0
-        || item.game_id.to_string() != provider_game_id
-        || item.status != 1
-        || item.visible != 1
-        || item.revenue_type != Some(0)
-        || item.name.trim().is_empty()
-        || is_known_runtime_provider_package("modio", None, &item.name)
-    {
+    if !mod_is_discoverable_metadata(&item, provider_game_id) {
         return None;
     }
     let file = item
@@ -643,6 +727,20 @@ fn mod_to_online_record(
     let package_url = non_empty_string(item.profile_url.trim())
         .or_else(|| non_empty_string(item.homepage_url.trim()));
     let website_url = non_empty_string(item.profile_url.trim());
+    let install_supported = direct_install_supported && !item.dependencies;
+    let install_note = if !direct_install_supported {
+        Some(
+            "This game requires each player to sign in to mod.io before downloading files. API-key-only installation is unavailable."
+                .to_string(),
+        )
+    } else if item.dependencies {
+        Some(
+            "mod.io reports required mod dependencies but does not provide enough verified dependency information for safe automatic installation."
+                .to_string(),
+        )
+    } else {
+        None
+    };
     Some(OnlineModRecord {
         id: package_id,
         provider: "modio".to_string(),
@@ -664,12 +762,23 @@ fn mod_to_online_record(
         installed,
         created_at: unix_timestamp(item.date_live.max(item.date_added)),
         updated_at: unix_timestamp(item.date_updated),
-        install_supported: direct_install_supported,
-        install_note: (!direct_install_supported).then(|| {
-            "This game requires each player to sign in to mod.io before downloading files. API-key-only installation is unavailable."
-                .to_string()
-        }),
+        install_supported,
+        install_note,
     })
+}
+
+fn mod_is_discoverable_metadata(item: &ModioMod, provider_game_id: &str) -> bool {
+    item.id > 0
+        && item.game_id.to_string() == provider_game_id
+        && item.status == 1
+        && item.visible == 1
+        && item.revenue_type == Some(0)
+        && !item.name.trim().is_empty()
+        && !is_known_runtime_provider_package("modio", None, &item.name)
+        && item
+            .modfile
+            .as_ref()
+            .is_some_and(|file| file.mod_id == item.id && file_is_installable(file))
 }
 
 fn provider_document(
@@ -708,6 +817,16 @@ fn ensure_public_free_mod(item: &ModioMod, provider_game_id: &str) -> Result<(),
     Ok(())
 }
 
+fn ensure_dependencies_supported(item: &ModioMod) -> Result<(), String> {
+    if item.dependencies {
+        return Err(format!(
+            "mod.io reports required mod dependencies for '{}', but its catalogue response does not provide enough verified dependency information for Mod Garrison to install them safely. No files were downloaded or installed.",
+            item.name
+        ));
+    }
+    Ok(())
+}
+
 fn mod_logo_url(item: &ModioMod) -> Option<String> {
     [
         item.logo.thumb_320x180.as_str(),
@@ -738,6 +857,21 @@ fn file_to_option(file: ModioFile, primary_file_id: Option<u64>) -> OnlineModFil
     }
 }
 
+fn include_primary_file(
+    mut files: Vec<ModioFile>,
+    primary_file: Option<&ModioFile>,
+    expected_mod_id: u64,
+) -> Vec<ModioFile> {
+    if let Some(primary) = primary_file.filter(|file| {
+        file.mod_id == expected_mod_id
+            && file_is_installable(file)
+            && !files.iter().any(|candidate| candidate.id == file.id)
+    }) {
+        files.push(primary.clone());
+    }
+    files
+}
+
 fn file_is_installable(file: &ModioFile) -> bool {
     file.id > 0
         && file.mod_id > 0
@@ -755,11 +889,17 @@ fn choose_file(
     files: &[ModioFile],
     expected_mod_id: u64,
     selected_file_id: Option<&str>,
+    primary_file: Option<&ModioFile>,
 ) -> Result<ModioFile, String> {
     if let Some(selected) = selected_file_id {
         let selected = selected
             .parse::<u64>()
             .map_err(|_| "The selected mod.io file id is invalid.".to_string())?;
+        if let Some(primary) = primary_file.filter(|file| {
+            file.id == selected && file.mod_id == expected_mod_id && file_is_installable(file)
+        }) {
+            return Ok(primary.clone());
+        }
         return files
             .iter()
             .find(|file| {
@@ -769,6 +909,11 @@ fn choose_file(
             .ok_or_else(|| {
                 "The selected mod.io file is no longer a clean supported archive.".to_string()
             });
+    }
+    if let Some(primary) = primary_file {
+        if primary.mod_id == expected_mod_id && file_is_installable(primary) {
+            return Ok(primary.clone());
+        }
     }
     files
         .iter()
@@ -1030,6 +1175,24 @@ fn unix_timestamp(timestamp: i64) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn clean_modio_file(id: u64, mod_id: u64, timestamp: i64) -> ModioFile {
+        ModioFile {
+            id,
+            mod_id,
+            date_added: timestamp,
+            date_updated: timestamp,
+            virus_status: 1,
+            virus_positive: 0,
+            filesize: 10,
+            filename: format!("file-{id}.zip"),
+            download: ModioDownload {
+                binary_url: format!("https://assets.modcdn.io/file-{id}.zip"),
+                date_expires: 0,
+            },
+            ..ModioFile::default()
+        }
+    }
+
     #[test]
     fn key_shape_validation_never_accepts_partial_or_query_text() {
         assert!(validate_api_key_shape("0123456789abcdef0123456789abcdef").is_ok());
@@ -1091,6 +1254,58 @@ mod tests {
     }
 
     #[test]
+    fn declared_primary_file_wins_over_a_newer_auxiliary_archive() {
+        let older_primary = clean_modio_file(10, 77, 100);
+        let newer_auxiliary = clean_modio_file(11, 77, 200);
+        let files = vec![newer_auxiliary.clone()];
+
+        let listed_files = include_primary_file(files.clone(), Some(&older_primary), 77);
+        assert!(listed_files.iter().any(|file| file.id == older_primary.id));
+
+        assert_eq!(
+            choose_file(&files, 77, None, Some(&older_primary))
+                .unwrap()
+                .id,
+            older_primary.id
+        );
+        assert_eq!(
+            choose_file(&files, 77, Some("11"), Some(&older_primary))
+                .unwrap()
+                .id,
+            newer_auxiliary.id
+        );
+
+        let rejected_primary = ModioFile {
+            virus_positive: 1,
+            ..older_primary
+        };
+        assert_eq!(
+            choose_file(&files, 77, None, Some(&rejected_primary))
+                .unwrap()
+                .id,
+            newer_auxiliary.id
+        );
+    }
+
+    #[test]
+    fn reported_mod_dependencies_fail_closed_before_download() {
+        let item = ModioMod {
+            name: "Dependent overhaul".to_string(),
+            dependencies: true,
+            ..ModioMod::default()
+        };
+        let error = ensure_dependencies_supported(&item).unwrap_err();
+        assert!(error.contains("required mod dependencies"));
+        assert!(error.contains("No files were downloaded or installed"));
+
+        assert!(ensure_dependencies_supported(&ModioMod {
+            dependencies: false,
+            ..item
+        })
+        .is_ok());
+    }
+
+    #[test]
     fn steam_link_must_match_the_verified_profile_when_present() {
         let mut game = ModioGame {
             id: 77,
@@ -1137,5 +1352,26 @@ mod tests {
             ..ModioGame::default()
         }));
         assert!(!modio_game_allows_api_key_downloads(&ModioGame::default()));
+    }
+
+    #[test]
+    fn metadata_learning_excludes_runtime_and_non_game_catalogue_rows() {
+        let mut item = ModioMod {
+            id: 77,
+            game_id: 12,
+            status: 1,
+            visible: 1,
+            name: "Gameplay Overhaul".to_string(),
+            revenue_type: Some(0),
+            modfile: Some(clean_modio_file(10, 77, 100)),
+            ..ModioMod::default()
+        };
+        assert!(mod_is_discoverable_metadata(&item, "12"));
+
+        item.name = "UE4SS for Example Game".to_string();
+        assert!(!mod_is_discoverable_metadata(&item, "12"));
+
+        item.name = "Gameplay Overhaul".to_string();
+        assert!(!mod_is_discoverable_metadata(&item, "13"));
     }
 }

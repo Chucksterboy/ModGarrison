@@ -213,11 +213,18 @@ export const desktopApi: DesktopApi = {
       modId: mod.id,
       providerGameId: mod.providerGameId
     }),
-  preflightDiscoveredModInstall: (profileId: string, mod: OnlineModRecord) =>
+  preflightDiscoveredModInstall: (
+    profileId: string,
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption
+  ) =>
     invoke<InstallPreflightResult>("preflight_discovered_mod_install", {
       profileId,
       provider: mod.provider,
-      modId: mod.id
+      modId: mod.id,
+      version: file?.version ?? mod.version,
+      providerGameId: mod.providerGameId,
+      selectedFileId: file?.id
     }),
   installDiscoveredMod: (
     profileId: string,

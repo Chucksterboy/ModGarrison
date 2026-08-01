@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { NoticeBanner } from "./App";
+import { FeedbackBanners, NoticeBanner } from "./App";
 
 afterEach(cleanup);
 
@@ -37,5 +37,33 @@ describe("NoticeBanner", () => {
     expect(screen.getByRole("alert").getAttribute("aria-live")).toBe(
       "assertive"
     );
+  });
+});
+
+describe("FeedbackBanners", () => {
+  it("renders a matching structured error only once", () => {
+    const detail = "The provider request could not be completed.";
+    render(
+      <FeedbackBanners
+        error={detail}
+        notice={{
+          detail,
+          kind: "error",
+          motionId: 3,
+          title: "Discovery failed"
+        }}
+      />
+    );
+
+    expect(screen.getAllByText(detail)).toHaveLength(1);
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("keeps an error-only fallback assertive and accessible", () => {
+    render(<FeedbackBanners error="The backend did not respond." />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert.getAttribute("aria-live")).toBe("assertive");
+    expect(alert.getAttribute("aria-atomic")).toBe("true");
   });
 });

@@ -155,6 +155,26 @@ interface PendingDependencyPrompt {
   preflight: InstallPreflightResult;
 }
 
+interface PendingOnlineInstallTargetPrompt {
+  kind: "online";
+  profileId: string;
+  mod: OnlineModRecord;
+  file?: OnlineModFileOption;
+  selection?: OnlineInstallSelection;
+  targets: InstallTargetOption[];
+}
+
+interface PendingManualInstallTargetPrompt {
+  kind: "manual";
+  profileId: string;
+  analysis: ArchiveAnalysis;
+  targets: InstallTargetOption[];
+}
+
+type PendingInstallTargetPrompt =
+  | PendingOnlineInstallTargetPrompt
+  | PendingManualInstallTargetPrompt;
+
 interface PendingNexusInstall {
   profileId: string;
   modId: string;
@@ -173,6 +193,36 @@ interface DiscoveryLoadCriteria {
   provider?: OnlineModProvider;
 }
 
+export function reconcileDiscoveryProviders(
+  current: OnlineModProviderOption[],
+  incoming: OnlineModProviderOption[],
+  criteria: Pick<DiscoveryLoadCriteria, "page" | "query" | "provider">
+): OnlineModProviderOption[] {
+  const dedupe = (providers: OnlineModProviderOption[]) => {
+    const unique = new Map<OnlineModProvider, OnlineModProviderOption>();
+    providers.forEach((provider) => {
+      if (!unique.has(provider.id)) {
+        unique.set(provider.id, provider);
+      }
+    });
+    return Array.from(unique.values());
+  };
+
+  if (criteria.page === 1 && !criteria.provider && !criteria.query.trim()) {
+    return dedupe(incoming);
+  }
+
+  const merged = new Map(
+    dedupe(current).map((provider) => [provider.id, provider])
+  );
+  dedupe(incoming).forEach((provider) => {
+    if (!merged.has(provider.id)) {
+      merged.set(provider.id, provider);
+    }
+  });
+  return Array.from(merged.values());
+}
+
 interface Notice {
   motionId: number;
   kind: NoticeKind;
@@ -188,6 +238,28 @@ interface RecentActivity {
 }
 
 type NoticeInput = Omit<Notice, "motionId">;
+
+export function buildDiscoveryNotice(
+  profileName: string,
+  result: Pick<
+    DiscoveryPage,
+    "complete" | "indexed" | "providerWarnings" | "total" | "totalIsExact"
+  >
+): NoticeInput {
+  const providerWarning = result.providerWarnings.filter(Boolean).join(" ");
+  const progressDetail =
+    result.complete && result.totalIsExact
+      ? `${profileName}: found ${result.total} online mod(s).`
+      : result.indexed === 0 && result.total === 0
+        ? `${profileName}: checking online providers; results will appear as indexing continues.`
+        : `${profileName}: indexed ${result.indexed} mod(s), with approximately ${result.total} currently reported.`;
+
+  return {
+    kind: providerWarning ? "warning" : "success",
+    title: providerWarning ? "Discovery partially updated" : "Discovery updated",
+    detail: [progressDetail, providerWarning].filter(Boolean).join(" ")
+  };
+}
 
 interface ConfigModalState {
   mod: InstalledModRecord;
@@ -400,6 +472,8 @@ export function App() {
   const [forceRemovalPrompt, setForceRemovalPrompt] = useState<ForceRemovalPrompt | null>(null);
   const [pendingDependencyPrompt, setPendingDependencyPrompt] =
     useState<PendingDependencyPrompt | null>(null);
+  const [pendingInstallTargetPrompt, setPendingInstallTargetPrompt] =
+    useState<PendingInstallTargetPrompt | null>(null);
   const selectedProfileIdRef = useRef("");
   const discoverProfileIdRef = useRef("");
   const appShellRef = useRef<HTMLElement>(null);
@@ -418,6 +492,7 @@ export function App() {
   const activeViewRef = useRef<ViewMode>(activeView);
   const processedNxmLinks = useRef(new Set<string>());
   const pendingNexusInstallRef = useRef<PendingNexusInstall | null>(null);
+  const onlineInstallInFlightRef = useRef("");
   const pendingNexusInstallTimeoutRef = useRef<number | null>(null);
   const installSoundPlayers = useRef<Record<InstallSoundKind, HTMLAudioElement> | null>(null);
   const gameLaunchStateRef = useRef<GameLaunchState>("idle");
@@ -562,6 +637,7 @@ export function App() {
   const profileRemovalPresence = useFadePresence(profilePendingRemoval);
   const forceRemovalPresence = useFadePresence(forceRemovalPrompt);
   const dependencyPromptPresence = useFadePresence(pendingDependencyPrompt);
+  const installTargetPromptPresence = useFadePresence(pendingInstallTargetPrompt);
   const profileCreatorPresence = useFadePresence(profileCreatorOpen ? true : null);
   const noticePresence = useFadePresence(notice, 140);
   const errorPresence = useFadePresence(error ? error : null, 140);
@@ -571,6 +647,7 @@ export function App() {
       profileRemovalPresence.value ||
       forceRemovalPresence.value ||
       dependencyPromptPresence.value ||
+      installTargetPromptPresence.value ||
       profileCreatorPresence.value
   );
   const selectedProfile = useMemo(
@@ -1143,6 +1220,7 @@ export function App() {
       rememberBoundedSetValue(processedNxmLinks.current, replayKey, maxProcessedNxmLinks);
       const pendingInstall = pendingNexusInstallRef.current;
       const activeModId = pendingInstall?.modId ?? nexusModIdFromNxmUrl(nxmUrl) ?? "nexus-handoff";
+      onlineInstallInFlightRef.current = activeModId;
       setError("");
       setInstallingOnlineModId(activeModId);
       setStatus("Installing Nexus download");
@@ -1189,6 +1267,9 @@ export function App() {
           pendingNexusInstallTimeoutRef.current = null;
         }
         pendingNexusInstallRef.current = null;
+        if (onlineInstallInFlightRef.current === activeModId) {
+          onlineInstallInFlightRef.current = "";
+        }
         setInstallingOnlineModId("");
       }
     }
@@ -1692,6 +1773,7 @@ export function App() {
       setDetection(null);
       setSelectedSteamGameAppId("");
       setProfileInput(emptyProfileInput);
+      let settledProfile = profile;
       let dependencyDetail = "";
       let dependencyWarnings: string[] = [];
       try {
@@ -1707,17 +1789,28 @@ export function App() {
         dependencyWarnings = [String(caughtError)];
       }
 
+      try {
+        const reloadedProfiles = await api.listProfiles();
+        settledProfile =
+          reloadedProfiles.find((candidate) => candidate.id === profile.id) ?? profile;
+        setProfiles(reloadedProfiles);
+      } catch {
+        // Keep the newly created snapshot if a follow-up read is temporarily unavailable.
+      }
+
       setStatus("Steam profile created");
       setNotice({
         kind:
-          profile.engine === "unknown" || profile.loader === "none" || dependencyWarnings.length > 0
+          settledProfile.engine === "unknown" ||
+          settledProfile.loader === "none" ||
+          dependencyWarnings.length > 0
             ? "warning"
             : "success",
         title: "Steam profile created",
         detail:
-          profile.engine === "unknown" || profile.loader === "none"
-            ? `${profile.name} was added from Steam, but detection may need review before installing mods.`
-            : `${profile.name} was added with Steam launch support.${dependencyDetail}${
+          settledProfile.engine === "unknown" || settledProfile.loader === "none"
+            ? `${settledProfile.name} was added from Steam, but detection may need review before installing mods.`
+            : `${settledProfile.name} was added with Steam launch support.${dependencyDetail}${
                 dependencyWarnings.length > 0 ? ` ${dependencyWarnings[0]}` : ""
               }`
       });
@@ -1907,8 +2000,7 @@ export function App() {
 
   function applyDiscoveryPage(
     result: DiscoveryPage,
-    profileId: string,
-    provider?: OnlineModProvider
+    criteria: DiscoveryLoadCriteria
   ) {
     const currentPageItems = result.items.slice(0, discoverPageSize);
     rememberOnlineModPresentations(currentPageItems);
@@ -1917,16 +2009,10 @@ export function App() {
     setOnlineModIndexed(result.indexed);
     setOnlineModComplete(result.complete);
     setOnlineModTotalIsExact(result.totalIsExact);
-    setDiscoverAvailableProviders((current) => {
-      if (!provider) {
-        return result.availableProviders;
-      }
-
-      const merged = new Map(current.map((option) => [option.id, option]));
-      result.availableProviders.forEach((option) => merged.set(option.id, option));
-      return Array.from(merged.values());
-    });
-    setDiscoverLoadedProfileId(profileId);
+    setDiscoverAvailableProviders((current) =>
+      reconcileDiscoveryProviders(current, result.availableProviders, criteria)
+    );
+    setDiscoverLoadedProfileId(criteria.profileId);
     setDiscoverProviderWarning(result.providerWarnings.filter(Boolean).join(" "));
   }
 
@@ -1976,13 +2062,17 @@ export function App() {
           return false;
         }
 
-        applyDiscoveryPage(result, criteria.profileId, criteria.provider);
+        applyDiscoveryPage(result, criteria);
         if (result.complete) {
           setIsWarmingDiscovery(false);
           setStatus(
             result.providerWarnings.some(Boolean)
               ? "Discovery ready with warnings"
               : "Discovery ready"
+          );
+          const profile = profiles.find((item) => item.id === criteria.profileId);
+          setNotice(
+            buildDiscoveryNotice(profile?.name ?? "Selected profile", result)
           );
           return false;
         }
@@ -1995,6 +2085,11 @@ export function App() {
           );
           setIsWarmingDiscovery(false);
           setStatus("Discovery ready with warnings");
+          setNotice({
+            kind: "warning",
+            title: "Background indexing paused",
+            detail: warmWarning
+          });
         }
         return false;
       } finally {
@@ -2039,7 +2134,7 @@ export function App() {
         return false;
       }
 
-      applyDiscoveryPage(result, profileId, provider);
+      applyDiscoveryPage(result, criteria);
       const providerWarning = result.providerWarnings.filter(Boolean).join(" ");
       setStatus(
         providerWarning
@@ -2049,18 +2144,7 @@ export function App() {
             : "Indexing online mods"
       );
       const profile = profiles.find((item) => item.id === profileId);
-      setNotice({
-        kind: providerWarning ? "warning" : "success",
-        title: providerWarning ? "Discovery partially updated" : "Discovery updated",
-        detail: [
-          result.complete && result.totalIsExact
-            ? `${profile?.name ?? "Selected profile"}: found ${result.total} online mod(s).`
-            : `${profile?.name ?? "Selected profile"}: indexed ${result.indexed} mod(s), with approximately ${result.total} currently reported.`,
-          providerWarning
-        ]
-          .filter(Boolean)
-          .join(" ")
-      });
+      setNotice(buildDiscoveryNotice(profile?.name ?? "Selected profile", result));
       if (!result.complete) {
         scheduleOnlineModWarm(criteria, generation);
       }
@@ -2097,7 +2181,7 @@ export function App() {
     mod: OnlineModRecord,
     file?: OnlineModFileOption,
     selection?: OnlineInstallSelection,
-    skipDependencyPrompt = false,
+    skipPreflight = false,
     requestedProfileId?: string
   ) {
     const targetProfileId = requestedProfileId ?? discoverProfileIdRef.current;
@@ -2110,21 +2194,63 @@ export function App() {
       return;
     }
 
-    if (mod.provider === "nexus" && !skipDependencyPrompt) {
+    if (onlineInstallInFlightRef.current) {
+      setNotice({
+        kind: "warning",
+        title: "Installation already running",
+        detail: "Wait for the current mod installation to finish before starting another one."
+      });
+      return;
+    }
+    onlineInstallInFlightRef.current = mod.id;
+    setInstallingOnlineModId(mod.id);
+
+    let effectiveSelection = selection;
+    if (!skipPreflight) {
       try {
-        const preflight = await api.preflightDiscoveredModInstall(targetProfileId, mod);
+        const preflight = await api.preflightDiscoveredModInstall(targetProfileId, mod, file);
+        if (!effectiveSelection?.installTargetId && preflight.installTargets.length === 1) {
+          effectiveSelection = {
+            ...effectiveSelection,
+            installTargetId: preflight.installTargets[0].id
+          };
+        }
         if (preflight.confirmationRequired) {
-          setPendingDependencyPrompt({ profileId: targetProfileId, mod, file, selection, preflight });
+          onlineInstallInFlightRef.current = "";
+          setInstallingOnlineModId("");
+          setPendingDependencyPrompt({
+            profileId: targetProfileId,
+            mod,
+            file,
+            selection: effectiveSelection,
+            preflight
+          });
           setStatus("Dependency confirmation needed");
           return;
         }
+        if (!effectiveSelection?.installTargetId && preflight.installTargets.length > 1) {
+          onlineInstallInFlightRef.current = "";
+          setInstallingOnlineModId("");
+          setPendingInstallTargetPrompt({
+            kind: "online",
+            profileId: targetProfileId,
+            mod,
+            file,
+            selection: effectiveSelection,
+            targets: preflight.installTargets
+          });
+          setStatus("Install target needed");
+          return;
+        }
       } catch (caughtError) {
+        onlineInstallInFlightRef.current = "";
+        setInstallingOnlineModId("");
         playInstallSound("failure");
         setError(String(caughtError));
-        setStatus("Dependency check failed");
+        setStatus("Install preflight failed");
         setNotice({
           kind: "error",
-          title: "Could not verify requirements",
+          title: "Could not prepare installation",
           detail: String(caughtError)
         });
         return;
@@ -2133,7 +2259,6 @@ export function App() {
 
     if (file?.action === "browser") {
       setError("");
-      setInstallingOnlineModId(mod.id);
       pendingNexusInstallRef.current = { profileId: targetProfileId, modId: mod.id };
       if (pendingNexusInstallTimeoutRef.current !== null) {
         window.clearTimeout(pendingNexusInstallTimeoutRef.current);
@@ -2141,6 +2266,9 @@ export function App() {
       pendingNexusInstallTimeoutRef.current = window.setTimeout(() => {
         if (pendingNexusInstallRef.current?.modId === mod.id) {
           pendingNexusInstallRef.current = null;
+          if (onlineInstallInFlightRef.current === mod.id) {
+            onlineInstallInFlightRef.current = "";
+          }
           setInstallingOnlineModId("");
           setStatus("Nexus confirmation expired");
         }
@@ -2151,7 +2279,7 @@ export function App() {
           targetProfileId,
           mod,
           file,
-          selection
+          effectiveSelection
         );
         await openExternalUrl(downloadPageUrl);
         setStatus("Waiting for Nexus confirmation");
@@ -2166,6 +2294,9 @@ export function App() {
           pendingNexusInstallTimeoutRef.current = null;
         }
         pendingNexusInstallRef.current = null;
+        if (onlineInstallInFlightRef.current === mod.id) {
+          onlineInstallInFlightRef.current = "";
+        }
         setInstallingOnlineModId("");
         playInstallSound("failure");
         setError(String(caughtError));
@@ -2180,11 +2311,15 @@ export function App() {
     }
 
     if (file?.action === "auth") {
+      onlineInstallInFlightRef.current = "";
+      setInstallingOnlineModId("");
       openNexusAuthSettings();
       return;
     }
 
     if (!mod.installSupported || file?.action === "unsupported") {
+      onlineInstallInFlightRef.current = "";
+      setInstallingOnlineModId("");
       setNotice({
         kind: "warning",
         title: "Install needs provider support",
@@ -2194,10 +2329,14 @@ export function App() {
     }
 
     setError("");
-    setInstallingOnlineModId(mod.id);
     setStatus("Installing online mod");
     try {
-      const result = await api.installDiscoveredMod(targetProfileId, mod, file, selection);
+      const result = await api.installDiscoveredMod(
+        targetProfileId,
+        mod,
+        file,
+        effectiveSelection
+      );
       playInstallSound("success");
       setOnlineInstallCompletionId((current) => current + 1);
       if (discoverProfileIdRef.current === targetProfileId) {
@@ -2224,6 +2363,9 @@ export function App() {
         detail: String(caughtError)
       });
     } finally {
+      if (onlineInstallInFlightRef.current === mod.id) {
+        onlineInstallInFlightRef.current = "";
+      }
       setInstallingOnlineModId("");
     }
   }
@@ -2274,7 +2416,39 @@ export function App() {
       return;
     }
 
+    if (!prompt.selection?.installTargetId && prompt.preflight.installTargets.length > 1) {
+      setPendingInstallTargetPrompt({
+        kind: "online",
+        profileId: prompt.profileId,
+        mod: prompt.mod,
+        file: prompt.file,
+        selection: prompt.selection,
+        targets: prompt.preflight.installTargets
+      });
+      setStatus("Install target needed");
+      return;
+    }
+
     await installOnlineMod(prompt.mod, prompt.file, prompt.selection, true, prompt.profileId);
+  }
+
+  async function confirmInstallTarget(
+    prompt: PendingInstallTargetPrompt,
+    installTargetId: string
+  ) {
+    setPendingInstallTargetPrompt(null);
+    if (prompt.kind === "manual") {
+      await installAnalysis(prompt.analysis, installTargetId, prompt.profileId);
+      return;
+    }
+
+    await installOnlineMod(
+      prompt.mod,
+      prompt.file,
+      { ...prompt.selection, installTargetId },
+      true,
+      prompt.profileId
+    );
   }
 
   function openNexusAuthSettings() {
@@ -2402,8 +2576,13 @@ export function App() {
     }
   }
 
-  async function installAnalysis(nextAnalysis: ArchiveAnalysis) {
-    if (!selectedProfile) {
+  async function installAnalysis(
+    nextAnalysis: ArchiveAnalysis,
+    installTargetId?: string,
+    requestedProfileId?: string
+  ) {
+    const targetProfileId = requestedProfileId ?? selectedProfile?.id;
+    if (!targetProfileId) {
       return;
     }
 
@@ -2421,21 +2600,36 @@ export function App() {
       return;
     }
 
+    const installTargets = nextAnalysis.installTargets ?? [];
+    const effectiveInstallTargetId =
+      installTargetId ?? (installTargets.length === 1 ? installTargets[0].id : undefined);
+    if (!effectiveInstallTargetId && installTargets.length > 1) {
+      setPendingInstallTargetPrompt({
+        kind: "manual",
+        profileId: targetProfileId,
+        analysis: nextAnalysis,
+        targets: installTargets
+      });
+      setStatus("Install target needed");
+      return;
+    }
+
     setIsInstalling(true);
     setStatus("Installing mod and dependencies");
     try {
       const result = await api.installArchive({
-        profileId: selectedProfile.id,
+        profileId: targetProfileId,
         archivePath: nextAnalysis.archivePath,
         archiveName: nextAnalysis.archiveName,
         packageIdentity: nextAnalysis.packageIdentity,
-        plan
+        plan,
+        installTargetId: effectiveInstallTargetId
       });
       playInstallSound("success");
-      await refreshInstalledMods(selectedProfile.id).catch(() => undefined);
+      await refreshInstalledMods(targetProfileId).catch(() => undefined);
       setStatus("Mod installed");
       setNotice({
-        kind: "success",
+        kind: result.warnings.length > 0 ? "warning" : "success",
         title: "Mod installed",
         detail: installSuccessDetail(nextAnalysis.archiveName, result.filesWritten.length, result.warnings)
       });
@@ -2474,14 +2668,20 @@ export function App() {
       setStatus(result.status === "removed" ? "Mod removed" : "Mod updated");
       const modName = displayModName(mod);
       setNotice({
-        kind: result.status === "removed" ? "warning" : "success",
+        kind:
+          result.status === "removed" || result.warnings.length > 0
+            ? "warning"
+            : "success",
         title:
           result.status === "removed"
             ? "Mod removed"
             : result.status === "disabled"
               ? "Mod disabled"
               : "Mod enabled",
-        detail: `${modName}: ${result.filesChanged.length} file(s) changed.`
+        detail: [
+          `${modName}: ${result.filesChanged.length} file(s) changed.`,
+          ...result.warnings
+        ].join(" ")
       });
     } catch (caughtError) {
       const detail = forceRemovalDetail(caughtError);
@@ -2682,9 +2882,13 @@ export function App() {
     if (!selectedProfile) {
       throw new Error("Create or select a game profile before editing config files.");
     }
+    if (!configModal?.mod.id) {
+      throw new Error("The selected mod is no longer available for configuration editing.");
+    }
 
     const updatedFile = await api.updateModConfigValue({
       profileId: selectedProfile.id,
+      installedModId: configModal.mod.id,
       filePath: file.path,
       section: entry.section,
       key: entry.key,
@@ -2705,6 +2909,7 @@ export function App() {
   const profileToRemove = profileRemovalPresence.value;
   const forceRemoval = forceRemovalPresence.value;
   const dependencyPrompt = dependencyPromptPresence.value;
+  const installTargetPrompt = installTargetPromptPresence.value;
 
   function startTitlebarDrag(event: ReactMouseEvent<HTMLElement>) {
     if (event.button !== 0 || event.defaultPrevented) {
@@ -2915,6 +3120,13 @@ export function App() {
                 : "workspace"
         } view-motion ${viewMotion.className}`}
       >
+        <FeedbackBanners
+          error={errorPresence.value ?? ""}
+          errorMotionClassName={errorPresence.className}
+          errorMotionId={errorMotionId}
+          notice={noticePresence.value}
+          noticeMotionClassName={noticePresence.className}
+        />
         {renderedView === "manager" ? (
           <>
         <header className="topbar">
@@ -2942,21 +3154,6 @@ export function App() {
             <strong>{installedMods.filter((mod) => !mod.enabled).length}</strong>
           </div>
         </div>
-
-        {errorPresence.value ? (
-          <div className={`error-banner ${errorPresence.className}`} key={errorMotionId}>
-            <AlertTriangle size={18} />
-            <span>{errorPresence.value}</span>
-          </div>
-        ) : null}
-
-        {noticePresence.value ? (
-          <NoticeBanner
-            key={noticePresence.value.motionId}
-            notice={noticePresence.value}
-            motionClassName={noticePresence.className}
-          />
-        ) : null}
 
         <section className="profile-command-panel vault-game-hero">
           <GameHeroArtwork profile={selectedProfile} />
@@ -3398,6 +3595,21 @@ export function App() {
         onConfirm={() => void confirmDependencyInstall(dependencyPrompt)}
       />
     ) : null}
+    {installTargetPrompt ? (
+      <InstallTargetDialog
+        modName={
+          installTargetPrompt.kind === "online"
+            ? installTargetPrompt.mod.name
+            : installTargetPrompt.analysis.archiveName
+        }
+        motionClassName={installTargetPromptPresence.className}
+        targets={installTargetPrompt.targets}
+        onCancel={() => setPendingInstallTargetPrompt(null)}
+        onConfirm={(installTargetId) =>
+          void confirmInstallTarget(installTargetPrompt, installTargetId)
+        }
+      />
+    ) : null}
     </>
   );
 }
@@ -3740,6 +3952,104 @@ interface DependencyInstallDialogProps {
   motionClassName: string;
   onCancel(): void;
   onConfirm(): void;
+}
+
+interface InstallTargetDialogProps {
+  modName: string;
+  motionClassName: string;
+  targets: InstallTargetOption[];
+  onCancel(): void;
+  onConfirm(installTargetId: string): void;
+}
+
+export function InstallTargetDialog({
+  modName,
+  motionClassName,
+  targets,
+  onCancel,
+  onConfirm
+}: InstallTargetDialogProps) {
+  const initialTarget =
+    targets.find((target) => target.recommended) ?? targets[0];
+  const [selectedTargetId, setSelectedTargetId] = useState(initialTarget?.id ?? "");
+
+  useEffect(() => {
+    const nextTarget = targets.find((target) => target.recommended) ?? targets[0];
+    setSelectedTargetId(nextTarget?.id ?? "");
+  }, [modName, targets]);
+
+  return (
+    <div className={`modal-backdrop ${motionClassName}`} onMouseDown={onCancel}>
+      <section
+        aria-label={`Choose install target for ${modName}`}
+        className="confirm-modal install-target-confirm-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="confirm-icon dependency-confirm-icon">
+          <FolderOpen size={22} />
+        </div>
+        <div className="confirm-copy">
+          <p className="eyebrow">Verified Install Targets</p>
+          <h3>{modName}</h3>
+          <p>
+            This package supports more than one real game directory. Choose one; only that
+            target will be installed.
+          </p>
+          <div
+            aria-label={`Install target for ${modName}`}
+            className="install-target-confirm-list"
+            role="radiogroup"
+          >
+            {targets.map((target) => {
+              const selected = target.id === selectedTargetId;
+              return (
+                <label
+                  className={
+                    selected
+                      ? "install-target-confirm-option selected"
+                      : "install-target-confirm-option"
+                  }
+                  key={target.id}
+                >
+                  <input
+                    checked={selected}
+                    name="prepared-install-target"
+                    onChange={() => setSelectedTargetId(target.id)}
+                    type="radio"
+                    value={target.id}
+                  />
+                  {selected ? (
+                    <CheckCircle2 aria-hidden="true" size={17} />
+                  ) : (
+                    <FolderOpen aria-hidden="true" size={17} />
+                  )}
+                  <span>
+                    <strong>{target.label}</strong>
+                    <small>{target.relativePath}</small>
+                  </span>
+                  <b>{target.recommended ? "Recommended" : "Available"}</b>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+        <div className="confirm-actions">
+          <button className="secondary-button compact-button" onClick={onCancel} type="button">
+            Cancel
+          </button>
+          <button
+            className="primary-button compact-button"
+            disabled={!selectedTargetId}
+            onClick={() => onConfirm(selectedTargetId)}
+            type="button"
+          >
+            Install Here
+          </button>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function DependencyInstallDialog({
@@ -4222,6 +4532,7 @@ export function DiscoverView({
     [availableProviders]
   );
   const visibleMods = mods;
+  const hasSearchQuery = query.trim().length > 0;
   const totalIsFinal = complete && totalIsExact;
   const currentPageEnd = (page - 1) * discoverPageSize + visibleMods.length;
   const pageableTotal = totalIsFinal ? total : Math.max(indexed, currentPageEnd);
@@ -4506,6 +4817,7 @@ export function DiscoverView({
               <OnlineModCard
                 expanded={expandedModId === mod.id}
                 installedMod={installedMod}
+                installBlocked={Boolean(installingModId) && installingModId !== mod.id}
                 installing={installingModId === mod.id}
                 key={`${mod.provider}:${mod.id}:${mod.version}`}
                 mod={displayedMod}
@@ -4523,19 +4835,15 @@ export function DiscoverView({
               <p>Select a profile, then load online mods when you are ready.</p>
             </div>
           ) : null}
-          {!isLoading && hasLoaded && mods.length === 0 ? (
+          {!isLoading && hasLoaded && visibleMods.length === 0 ? (
             <div className="empty-mods discover-empty">
-              <Compass size={26} />
+              {hasSearchQuery ? <Search size={24} /> : <Compass size={26} />}
               <p>
-                {providerWarning ||
-                  "No online provider results were found for this profile."}
+                {hasSearchQuery
+                  ? "No online mods match that search."
+                  : providerWarning ||
+                    "No online provider results were found for this profile."}
               </p>
-            </div>
-          ) : null}
-          {!isLoading && hasLoaded && mods.length > 0 && visibleMods.length === 0 ? (
-            <div className="empty-mods discover-empty">
-              <Search size={24} />
-              <p>No online mods match that search.</p>
             </div>
           ) : null}
           {pageableTotal > discoverPageSize ? (
@@ -4699,6 +5007,7 @@ function DiscoveryPagination({
 interface OnlineModCardProps {
   expanded: boolean;
   installedMod?: InstalledModRecord;
+  installBlocked: boolean;
   installing: boolean;
   mod: OnlineModRecord;
   onInstall(
@@ -4715,6 +5024,7 @@ interface OnlineModCardProps {
 function OnlineModCard({
   expanded,
   installedMod,
+  installBlocked,
   installing,
   mod,
   onInstall,
@@ -4738,6 +5048,7 @@ function OnlineModCard({
   const pageUrl = mod.packageUrl ?? mod.websiteUrl;
   const installDisabled =
     installing ||
+    installBlocked ||
     (isSteamManaged ? !pageUrl : !mod.installSupported && !needsAuth);
   const replacementSelection: OnlineInstallSelection | undefined = installedMod
     ? {
@@ -4786,6 +5097,7 @@ function OnlineModCard({
             : "Select a File";
   const selectedActionDisabled =
     installing ||
+    installBlocked ||
     !selectedFile ||
     selectedFile.action === "unsupported" ||
     selectedFile.action === "auth";
@@ -6105,6 +6417,50 @@ function DetectionWarning({ detection, detectionIssue, isDetecting }: DetectionW
 interface NoticeBannerProps {
   motionClassName?: string;
   notice: Notice;
+}
+
+interface FeedbackBannersProps {
+  error?: string;
+  errorMotionClassName?: string;
+  errorMotionId?: number;
+  notice?: Notice | null;
+  noticeMotionClassName?: string;
+}
+
+export function FeedbackBanners({
+  error = "",
+  errorMotionClassName = "",
+  errorMotionId = 0,
+  notice = null,
+  noticeMotionClassName = ""
+}: FeedbackBannersProps) {
+  const rawError = error.trim();
+  const structuredErrorDuplicatesRaw =
+    Boolean(rawError) && notice?.kind === "error" && notice.detail.trim() === rawError;
+
+  return (
+    <>
+      {rawError && !structuredErrorDuplicatesRaw ? (
+        <div
+          aria-atomic="true"
+          aria-live="assertive"
+          className={`error-banner ${errorMotionClassName}`}
+          key={errorMotionId}
+          role="alert"
+        >
+          <AlertTriangle aria-hidden="true" size={18} />
+          <span>{rawError}</span>
+        </div>
+      ) : null}
+      {notice ? (
+        <NoticeBanner
+          key={notice.motionId}
+          notice={notice}
+          motionClassName={noticeMotionClassName}
+        />
+      ) : null}
+    </>
+  );
 }
 
 export function NoticeBanner({ motionClassName = "", notice }: NoticeBannerProps) {

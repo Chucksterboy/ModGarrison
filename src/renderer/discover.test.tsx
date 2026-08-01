@@ -14,7 +14,12 @@ import type {
   OnlineModProviderOption,
   OnlineModRecord
 } from "../shared/contracts";
-import { DiscoverView, ProgressiveDiscoveryCoordinator } from "./App";
+import {
+  buildDiscoveryNotice,
+  DiscoverView,
+  ProgressiveDiscoveryCoordinator,
+  reconcileDiscoveryProviders
+} from "./App";
 
 const profile: GameProfile = {
   id: "profile-mound",
@@ -197,6 +202,84 @@ function renderDiscover(
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("Discovery result presentation", () => {
+  it("keeps known game providers while a filtered query has no matches", () => {
+    expect(
+      reconcileDiscoveryProviders(availableProviders.slice(0, 1), [], {
+        page: 1,
+        query: "no matches",
+        provider: undefined
+      })
+    ).toEqual(availableProviders.slice(0, 1));
+  });
+
+  it("replaces stale providers only for an unfiltered first page", () => {
+    expect(
+      reconcileDiscoveryProviders(availableProviders.slice(0, 2), [availableProviders[2]], {
+        page: 1,
+        query: "",
+        provider: undefined
+      })
+    ).toEqual([availableProviders[2]]);
+  });
+
+  it("merges provider-specific responses into the known game providers", () => {
+    expect(
+      reconcileDiscoveryProviders(availableProviders.slice(0, 1), [availableProviders[1]], {
+        page: 1,
+        query: "",
+        provider: "nexus"
+      })
+    ).toEqual(availableProviders.slice(0, 2));
+  });
+
+  it("does not announce a misleading approximate zero while providers are warming", () => {
+    const notice = buildDiscoveryNotice(profile.name, {
+      complete: false,
+      indexed: 0,
+      providerWarnings: [],
+      total: 0,
+      totalIsExact: false
+    });
+
+    expect(notice.detail).toContain("checking online providers");
+    expect(notice.detail).not.toContain("approximately 0");
+  });
+
+  it("announces the terminal result after background indexing completes", () => {
+    const notice = buildDiscoveryNotice(profile.name, {
+      complete: true,
+      indexed: 6,
+      providerWarnings: [],
+      total: 6,
+      totalIsExact: true
+    });
+
+    expect(notice.detail).toBe(`${profile.name}: found 6 online mod(s).`);
+  });
+
+  it("shows a search-specific empty state for server-filtered results", async () => {
+    vi.useFakeTimers();
+    renderDiscover(vi.fn().mockResolvedValue(true), {
+      availableProviders: availableProviders.slice(0, 1)
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("Search online mods"), {
+      target: { value: "zz-no-match" }
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("No online mods match that search.")).toBeTruthy();
+    expect(
+      screen.queryByText("No online provider results were found for this profile.")
+    ).toBeNull();
+    expect(screen.getByLabelText("Choose provider")).toBeTruthy();
+  });
 });
 
 describe("Progressive discovery coordination", () => {

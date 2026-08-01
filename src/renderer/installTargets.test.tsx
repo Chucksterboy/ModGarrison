@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InstallTargetOption } from "../shared/contracts";
 import {
   InstallTargetChoices,
+  InstallTargetDialog,
   InstallTargetPicker,
   LegacyInstallTargetChoices,
   installTargetRefreshWarning,
@@ -51,6 +52,35 @@ describe("selectedInstallTargetOption", () => {
         selectedInstallTargetId: "missing"
       })
     ).toBeUndefined();
+  });
+});
+
+describe("InstallTargetDialog", () => {
+  it("presents verified choices and confirms the selected real target", () => {
+    const onConfirm = vi.fn();
+
+    render(
+      <InstallTargetDialog
+        modName="Example Mod"
+        motionClassName=""
+        onCancel={() => undefined}
+        onConfirm={onConfirm}
+        targets={[clientTarget, serverTarget]}
+      />
+    );
+
+    expect(
+      screen.getByRole("dialog", { name: "Choose install target for Example Mod" })
+    ).toBeTruthy();
+    expect((screen.getByRole("radio", { name: /Client/ }) as HTMLInputElement).checked).toBe(
+      true
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: /Server/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Here" }));
+
+    expect(onConfirm).toHaveBeenCalledOnce();
+    expect(onConfirm).toHaveBeenCalledWith(serverTarget.id);
   });
 });
 

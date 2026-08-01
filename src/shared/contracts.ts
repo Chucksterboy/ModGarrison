@@ -184,6 +184,7 @@ export interface ArchiveAnalysis {
   compatibility: CompatibilityResult;
   plans: InstallPlan[];
   recommendedPlan?: InstallPlan;
+  installTargets?: InstallTargetOption[];
 }
 
 export interface InstallRequest {
@@ -192,6 +193,7 @@ export interface InstallRequest {
   archiveName?: string;
   packageIdentity?: PackageIdentity;
   plan: InstallPlan;
+  installTargetId?: string;
 }
 
 export interface InstallResult {
@@ -273,6 +275,7 @@ export interface ModConfigFile {
 
 export interface UpdateModConfigValueInput {
   profileId: string;
+  installedModId: string;
   filePath: string;
   section?: string;
   key: string;
@@ -559,7 +562,8 @@ export interface DesktopApi {
   ): Promise<OnlineModFileOption[]>;
   preflightDiscoveredModInstall(
     profileId: string,
-    mod: OnlineModRecord
+    mod: OnlineModRecord,
+    file?: OnlineModFileOption
   ): Promise<InstallPreflightResult>;
   installDiscoveredMod(
     profileId: string,

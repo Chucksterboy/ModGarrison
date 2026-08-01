@@ -8,7 +8,12 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock
 }));
 
-import type { ModActionResult } from "../shared/contracts";
+import type {
+  InstallRequest,
+  ModActionResult,
+  OnlineModFileOption,
+  OnlineModRecord
+} from "../shared/contracts";
 import { desktopApi } from "./tauriApi";
 
 beforeEach(() => {
@@ -54,6 +59,79 @@ describe("desktopApi.saveModioApiKey", () => {
     expect(invokeMock).toHaveBeenCalledWith("save_modio_api_key", {
       apiKey: "developer-key"
     });
+  });
+});
+
+describe("desktopApi install preparation", () => {
+  it("binds preflight to the exact provider game and selected artifact", async () => {
+    invokeMock.mockResolvedValue({
+      dependencies: [],
+      missingDependencies: [],
+      confirmationRequired: false,
+      installTargets: []
+    });
+    const mod = {
+      id: "modio:55/901",
+      provider: "modio",
+      providerGameId: "55",
+      version: "1.0.0"
+    } as OnlineModRecord;
+    const file = {
+      id: "artifact-77",
+      version: "1.1.0",
+      primary: false,
+      action: "direct"
+    } as OnlineModFileOption;
+
+    await desktopApi.preflightDiscoveredModInstall("profile-one", mod, file);
+
+    expect(invokeMock).toHaveBeenCalledWith("preflight_discovered_mod_install", {
+      profileId: "profile-one",
+      provider: "modio",
+      modId: "modio:55/901",
+      version: "1.1.0",
+      providerGameId: "55",
+      selectedFileId: "artifact-77"
+    });
+  });
+
+  it("passes the selected verified target with a manual install", async () => {
+    invokeMock.mockResolvedValue({
+      profileId: "profile-one",
+      archivePath: "C:/managed/mod.zip",
+      installedModId: "installed-one",
+      installedAt: "now",
+      filesWritten: [],
+      backupsWritten: [],
+      warnings: []
+    });
+    const request = {
+      profileId: "profile-one",
+      archivePath: "C:/Downloads/mod.zip",
+      archiveName: "mod.zip",
+      packageIdentity: {
+        provider: "unknown",
+        modTypes: [],
+        dependencies: [],
+        evidence: [],
+        confidence: 1
+      },
+      plan: {
+        adapterId: "unreal-pak",
+        adapterName: "Unreal Pak",
+        confidence: 1,
+        summary: "fixture",
+        mappings: [],
+        dependencies: [],
+        warnings: [],
+        requiresConfirmation: false
+      },
+      installTargetId: "unreal-pak|r5/content/paks/~mods"
+    } satisfies InstallRequest;
+
+    await desktopApi.installArchive(request);
+
+    expect(invokeMock).toHaveBeenCalledWith("install_archive", { request });
   });
 });
 

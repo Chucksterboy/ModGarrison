@@ -4136,6 +4136,84 @@ code {
   font-size: 11px;
 }
 
+.install-target-confirm-modal {
+  width: min(680px, calc(100vw - 48px));
+  border-color: rgba(85, 185, 255, 0.45);
+  background:
+    linear-gradient(90deg, transparent 0 46px, rgba(85, 185, 255, 0.06) 46px 47px, transparent 47px 146px),
+    linear-gradient(180deg, rgba(85, 185, 255, 0.09), transparent 160px),
+    rgba(7, 14, 22, 0.98);
+}
+
+.install-target-confirm-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  max-height: min(320px, 42vh);
+  overflow-y: auto;
+}
+
+.install-target-confirm-option {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid rgba(85, 185, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(10, 25, 37, 0.72);
+  padding: 11px 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.install-target-confirm-option:hover,
+.install-target-confirm-option:focus-within {
+  border-color: rgba(85, 185, 255, 0.48);
+}
+
+.install-target-confirm-option.selected {
+  border-color: rgba(85, 185, 255, 0.72);
+  background: rgba(31, 90, 126, 0.28);
+}
+
+.install-target-confirm-option input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.install-target-confirm-option > svg {
+  color: var(--accent);
+}
+
+.install-target-confirm-option > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.install-target-confirm-option strong,
+.install-target-confirm-option small {
+  overflow-wrap: anywhere;
+}
+
+.install-target-confirm-option strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.install-target-confirm-option small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.install-target-confirm-option > b {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .rename-modal {
   border-color: rgba(85, 185, 255, 0.42);
   background:
@@ -5053,6 +5131,21 @@ body {
   margin-bottom: 9px;
   border-radius: 5px;
   padding: 9px 12px;
+}
+
+.discover-workspace > .error-banner,
+.discover-workspace > .notice-banner {
+  width: min(1460px, 100%);
+}
+
+.transfer-workspace > .error-banner,
+.transfer-workspace > .notice-banner {
+  width: min(980px, 100%);
+}
+
+.settings-workspace > .error-banner,
+.settings-workspace > .notice-banner {
+  width: min(720px, 100%);
 }
 
 .profile-command-panel.vault-game-hero {

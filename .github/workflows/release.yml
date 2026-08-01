@@ -59,15 +59,15 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Adds GameBanana and mod.io discovery, direct-file inspection, and safe supported-archive installation.
-            - Adds Steam Workshop visibility for content already downloaded through Steam while leaving subscriptions, downloads, updates, and removal under Steam's control.
-            - Shows a provider selector only when the selected game has real mods from that provider; runtime packages do not count as discoverable mods.
-            - Automatically resolves exact per-game provider catalogues and caches both positive and negative mappings without asking users to choose domains manually.
-            - Loads the visible Discover page first, then indexes large catalogues in bounded background batches so games with thousands of mods no longer freeze the application.
-            - Cancels stale discovery work when the profile, provider, search, sort, page, or view changes, and limits pagination to records that have actually been indexed.
-            - Displays live indexed-versus-estimated totals while background discovery is still running.
-            - Preserves Nexus browser/NXM rules, restricts mod.io direct downloads to eligible free public files, and rejects unsafe provider URLs or payloads.
-            - Improves the Discover controls and health/status experience while keeping installed-mod and provider actions responsive during background indexing.
+            - Hardens archive and install-path recognition against traversal, Windows path aliases, separator collisions, ambiguous wrapper folders, and unsafe variant layouts.
+            - Presents only verified, real install targets and moves a mod atomically between client and local-server locations when the selected target changes.
+            - Improves route inference from archives, game folders, and provider documentation while excluding runtime packages and loader/tooling directories from mod targets.
+            - Serializes profile and mod mutations and recovers interrupted enable, disable, target-switch, and store transactions without leaving partial deployments.
+            - Tracks configuration ownership per installed mod and rejects cross-mod configuration edits or ambiguous generated config matches.
+            - Binds provider installs to the exact game and selected artifact, verifies declared size and SHA-256 data when available, and cleans up failed or one-shot downloads safely.
+            - Restricts provider downloads to validated HTTPS/public destinations and fails closed for unsafe GameBanana scans or unsupported mod.io dependencies.
+            - Keeps Discover providers visible during filtered zero-result searches, reports background indexing accurately, and shows feedback consistently across every workspace.
+            - Refreshes newly created profiles after runtime bootstrap so the Library and health status immediately reflect the persisted Ready state.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
             - Existing profiles, settings, provider credentials, portable profile bundles, and installation upgrades remain compatible.
           releaseDraft: true

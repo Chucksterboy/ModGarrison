@@ -253,6 +253,66 @@ pub(super) fn discover_mods(
     })
 }
 
+pub(super) fn available_mod_documents(
+    profile: &GameProfile,
+    mapping: &ProviderGameMapping,
+    requested_limit: usize,
+) -> Result<Vec<ProviderRouteDocument>, String> {
+    validate_mapping_for_profile(profile, mapping)?;
+    let game_id = parse_positive_id(&mapping.provider_game_id, "GameBanana game")?;
+    let limit = requested_limit.min(PROFILE_RUNTIME_SAMPLE_SIZE.max(PROFILE_ROUTE_SAMPLE_SIZE));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let client = provider_client()?;
+    let maximum_pages = limit.div_ceil(CATALOGUE_PAGE_SIZE).saturating_add(2).min(4);
+    let mut candidate_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for page_number in 1..=maximum_pages {
+        let page =
+            fetch_catalogue_index_page_untracked(&client, game_id, page_number, "downloads")?;
+        for record in page.records {
+            if record.game_id.is_none_or(|id| id == game_id) && seen_ids.insert(record.id) {
+                candidate_ids.push(record.id);
+            }
+        }
+        if candidate_ids.len() >= limit || page.complete || page.raw_record_count == 0 {
+            break;
+        }
+    }
+
+    let mut documents = Vec::new();
+    for ids in candidate_ids.chunks(DETAIL_BATCH_SIZE) {
+        for item in fetch_mod_batch(&client, ids)? {
+            if documents.len() >= limit {
+                break;
+            }
+            if let Some(document) =
+                available_mod_document(&mapping.canonical_game_name, game_id, &item)
+            {
+                documents.push(document);
+            }
+        }
+        if documents.len() >= limit {
+            break;
+        }
+    }
+    Ok(documents)
+}
+
+fn available_mod_document(
+    canonical_game_name: &str,
+    game_id: u64,
+    item: &GameBananaMod,
+) -> Option<ProviderRouteDocument> {
+    if !exact_game_name_match(&item.game_name, canonical_game_name) || !item_is_discoverable(item) {
+        return None;
+    }
+    let files = supported_files(item);
+    Some(provider_document(game_id, item, files.first()))
+}
+
 pub(super) fn list_files(
     store_root: &Path,
     profile: &GameProfile,
@@ -282,18 +342,20 @@ pub(super) fn preflight(
     store_root: &Path,
     profile: &GameProfile,
     mod_id: &str,
+    selected_file_id: Option<&str>,
 ) -> Result<(Vec<DependencySpec>, Vec<InstallTargetOption>), String> {
     let (encoded_game_id, item_id) = parse_online_mod_id(mod_id)?;
     let mapping = verified_mapping(store_root, profile, encoded_game_id, None)?;
     let item = fetch_single_mod(item_id)?;
     verify_item_game(&mapping, &item)?;
-    if !item_is_discoverable(&item) {
+    if !item_is_available_for_install(&item) {
         return Err(
             "This GameBanana mod is unavailable, unsafe, obsolete, or no longer has an installable archive."
                 .to_string(),
         );
     }
-    let document = provider_document(encoded_game_id, &item);
+    let file = choose_file(&item, selected_file_id)?;
+    let document = provider_document(encoded_game_id, &item, Some(&file));
     let dependencies = description_runtime_dependencies(profile, &document.text, None);
     let install_targets = provider_install_target_options(store_root, profile, &document);
     Ok((dependencies, install_targets))
@@ -319,14 +381,14 @@ pub(super) fn install(
     let expected_game_id = parse_positive_id(&mapping.provider_game_id, "GameBanana game")?;
     let item = fetch_single_mod(item_id)?;
     verify_item_game(&mapping, &item)?;
-    if !item_is_discoverable(&item) {
+    if !item_is_available_for_install(&item) {
         return Err(
             "This GameBanana mod is unavailable, unsafe, obsolete, or no longer has an installable archive."
                 .to_string(),
         );
     }
     let file = choose_file(&item, selected_file_id)?;
-    let provider_document = provider_document(expected_game_id, &item);
+    let provider_document = provider_document(expected_game_id, &item, Some(&file));
     let dependencies = description_runtime_dependencies(profile, &provider_document.text, None);
     let archive_path = download_file(store_root, expected_game_id, item_id, &file)?;
     let resolved_version = Some(provider_file_version(file.id));
@@ -373,7 +435,7 @@ pub(super) fn install(
     }
 
     let mut visited_dependencies = HashSet::new();
-    install_archive_impl_with_metadata(
+    let install_result = install_archive_impl_with_metadata(
         store_root,
         profile,
         &install_source_path,
@@ -398,7 +460,15 @@ pub(super) fn install(
             visited_dependencies: &mut visited_dependencies,
             dependency_depth: 0,
         },
-    )
+    );
+    if install_result.is_ok() {
+        cleanup_successful_provider_artifacts(
+            store_root,
+            &archive_path,
+            Path::new(&install_source_path),
+        );
+    }
+    install_result
 }
 
 fn cached_exact_game_mapping(
@@ -556,6 +626,17 @@ fn fetch_catalogue_index_page(
     request_id: u64,
 ) -> Result<CatalogueIndexPage, String> {
     ensure_discovery_is_current(&profile.id, request_id)?;
+    let page = fetch_catalogue_index_page_untracked(client, game_id, page, sort)?;
+    ensure_discovery_is_current(&profile.id, request_id)?;
+    Ok(page)
+}
+
+fn fetch_catalogue_index_page_untracked(
+    client: &Client,
+    game_id: u64,
+    page: usize,
+    sort: &str,
+) -> Result<CatalogueIndexPage, String> {
     let response = client
         .get(format!("{SITE_BASE}{CATALOGUE_INDEX_PATH}"))
         .query(&[
@@ -566,14 +647,12 @@ fn fetch_catalogue_index_page(
         ])
         .send()
         .map_err(|error| format!("GameBanana catalogue request failed: {error}"))?;
-    ensure_discovery_is_current(&profile.id, request_id)?;
     let response = response
         .error_for_status()
         .map_err(|error| format!("GameBanana catalogue request failed: {error}"))?;
     let value = response
         .json::<serde_json::Value>()
         .map_err(|error| format!("GameBanana returned invalid catalogue data: {error}"))?;
-    ensure_discovery_is_current(&profile.id, request_id)?;
     parse_catalogue_index_page(&value)
 }
 
@@ -781,7 +860,7 @@ fn item_to_online_mod(
     let files = supported_files(item);
     let primary_file = files.first();
     let description = clean_provider_text(&item.description);
-    let provider_document = provider_document(game_id, item);
+    let provider_document = provider_document(game_id, item, primary_file);
     let dependency_count =
         description_runtime_dependencies(profile, &provider_document.text, None).len();
     let record = OnlineModRecord {
@@ -814,13 +893,17 @@ fn item_to_online_mod(
 }
 
 fn item_is_discoverable(item: &GameBananaMod) -> bool {
+    item_is_available_for_install(item) && !supported_files(item).is_empty()
+}
+
+fn item_is_available_for_install(item: &GameBananaMod) -> bool {
     !item.nsfw
         && !item.trashed
         && !item.withheld
         && !item.obsolete
         && !item.name.trim().is_empty()
         && !item_is_runtime_or_tool(item)
-        && !supported_files(item).is_empty()
+        && item.files.iter().any(file_is_installable_archive_candidate)
 }
 
 fn item_is_runtime_or_tool(item: &GameBananaMod) -> bool {
@@ -851,32 +934,52 @@ fn supported_files(item: &GameBananaMod) -> Vec<GameBananaFile> {
 }
 
 fn file_is_supported(file: &GameBananaFile) -> bool {
+    file_is_installable_archive_candidate(file)
+        && file_safety_state(file) == GameBananaFileSafety::Verified
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameBananaFileSafety {
+    Verified,
+    PendingOrUnknown,
+    Rejected,
+}
+
+fn file_has_supported_archive_shape(file: &GameBananaFile) -> bool {
     let lower = file.name.to_ascii_lowercase();
-    let archive = lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar");
-    let analysis_ok = file
-        .analysis_result
-        .as_deref()
-        .is_none_or(|value| value.eq_ignore_ascii_case("ok"));
-    let antivirus_ok = file
-        .antivirus_result
-        .as_deref()
-        .is_none_or(|value| value.eq_ignore_ascii_case("clean"));
-    let analysis_finished = file
-        .analysis_state
-        .as_deref()
-        .is_none_or(|value| value.eq_ignore_ascii_case("done"));
-    let antivirus_finished = file
-        .antivirus_state
-        .as_deref()
-        .is_none_or(|value| value.eq_ignore_ascii_case("done"));
-    archive
+    lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar")
+}
+
+fn file_is_installable_archive_candidate(file: &GameBananaFile) -> bool {
+    file_has_supported_archive_shape(file)
         && !file.archived
         && file.has_contents.unwrap_or(true)
-        && analysis_ok
-        && antivirus_ok
-        && analysis_finished
-        && antivirus_finished
         && official_download_url(&file.download_url, file.id)
+}
+
+fn file_safety_state(file: &GameBananaFile) -> GameBananaFileSafety {
+    let analysis_result = file.analysis_result.as_deref();
+    let antivirus_result = file.antivirus_result.as_deref();
+    if analysis_result.is_some_and(|value| !value.eq_ignore_ascii_case("ok"))
+        || antivirus_result.is_some_and(|value| !value.eq_ignore_ascii_case("clean"))
+    {
+        return GameBananaFileSafety::Rejected;
+    }
+    let analysis_complete = file
+        .analysis_state
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("done"));
+    let antivirus_complete = file
+        .antivirus_state
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("done"));
+    let analysis_clean = analysis_result.is_some_and(|value| value.eq_ignore_ascii_case("ok"));
+    let antivirus_clean = antivirus_result.is_some_and(|value| value.eq_ignore_ascii_case("clean"));
+    if analysis_complete && antivirus_complete && analysis_clean && antivirus_clean {
+        GameBananaFileSafety::Verified
+    } else {
+        GameBananaFileSafety::PendingOrUnknown
+    }
 }
 
 fn file_options(item: &GameBananaMod) -> Vec<OnlineModFileOption> {
@@ -910,18 +1013,45 @@ fn choose_file(
     let files = supported_files(item);
     if let Some(selected) = selected_file_id {
         let file_id = parse_positive_id(selected, "GameBanana file")?;
-        return files
-            .into_iter()
+        let file = item
+            .files
+            .iter()
             .find(|file| file.id == file_id)
-            .ok_or_else(|| {
+            .ok_or_else(|| "The selected GameBanana file is no longer available.".to_string())?;
+        if !file_is_installable_archive_candidate(file) {
+            return Err(
+                "The selected GameBanana file is not an available archive from GameBanana's verified download host."
+                    .to_string(),
+            );
+        }
+        return match file_safety_state(file) {
+            GameBananaFileSafety::Verified => Ok(file.clone()),
+            GameBananaFileSafety::PendingOrUnknown => Err(
+                "GameBanana has not completed both archive analysis and antivirus scanning for the selected file. Installation is blocked until GameBanana reports verified clean results."
+                    .to_string(),
+            ),
+            _ => Err(
                 "The selected GameBanana file is unavailable or did not pass provider safety checks."
-                    .to_string()
-            });
+                    .to_string(),
+            ),
+        };
     }
-    files.into_iter().next().ok_or_else(|| {
+    if let Some(file) = files.into_iter().next() {
+        return Ok(file);
+    }
+    if item.files.iter().any(|file| {
+        file_is_installable_archive_candidate(file)
+            && file_safety_state(file) == GameBananaFileSafety::PendingOrUnknown
+    }) {
+        return Err(
+            "GameBanana has not completed both archive analysis and antivirus scanning for this mod. Installation is blocked until GameBanana reports verified clean results."
+                .to_string(),
+        );
+    }
+    Err(
         "GameBanana returned no ZIP, 7Z, or RAR archive that passed its file safety checks."
-            .to_string()
-    })
+            .to_string(),
+    )
 }
 
 fn download_file(
@@ -1024,13 +1154,14 @@ fn verify_item_game(mapping: &ProviderGameMapping, item: &GameBananaMod) -> Resu
     Ok(())
 }
 
-fn provider_document(game_id: u64, item: &GameBananaMod) -> ProviderRouteDocument {
-    let file_descriptions = item
-        .files
-        .iter()
-        .filter_map(|file| file.description.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
+fn provider_document(
+    game_id: u64,
+    item: &GameBananaMod,
+    selected_file: Option<&GameBananaFile>,
+) -> ProviderRouteDocument {
+    let selected_file_description = selected_file
+        .and_then(|file| file.description.as_deref())
+        .unwrap_or_default();
     ProviderRouteDocument {
         provider: "GameBanana".to_string(),
         mod_id: package_id(game_id, item.id),
@@ -1039,7 +1170,7 @@ fn provider_document(game_id: u64, item: &GameBananaMod) -> ProviderRouteDocumen
             item.description.as_str(),
             item.text.as_str(),
             item.install_instructions.as_str(),
-            file_descriptions.as_str(),
+            selected_file_description,
         ]
         .into_iter()
         .filter(|value| !value.trim().is_empty())
@@ -1313,9 +1444,104 @@ mod tests {
         let mut executable = file.clone();
         executable.name = "installer.exe".to_string();
         assert!(!file_is_supported(&executable));
+        let mut missing_analysis = file.clone();
+        missing_analysis.analysis_state = None;
+        assert_eq!(
+            file_safety_state(&missing_analysis),
+            GameBananaFileSafety::PendingOrUnknown
+        );
+        assert!(!file_is_supported(&missing_analysis));
+        let mut missing_antivirus = file.clone();
+        missing_antivirus.antivirus_result = None;
+        assert_eq!(
+            file_safety_state(&missing_antivirus),
+            GameBananaFileSafety::PendingOrUnknown
+        );
+        assert!(!file_is_supported(&missing_antivirus));
         let mut infected = file;
         infected.antivirus_result = Some("infected".to_string());
+        assert_eq!(file_safety_state(&infected), GameBananaFileSafety::Rejected);
         assert!(!file_is_supported(&infected));
+    }
+
+    #[test]
+    fn selected_file_document_never_includes_other_variant_descriptions() {
+        let item = parse_mod(
+            7,
+            &serde_json::json!({
+                "name": "Dual target mod",
+                "description": "Shared description",
+                "Game().name": "Example Game",
+                "RootCategory().name": "Game files",
+                "Files().aFiles()": {
+                    "10": {
+                        "_idRow": "10",
+                        "_sFile": "client.zip",
+                        "_sDescription": "CLIENT_VARIANT install in the game folder",
+                        "_nFilesize": 123,
+                        "_sDownloadUrl": "https://gamebanana.com/dl/10",
+                        "_sAnalysisState": "done",
+                        "_sAnalysisResult": "ok",
+                        "_sAvState": "done",
+                        "_sAvResult": "clean",
+                        "_bIsArchived": false,
+                        "_bHasContents": true
+                    },
+                    "11": {
+                        "_idRow": "11",
+                        "_sFile": "server.zip",
+                        "_sDescription": "SERVER_VARIANT install in the dedicated server folder",
+                        "_nFilesize": 123,
+                        "_sDownloadUrl": "https://gamebanana.com/dl/11",
+                        "_sAnalysisState": "done",
+                        "_sAnalysisResult": "ok",
+                        "_sAvState": "done",
+                        "_sAvResult": "clean",
+                        "_bIsArchived": false,
+                        "_bHasContents": true
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let client = item.files.iter().find(|file| file.id == 10).unwrap();
+        let server = item.files.iter().find(|file| file.id == 11).unwrap();
+
+        let client_document = provider_document(1, &item, Some(client));
+        assert!(client_document.text.contains("CLIENT_VARIANT"));
+        assert!(!client_document.text.contains("SERVER_VARIANT"));
+
+        let server_document = provider_document(1, &item, Some(server));
+        assert!(server_document.text.contains("SERVER_VARIANT"));
+        assert!(!server_document.text.contains("CLIENT_VARIANT"));
+    }
+
+    #[test]
+    fn direct_selection_blocks_files_with_missing_scan_fields() {
+        let item = parse_mod(
+            7,
+            &serde_json::json!({
+                "name": "Pending file",
+                "Game().name": "Example Game",
+                "RootCategory().name": "Game files",
+                "Files().aFiles()": {
+                    "99": {
+                        "_idRow": "99",
+                        "_sFile": "pending.zip",
+                        "_nFilesize": 123,
+                        "_sDownloadUrl": "https://gamebanana.com/dl/99",
+                        "_bIsArchived": false,
+                        "_bHasContents": true
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(item_is_available_for_install(&item));
+        assert!(!item_is_discoverable(&item));
+        let error = choose_file(&item, Some("99")).unwrap_err();
+        assert!(error.contains("has not completed both archive analysis and antivirus scanning"));
     }
 
     #[test]
@@ -1373,5 +1599,39 @@ mod tests {
         assert!(item_is_runtime_or_tool(&item));
         item.category = "Game files".to_string();
         assert!(!item_is_runtime_or_tool(&item));
+    }
+
+    #[test]
+    fn metadata_learning_only_uses_discoverable_mods_for_the_verified_game() {
+        let mut item = parse_mod(
+            7,
+            &serde_json::json!({
+                "name": "Gameplay Overhaul",
+                "description": "Requires UE4SS. Install to ExampleGame\\Content\\Paks\\~mods",
+                "Game().name": "Example Game",
+                "RootCategory().name": "Game files",
+                "Files().aFiles()": {
+                    "99": {
+                        "_idRow": "99",
+                        "_sFile": "example.zip",
+                        "_nFilesize": 123,
+                        "_sDownloadUrl": "https://gamebanana.com/dl/99",
+                        "_sAnalysisState": "done",
+                        "_sAnalysisResult": "ok",
+                        "_sAvState": "done",
+                        "_sAvResult": "clean",
+                        "_bIsArchived": false,
+                        "_bHasContents": true
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(available_mod_document("Example Game", 12, &item).is_some());
+        assert!(available_mod_document("Different Game", 12, &item).is_none());
+
+        item.name = "UE4SS for Example Game".to_string();
+        assert!(available_mod_document("Example Game", 12, &item).is_none());
     }
 }
