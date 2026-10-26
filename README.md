@@ -27,7 +27,27 @@ The first implementation supports ZIP archives, 7Z archives, and normal folder i
 - UE4SS / Unreal mod structures.
 - REFramework / RE Engine scripts and plugins.
 - Generic Unreal `.pak` style mods.
+- Recognized Enshrouded EML, Shroudtopia, and native proxy layouts.
 - Loose-file fallback with warnings.
+
+## Enshrouded Support
+
+Version 0.13.0 adds Enshrouded installation rules that preserve each recognized
+mod's scripts, settings, native libraries, and companion assets. Supported EML,
+maintained Shroudtopia, and shared native-loader dependencies are downloaded
+automatically from their official releases when required.
+
+Mod Garrison manages shared loader ownership and captures the original game
+patch data for EML disable, clean-launch, and removal operations. Automatically
+installed dependencies remain while another managed mod needs them. The
+cogwheel exposes supported settings, including Max Stack's four main options
+and per-item overrides; saved EML changes apply at the next game startup.
+
+Support depends on the archive layout and the selected game/mod versions.
+Research covered 25 author installation workflows; this is not a claim that
+every mod or combination has been tested in-game. Save imports, standalone
+tools, hardware requirements, and incompatible native hooks need separate
+handling. See [Enshrouded support and research](docs/enshrouded-support.md).
 
 ## Runtime Providers
 
@@ -39,6 +59,8 @@ Mod Garrison can automatically resolve these loader/runtime dependencies:
 - BepInEx IL2CPP x64 from official BepInBuilds bleeding-edge artifacts.
 - UE4SS from official GitHub releases.
 - REFramework from official GitHub releases, using game-specific stable assets when a supported RE Engine game is detected and the generic nightly asset as a fallback.
+- Enshrouded Mod Loader (EML) from its official GitHub release.
+- Maintained Shroudtopia (Shroudweave) and ModLoader Proxy from specific verified GitHub releases.
 
 Source platforms are handled according to their documented capabilities:
 
@@ -88,8 +110,8 @@ the [GitHub Releases page](https://github.com/Chucksterboy/ModGarrison/releases)
 To publish an installer build, push a version tag:
 
 ```powershell
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.13.0
+git push origin v0.13.0
 ```
 
 The GitHub Actions release workflow validates the project, builds the single

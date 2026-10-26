@@ -1,3 +1,11 @@
+mod enshrouded;
+mod enshrouded_cleanup;
+mod enshrouded_integration;
+mod enshrouded_loaders;
+mod enshrouded_patch_state;
+#[cfg(test)]
+mod enshrouded_regression_tests;
+mod enshrouded_runtime;
 mod gamebanana;
 mod modio;
 mod operation;
@@ -6226,7 +6234,7 @@ where
         ));
     }
 
-    match install() {
+    match enshrouded_integration::with_replacement_baseline(&record, install) {
         Ok(result) => {
             let replacement = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
                 .map_err(error_to_string)
@@ -6920,7 +6928,12 @@ async fn preflight_discovered_mod_install(
             .collect::<Vec<_>>();
         let confirmation_required = missing_dependencies
             .iter()
-            .any(|dependency| matches!(dependency.provider.as_str(), "nexus" | "manual"));
+            .any(|dependency| matches!(dependency.provider.as_str(), "nexus" | "manual"))
+            && !(profile.game_id.as_deref() == Some("enshrouded")
+                && missing_dependencies.iter().all(|dependency| dependency.provider != "manual")
+                && settings.nexus_api_key().is_some_and(|key| {
+                    validate_nexus_api_key(key).is_ok_and(|account| account.is_premium)
+                }));
 
         Ok(InstallPreflightResult {
             dependencies,
@@ -6994,7 +7007,7 @@ async fn begin_nexus_requirement_download(
             ));
         }
         let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
-        let file = choose_nexus_file(&files).ok_or_else(|| {
+        let file = choose_nexus_file_for_profile(&profile, &files, None)?.ok_or_else(|| {
             "Nexus returned no supported main archive for this requirement.".to_string()
         })?;
         let now = Utc::now().timestamp();
@@ -7055,7 +7068,7 @@ async fn begin_nexus_browser_download(
         )?;
         let client = provider_client()?;
         let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
-        let file = choose_requested_nexus_file(&files, Some(&selected_file_id))?
+        let file = choose_nexus_file_for_profile(&profile, &files, Some(&selected_file_id))?
             .ok_or_else(|| "The selected Nexus file is no longer available.".to_string())?;
         let install_target_id = carried_forward_install_target_id(
             &root,
@@ -7118,7 +7131,7 @@ async fn install_nexus_nxm_link(
         let client = provider_client()?;
         let account = validate_nexus_api_key(api_key)?;
         let files = fetch_nexus_mod_files(&client, api_key, &nxm.domain, nxm.mod_id)?;
-        let file = choose_requested_nexus_file(&files, Some(&nxm.file_id.to_string()))?
+        let file = choose_nexus_file_for_profile(&profile, &files, Some(&nxm.file_id.to_string()))?
             .ok_or_else(|| "The Nexus file from this download link is no longer available.".to_string())?;
         let links = fetch_nexus_download_links_with_nxm(&client, api_key, &nxm)?;
         let download_url = nexus_http_download_url(&links).ok_or_else(|| {
@@ -7774,6 +7787,22 @@ fn update_mod_config_value_impl(
         Some("yaml") | Some("yml") => {
             update_yaml_config_content(content, input.section.as_deref(), &input.key, &input.value)?
         }
+        _ if enshrouded::is_profile(profile)
+            && requested_identity
+                == normalize_filesystem_identity(
+                    Path::new(&profile.game_path)
+                        .join("mods/max-stack/items.txt")
+                        .to_string_lossy()
+                        .as_ref(),
+                ) =>
+        {
+            update_max_stack_item_override(
+                content,
+                input.section.as_deref(),
+                &input.key,
+                &input.value,
+            )?
+        }
         _ => update_key_value_config_content(
             content,
             input.section.as_deref(),
@@ -7822,12 +7851,36 @@ fn update_mod_config_value_impl(
         merge_config_path(&mut record.config_files, &path);
     }
 
-    if let Err(error) = commit_installed_mod_records(root, profile, &owning_records, &[]) {
+    let cache_update = match enshrouded_integration::invalidate_eml_config_cache(
+        root,
+        profile,
+        &owning_records[0],
+    ) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            return Err(restore_config_after_failed_edit(
+                &path,
+                &original_bytes,
+                error,
+            ));
+        }
+    };
+    let deployment_refs = cache_update.iter().collect::<Vec<_>>();
+    if let Err(error) =
+        commit_installed_mod_records(root, profile, &owning_records, &deployment_refs)
+    {
+        let rollback = cache_update
+            .as_ref()
+            .and_then(|deployment| deployment.rollback().err())
+            .unwrap_or_default();
         return Err(restore_config_after_failed_edit(
             &path,
             &original_bytes,
-            format!("Could not save the updated config receipt: {error}"),
+            format!("Could not save the updated config receipt: {error} {rollback}"),
         ));
+    }
+    if let Some(deployment) = cache_update {
+        let _ = deployment.commit();
     }
 
     read_mod_config_file(root, profile, &input.file_path)
@@ -7922,25 +7975,60 @@ fn disable_mod_sync(
         &original,
         ModifiedFilePolicy::PreserveConfigChanges,
     )?;
-    let files_changed = deactivation.files_changed;
+    let mut files_changed = deactivation.files_changed;
+    let rebase = if enshrouded_patch_state::record_uses_eml(&original) {
+        match enshrouded_patch_state::rebase_mod_data(&root, &profile, &original.id) {
+            Ok(deployment) => deployment,
+            Err(error) => {
+                return match restore_deactivated_mods(
+                    &root,
+                    &profile,
+                    std::slice::from_ref(&original),
+                ) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(format!("{error} {restore_error}")),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(deployment) = rebase.as_ref() {
+        files_changed.extend(deployment.files_written.clone());
+    }
     let mut updated = original.clone();
     updated.enabled = false;
     updated.last_status = "disabled".to_string();
-    if let Err(error) =
-        commit_installed_mod_records(&root, &profile, std::slice::from_ref(&updated), &[])
-    {
+    let deployment_refs = rebase.iter().collect::<Vec<_>>();
+    if let Err(error) = commit_installed_mod_records(
+        &root,
+        &profile,
+        std::slice::from_ref(&updated),
+        &deployment_refs,
+    ) {
+        let rollback_error = rebase
+            .as_ref()
+            .and_then(|deployment| deployment.rollback().err());
+        let error = match rollback_error {
+            Some(rollback) => format!("{error} {rollback}"),
+            None => error,
+        };
         return match restore_deactivated_mods(&root, &profile, std::slice::from_ref(&original)) {
             Ok(()) => Err(error),
             Err(restore_error) => Err(format!("{error} {restore_error}")),
         };
     }
+    let warnings = rebase
+        .into_iter()
+        .filter_map(|deployment| deployment.commit().err())
+        .collect();
 
     Ok(ModActionResult {
         profile_id,
         installed_mod_id,
         status: "disabled".to_string(),
         files_changed,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -8949,6 +9037,12 @@ fn set_all_profile_mods_enabled_sync(
             deployments.push(deployment);
         }
     } else {
+        let _shared_removal_guard = enshrouded_integration::pending_removals(
+            target_indices
+                .iter()
+                .map(|index| original_store.items[*index].id.clone())
+                .collect(),
+        );
         for index in &target_indices {
             let original = original_store.items[*index].clone();
             match deactivate_mod_files_with_policy(
@@ -8973,6 +9067,25 @@ fn set_all_profile_mods_enabled_sync(
             deactivated.push(original);
             next_store.items[*index].enabled = false;
             next_store.items[*index].last_status = "disabled".to_string();
+        }
+        if target_indices
+            .iter()
+            .any(|index| enshrouded_patch_state::record_uses_eml(&original_store.items[*index]))
+        {
+            match enshrouded_patch_state::rebase_mod_data(&root, &profile, "enshrouded-disable-all")
+            {
+                Ok(Some(deployment)) => {
+                    files_changed.extend(deployment.files_written.clone());
+                    deployments.push(deployment);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return match restore_deactivated_mods(&root, &profile, &deactivated) {
+                        Ok(()) => Err(error),
+                        Err(restore_error) => Err(format!("{error} {restore_error}")),
+                    };
+                }
+            }
         }
     }
 
@@ -9071,6 +9184,15 @@ fn remove_mod_sync(
             &store.items,
             &store.items[record_index],
         )?;
+    }
+    if enshrouded::is_profile(&profile) {
+        return enshrouded_integration::remove_mod(
+            &root,
+            &profile,
+            &store.items[record_index],
+            &store.items,
+            force_forget_modified,
+        );
     }
     let record = store.items.remove(record_index);
     let deactivation = if record.enabled {
@@ -10440,6 +10562,10 @@ fn score_loaders(
     scores: &mut HashMap<String, i32>,
     signals: &mut Vec<DetectionSignal>,
 ) {
+    // Enshrouded's root `mods` folder is not evidence of UE4SS.
+    if engine == "enshrouded" {
+        return;
+    }
     let bepinex_loader = if engine == "unity-il2cpp" {
         "bepinex-il2cpp"
     } else {
@@ -10652,6 +10778,10 @@ fn prepare_mod_routes(
     }
 
     let mut preparation = RoutePreparation::default();
+
+    if supports("enshrouded") {
+        push_unique_route(&mut routes, "mods");
+    }
 
     for route in routes {
         match safe_join(game_path, &route) {
@@ -11417,10 +11547,16 @@ fn analyze_scanned_archive_with_identity(
     profile: &GameProfile,
     source_identity: Option<PackageIdentity>,
 ) -> ArchiveAnalysis {
+    let mut enshrouded_source = scanned.clone();
+    enshrouded_source.package_identity = Some(merge_package_identity(
+        scanned.package_identity.clone(),
+        source_identity.clone(),
+    ));
     let ue4ss = ue4ss_plan(&scanned, profile);
     let unreal_pak = unreal_pak_plan(&scanned, profile);
     let composite_unreal = composite_unreal_plan(&scanned, ue4ss.as_ref(), unreal_pak.as_ref());
     let mut plans = vec![
+        enshrouded::plan(&enshrouded_source, profile),
         composite_unreal,
         bepinex_plan(&scanned, profile),
         native_script_plan(&scanned, profile),
@@ -11553,11 +11689,13 @@ fn incomplete_install_plan_reason(scanned: &ScannedArchive, plan: &InstallPlan) 
         .filter(|mapping| mapping.generated_content.is_none())
         .map(|mapping| normalize_archive_path(&mapping.source_path).to_ascii_lowercase())
         .collect::<HashSet<_>>();
+    let eml_proof_is_consumed = enshrouded_runtime::plan_supplies_eml(plan);
     let mut missing = installable_files(&scanned.entries)
         .into_iter()
         .filter(|file| {
             let source = normalize_archive_path(&file.path).to_ascii_lowercase();
             !mapped_sources.contains(&source)
+                && !(eml_proof_is_consumed && source == ".mod-garrison/enshrouded-eml.json")
                 && (!source.ends_with(".sig") || verified_unreal_payloads.contains(&source))
         })
         .map(|file| normalize_archive_path(&file.logical_path))
@@ -13420,6 +13558,25 @@ fn install_archive_impl_with_metadata_inner(
     let dependency_install_target = selected_install_target
         .as_ref()
         .or(runtime_dependency_target.as_ref());
+    let install_id = Uuid::new_v4().to_string();
+    let package_key = metadata.package_id.as_deref().unwrap_or(archive_path);
+    enshrouded_integration::prepare_plan(
+        store_root,
+        profile,
+        &mut effective_plan,
+        package_key,
+        Path::new(archive_path),
+    )?;
+    enshrouded_integration::carry_replacement_baseline(profile, package_key, &mut effective_plan);
+    enshrouded_cleanup::snapshot_plan(profile, &mut effective_plan, &install_id)?;
+    if profile.game_id.as_deref() == Some("enshrouded") {
+        let existing = read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+            .map_err(error_to_string)?;
+        enshrouded_cleanup::inherit_shared_parents(profile, &mut effective_plan, &existing.items)?;
+    }
+    if profile.game_id.as_deref() == Some("enshrouded") && dependency_depth > 0 {
+        enshrouded_integration::mark_automatic(&mut effective_plan, &install_id);
+    }
     let plan = &effective_plan;
 
     if dependency_depth > MAX_DEPENDENCY_DEPTH {
@@ -13439,7 +13596,6 @@ fn install_archive_impl_with_metadata_inner(
         return Err(reason);
     }
 
-    let install_id = Uuid::new_v4().to_string();
     let installed_at = now_string();
     let managed_source_path =
         materialize_import_source(store_root, profile, &install_id, &prepared_source_path)
@@ -13635,6 +13791,9 @@ fn rollback_install_graph(
         .cloned()
         .collect::<Vec<_>>();
     let mut deactivated = Vec::new();
+    let _shared_removal_guard = enshrouded_integration::pending_removals(
+        added.iter().map(|record| record.id.clone()).collect(),
+    );
     for record in added.iter().rev() {
         if record.enabled && !record.externally_managed {
             if let Err(error) = deactivate_mod_files(store_root, profile, record) {
@@ -13757,6 +13916,9 @@ fn incompatible_provider_game_reason(
 
 fn incompatible_install_plan_reason(profile: &GameProfile, plan: &InstallPlan) -> Option<String> {
     let engine_reason = match plan.adapter_id.as_str() {
+        "enshrouded" if profile.game_id.as_deref() != Some("enshrouded") => Some(
+            "Enshrouded packages require a verified Enshrouded game profile.".to_string(),
+        ),
         "unreal-pak" | "ue4ss" if profile.engine != "unreal" => Some(format!(
             "{} mods are for Unreal Engine games, but this profile is detected as {}.",
             plan.adapter_name,
@@ -13886,6 +14048,7 @@ fn profile_game_label(profile: &GameProfile) -> String {
 
 fn adapter_display_name(adapter: &str) -> &str {
     match adapter {
+        "enshrouded" => "Enshrouded mods",
         "bepinex" => "BepInEx mods",
         "script-files" => "native script mods",
         "ue4ss" => "UE4SS mods",
@@ -13927,6 +14090,26 @@ fn duplicate_installed_mod_reason(
         .iter()
         .filter(|record| record.profile_id == profile.id && record.last_status != "removed")
     {
+        let candidate_package = metadata.package_id.as_deref().or_else(|| {
+            metadata
+                .package_identity
+                .as_ref()
+                .and_then(|identity| identity.package_id.as_deref())
+        });
+        if enshrouded::is_profile(profile) {
+            if let (Some(candidate), Some(existing)) =
+                (candidate_package, record.package_id.as_deref())
+            {
+                if candidate.starts_with("nexus:enshrouded/")
+                    && existing.starts_with("nexus:enshrouded/")
+                    && !candidate.eq_ignore_ascii_case(existing)
+                {
+                    // Distinct verified Nexus mods often share bootstrap names
+                    // such as dinput8.dll. File ownership checks still apply.
+                    continue;
+                }
+            }
+        }
         let existing_keys = installed_mod_identity_keys(record);
         if candidate_keys
             .iter()
@@ -14072,6 +14255,7 @@ fn normalize_mod_identity(value: &str) -> String {
 
 fn engine_label(engine: &str) -> &'static str {
     match engine {
+        "enshrouded" => "Enshrouded (Keen Engine)",
         "unity-mono" => "Unity Mono",
         "unity-il2cpp" => "Unity IL2CPP",
         "unreal" => "Unreal Engine",
@@ -14167,6 +14351,18 @@ fn profile_runtime_ids(profile: &GameProfile) -> Vec<String> {
 
     if runtime_definition_by_id(&profile.loader).is_some() {
         push_unique_string_value(&mut runtimes, &profile.loader);
+    }
+    if profile.game_id.as_deref() == Some("enshrouded") {
+        // Loader alternatives are provisioned on demand, not all at profile creation.
+        for runtime in [
+            "enshrouded-eml",
+            "enshrouded-shroudtopia",
+            "enshrouded-proxy",
+        ] {
+            if runtime_definition_by_id(runtime).is_some() {
+                push_unique_string_value(&mut runtimes, runtime);
+            }
+        }
     }
     runtimes
 }
@@ -16196,6 +16392,11 @@ fn infer_profile_foundation_runtime(
     profile: &GameProfile,
     force_refresh: bool,
 ) -> RuntimeInferenceOutcome {
+    // Enshrouded has multiple independent loader families. Provision the selected
+    // package's actual dependencies instead of installing a catalogue majority.
+    if profile.game_id.as_deref() == Some("enshrouded") {
+        return RuntimeInferenceOutcome::default();
+    }
     if !profile_bootstrap_dependencies(profile).is_empty() {
         return RuntimeInferenceOutcome::default();
     }
@@ -19173,6 +19374,9 @@ fn runtime_definition_matches_profile(
 
 fn runtime_requirement_aliases(runtime_id: &str) -> Vec<&'static str> {
     match runtime_id {
+        "enshrouded-eml" => vec!["enshrouded mod loader", "eml", "kfc parser"],
+        "enshrouded-shroudtopia" => vec!["shroudtopia", "shroudweave"],
+        "enshrouded-proxy" => vec!["modloader proxy", "modloaderproxy"],
         "bepinex" | "bepinex-il2cpp" => vec!["bepinex", "bep in ex"],
         "ue4ss" => vec!["ue4ss", "re ue4ss"],
         "reframework" => vec!["reframework", "re framework"],
@@ -20672,7 +20876,7 @@ fn install_nexus_discovered_mod(
         );
     }
     let files = fetch_nexus_mod_files(&client, api_key, &domain, nexus_mod_id)?;
-    let file = choose_requested_nexus_file(&files, selected_file_id)?.ok_or_else(|| {
+    let file = choose_nexus_file_for_profile(profile, &files, selected_file_id)?.ok_or_else(|| {
         "Nexus returned no installable files for this mod. Open the mod page and download manually."
             .to_string()
     })?;
@@ -20856,7 +21060,7 @@ fn install_resolved_nexus_file_inner(
         client,
         api_key,
         account,
-        &dependencies,
+        &plan.dependencies,
         visited_dependencies,
         dependency_depth + 1,
         selected_install_target,
@@ -20981,12 +21185,13 @@ fn install_nexus_requirement_dependencies(
         }
 
         let files = fetch_nexus_mod_files(client, api_key, &dependency_domain, dependency_mod_id)?;
-        let dependency_file = choose_nexus_file(&files).ok_or_else(|| {
-            format!(
-                "{} is required, but Nexus returned no supported main archive for it.",
-                dependency.name
-            )
-        })?;
+        let dependency_file =
+            choose_nexus_file_for_profile(profile, &files, None)?.ok_or_else(|| {
+                format!(
+                    "{} is required, but Nexus returned no supported main archive for it.",
+                    dependency.name
+                )
+            })?;
         let links = fetch_nexus_download_links(
             client,
             api_key,
@@ -21389,6 +21594,61 @@ fn clear_stale_nexus_key_validation(value: Option<&str>) {
     {
         *cache = None;
     }
+}
+
+fn choose_nexus_file_for_profile(
+    profile: &GameProfile,
+    files: &[NexusFileRecord],
+    selected_file_id: Option<&str>,
+) -> Result<Option<NexusFileRecord>, String> {
+    if !enshrouded::is_profile(profile) {
+        return choose_requested_nexus_file(files, selected_file_id);
+    }
+    let server = !Path::new(&profile.game_path)
+        .join("enshrouded.exe")
+        .is_file();
+    let file_scope = |file: &NexusFileRecord| {
+        let title = format!(
+            "{} {}",
+            file.name,
+            file.file_name.as_deref().unwrap_or_default()
+        );
+        let words = ascii_requirement_text(&title);
+        if words
+            .split_whitespace()
+            .any(|word| matches!(word, "server" | "dedicated"))
+        {
+            Some(true)
+        } else if words.split_whitespace().any(|word| word == "client") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    if selected_file_id.is_some() {
+        let file = choose_requested_nexus_file(files, selected_file_id)?;
+        if file
+            .as_ref()
+            .is_some_and(|file| file_scope(file).is_some_and(|scope| scope != server))
+        {
+            return Err("The selected Enshrouded file targets a different client/server installation. The game folder was not changed.".to_string());
+        }
+        return Ok(file);
+    }
+    let matching = files
+        .iter()
+        .filter(|file| file_scope(file) == Some(server))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(file) = choose_nexus_file(&matching) {
+        return Ok(Some(file));
+    }
+    let generic = files
+        .iter()
+        .filter(|file| file_scope(file).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(choose_nexus_file(&generic))
 }
 
 fn choose_requested_nexus_file(
@@ -22829,6 +23089,21 @@ fn runtime_installed(profile: &GameProfile, runtime: &str) -> bool {
 }
 
 fn runtime_supplied_by_plan(profile: &GameProfile, plan: &InstallPlan) -> Option<String> {
+    if profile.game_id.as_deref() == Some("enshrouded")
+        && enshrouded_runtime::plan_supplies_eml(plan)
+    {
+        return Some("enshrouded-eml".to_string());
+    }
+    if profile.game_id.as_deref() == Some("enshrouded") {
+        if enshrouded_loaders::plan_supplies_shroudtopia(plan) {
+            return Some("enshrouded-shroudtopia".to_string());
+        }
+        if enshrouded_loaders::runtime_supplies_proxy(plan) {
+            return Some("enshrouded-proxy".to_string());
+        }
+        // Installed loaders do not prove that this package supplies a loader.
+        return None;
+    }
     let mut entries = Vec::new();
     let mut seen_entries = HashSet::new();
 
@@ -22875,6 +23150,9 @@ fn runtime_supplied_by_plan(profile: &GameProfile, plan: &InstallPlan) -> Option
 
 fn runtime_layout_matches(profile: &GameProfile, entries: &[ProbeEntry], runtime: &str) -> bool {
     match runtime {
+        "enshrouded-eml" => enshrouded_runtime::installed_eml(profile),
+        "enshrouded-shroudtopia" => enshrouded_loaders::installed_shroudtopia(profile),
+        "enshrouded-proxy" => enshrouded_loaders::installed_proxy(profile),
         "bepinex" | "bepinex-il2cpp" => bepinex_runtime_layout_matches(entries, runtime),
         "ue4ss" => ue4ss_runtime_layout_matches(entries),
         "reframework" => reframework_runtime_layout_matches(entries),
@@ -23367,21 +23645,45 @@ fn resolve_github_release_dependency(
     let raw = source
         .strip_prefix("github-release:")
         .ok_or_else(|| format!("{} has an invalid GitHub release source.", dependency.name))?;
-    let (repo, asset_pattern) = raw.split_once('#').ok_or_else(|| {
+    let (repository_ref, asset_pattern) = raw.split_once('#').ok_or_else(|| {
         format!(
             "{} GitHub source must include an asset pattern.",
             dependency.name
         )
     })?;
+    let (repo, release_tag) = repository_ref
+        .split_once('@')
+        .map(|(repo, tag)| (repo, Some(tag)))
+        .unwrap_or((repository_ref, None));
     let (owner, repo_name) = repo
         .split_once('/')
         .ok_or_else(|| format!("{} GitHub source must use owner/repo.", dependency.name))?;
 
     let client = provider_client()?;
-    let url = format!(
-        "{}/{}/{}/releases/latest",
-        GITHUB_API_BASE, owner, repo_name
-    );
+    if [owner, repo_name].iter().any(|part| {
+        part.is_empty()
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    }) {
+        return Err("A GitHub dependency has an invalid repository.".to_string());
+    }
+    // Some official repositories publish several products; `latest` is not
+    // necessarily a release of the loader required by this mod.
+    let endpoint = match release_tag {
+        Some(tag)
+            if !tag.is_empty()
+                && tag.len() <= 128
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)) =>
+        {
+            format!("tags/{tag}")
+        }
+        Some(_) => return Err("A GitHub dependency has an invalid release tag.".to_string()),
+        None => "latest".to_string(),
+    };
+    let url = format!("{GITHUB_API_BASE}/{owner}/{repo_name}/releases/{endpoint}");
     let release = client
         .get(url)
         .send()
@@ -23491,6 +23793,9 @@ fn download_release_archive(
     dependency: &DependencySpec,
     release_ref: &ReleaseDependencyRef,
 ) -> Result<PathBuf, String> {
+    if enshrouded_runtime::is_eml_dependency(dependency) {
+        return enshrouded_runtime::download_eml_archive(store_root, dependency, release_ref);
+    }
     let cache_dir = store_root
         .join("cache")
         .join(sanitize_file_segment(&dependency.provider))
@@ -24287,14 +24592,19 @@ fn deploy_plan_transaction(
                 ));
             }
 
-            if mapping.target_root == "game" {
-                if let Some(owner) =
-                    enabled_file_owner(store_root, &profile.id, &destination_key, excluded_mod_id)?
+            let existing_owner = if mapping.target_root == "game" {
+                enabled_file_owner(store_root, &profile.id, &destination_key, excluded_mod_id)?
+            } else {
+                None
+            };
+            if let Some(owner) = existing_owner.as_ref() {
+                if !(enshrouded::is_profile(profile)
+                    && enshrouded_integration::is_native_alias(&destination))
                 {
                     return Err(format!(
                         "File conflict: {} is already managed by {}. Disable or remove that mod first.",
                         mapping.target_relative_path,
-                        display_record_name(&owner)
+                        display_record_name(owner)
                     ));
                 }
             }
@@ -24341,6 +24651,16 @@ fn deploy_plan_transaction(
                 let mut output = File::create(&staged_path).map_err(error_to_string)?;
                 copy_with_limit(&mut input, &mut output, MAX_ARCHIVE_FILE_BYTES)?
             };
+            if let Some(owner) = existing_owner.as_ref() {
+                let expected =
+                    managed_record_hash_for_path(owner, &destination).ok_or_else(|| {
+                        "The shared native loader has no verified file receipt.".to_string()
+                    })?;
+                if sha256_file(&staged_path)? != expected || sha256_file(&destination)? != expected
+                {
+                    return Err("Shared Enshrouded loader content differs from its existing owner; no files were changed.".to_string());
+                }
+            }
             expanded_bytes = expanded_bytes
                 .checked_add(file_size)
                 .ok_or_else(|| "The expanded mod size overflowed its safety limit.".to_string())?;
@@ -24381,13 +24701,66 @@ fn deploy_plan_transaction(
                 immediate_backup: immediate_backup.clone(),
             });
 
-            if file.is_game_file && file.destination.exists() {
+            let shared_owner = if file.is_game_file
+                && enshrouded::is_profile(profile)
+                && enshrouded_integration::is_native_alias(&file.destination)
+            {
+                enabled_file_owner(
+                    store_root,
+                    &profile.id,
+                    &normalize_filesystem_identity(file.destination.to_string_lossy().as_ref()),
+                    Some(install_id),
+                )?
+            } else {
+                None
+            };
+            let shared_baseline = shared_owner.as_ref().map(|owner| {
+                profile_backup_dir(store_root, &profile.id, &owner.id)
+                    .join(&file.target_relative_path)
+            });
+            let preserved_owned_config = if enshrouded::is_profile(profile) {
+                if let Some(previous_id) = excluded_mod_id {
+                    let previous =
+                        read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+                            .map_err(error_to_string)?;
+                    previous
+                        .items
+                        .iter()
+                        .find(|record| record.id == previous_id && record.profile_id == profile.id)
+                        .is_some_and(|record| {
+                            record.files_written.iter().any(|path| {
+                                normalize_filesystem_identity(path)
+                                    == normalize_filesystem_identity(
+                                        file.destination.to_string_lossy().as_ref(),
+                                    )
+                            }) && !record.backups_written.iter().any(|path| {
+                                Path::new(path)
+                                    == profile_backup_dir(store_root, &profile.id, previous_id)
+                                        .join(&file.target_relative_path)
+                            })
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if file.is_game_file
+                && file.destination.exists()
+                && !preserved_owned_config
+                && (shared_owner.is_none()
+                    || shared_baseline.as_ref().is_some_and(|path| path.is_file()))
+            {
                 let backup_path = safe_join(&backup_root, &file.target_relative_path)?;
                 if !backup_path.exists() {
                     if let Some(parent) = backup_path.parent() {
                         fs::create_dir_all(parent).map_err(error_to_string)?;
                     }
-                    copy_file_synced(&file.destination, &backup_path)?;
+                    let source = shared_baseline
+                        .as_deref()
+                        .filter(|path| path.is_file())
+                        .unwrap_or(&file.destination);
+                    copy_file_synced(source, &backup_path)?;
                 }
                 backups_written.push(backup_path.to_string_lossy().to_string());
             }
@@ -25024,10 +25397,39 @@ fn suspend_profile_mod_files(store_root: &Path, profile: &GameProfile) -> Result
         suspended_records.push((record.clone(), suspended));
     }
 
-    if let Err(error) = write_profile_launch_suspension(store_root, &suspension) {
+    let rebase = if store.items.iter().any(|record| {
+        record.profile_id == profile.id
+            && record.enabled
+            && enshrouded_patch_state::record_uses_eml(record)
+    }) {
+        match enshrouded_patch_state::rebase_mod_data(
+            store_root,
+            profile,
+            "enshrouded-clean-launch",
+        ) {
+            Ok(deployment) => deployment,
+            Err(error) => {
+                rollback_launch_suspension(store_root, profile, &suspended_records);
+                cleanup_new_launch_snapshots(store_root, &original_suspension, &suspension);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = write_profile_launch_suspension(store_root, &suspension, rebase.as_ref()) {
+        let rollback_error = rebase
+            .as_ref()
+            .and_then(|deployment| deployment.rollback().err());
         rollback_launch_suspension(store_root, profile, &suspended_records);
         cleanup_new_launch_snapshots(store_root, &original_suspension, &suspension);
-        return Err(error);
+        return Err(match rollback_error {
+            Some(rollback) => format!("{error} {rollback}"),
+            None => error,
+        });
+    }
+    if let Some(deployment) = rebase {
+        let _ = deployment.commit();
     }
 
     Ok(suspended_records.len())
@@ -25260,16 +25662,32 @@ fn read_profile_launch_suspension(
 fn write_profile_launch_suspension(
     store_root: &Path,
     suspension: &ProfileLaunchSuspension,
+    deployment: Option<&DeploymentOutcome>,
 ) -> Result<(), String> {
-    if suspension.mods.is_empty() {
+    if suspension.mods.is_empty() && deployment.is_none() {
         return Ok(());
     }
-    let path = profile_launch_suspension_manifest_path(store_root, &suspension.profile_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(error_to_string)?;
+    let mut writes = Vec::new();
+    if !suspension.mods.is_empty() {
+        let path = profile_launch_suspension_manifest_path(store_root, &suspension.profile_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(error_to_string)?;
+        }
+        writes.push(StoreBatchWrite {
+            target: path,
+            content: serialize_json_line(suspension)?,
+        });
     }
-    let content = serde_json::to_string_pretty(suspension).map_err(error_to_string)?;
-    atomic_write(&path, format!("{content}\n").as_bytes()).map_err(error_to_string)
+    if let Some(deployment) = deployment {
+        let mut journal = deployment.journal.clone();
+        journal.phase = DeploymentJournalPhase::StateCommitted;
+        writes.push(StoreBatchWrite {
+            target: deployment_journal_path(&deployment.transaction_root),
+            content: serialize_json_line(&journal)?,
+        });
+    }
+    let _commit = lock_mutations()?;
+    commit_store_batch(store_root, writes).map_err(error_to_string)
 }
 
 fn clear_profile_launch_suspension(store_root: &Path, profile_id: &str) -> Result<(), String> {
@@ -25493,6 +25911,10 @@ fn deactivate_mod_files_with_policy_and_paths(
             continue;
         }
         let identity = normalize_filesystem_identity(path.to_string_lossy().as_ref());
+        if enshrouded_integration::shared_alias_is_retained(store_root, profile, record, &path)? {
+            preserved_identities.insert(identity);
+            continue;
+        }
         if preserved_identities.contains(&identity) {
             continue;
         }
@@ -25607,7 +26029,16 @@ fn deactivate_mod_files_with_policy_and_paths(
         profile_id: profile.id.clone(),
         record_id: record.id.clone(),
         game_path: profile.game_path.clone(),
-        original_record: record.clone(),
+        original_record: if enshrouded::is_profile(profile) {
+            read_store::<InstalledModRecord>(&installed_mods_path(store_root))
+                .map_err(error_to_string)?
+                .items
+                .into_iter()
+                .find(|original| original.id == record.id && original.profile_id == profile.id)
+                .unwrap_or_else(|| record.clone())
+        } else {
+            record.clone()
+        },
         entries: journal_entries,
     };
     if let Err(error) = write_deactivation_journal(&transaction_root, &journal) {
@@ -26232,6 +26663,7 @@ fn runtime_signature_file_matches(runtime: &str, path: &str) -> bool {
 
 fn runtime_adapter_id(runtime: &str) -> &str {
     match runtime {
+        "enshrouded-eml" | "enshrouded-shroudtopia" | "enshrouded-proxy" => "enshrouded",
         "bepinex" | "bepinex-il2cpp" => "bepinex",
         "ue4ss" => "ue4ss",
         "reframework" => "reframework",
@@ -26439,6 +26871,11 @@ fn push_unique_config_path(files: &mut Vec<String>, seen: &mut HashSet<String>, 
 }
 
 fn is_supported_config_file(path: &Path) -> bool {
+    if path.file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("config.txt") || name.eq_ignore_ascii_case("items.txt")
+    }) {
+        return true;
+    }
     let Some(extension) = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -26454,6 +26891,15 @@ fn is_supported_config_file(path: &Path) -> bool {
 }
 
 fn is_user_editable_config_file(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case(".mod-garrison"))
+        || path.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case("mod.json") || name.eq_ignore_ascii_case("flame.json")
+        })
+    {
+        return false;
+    }
     is_supported_config_file(path) && !is_localization_resource_path(path)
 }
 
@@ -27530,6 +27976,48 @@ fn json_config_update_value(
     }
 }
 
+fn update_max_stack_item_override(
+    content: &str,
+    section: Option<&str>,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    if section.is_some()
+        || key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        return Err(
+            "Enter an item ID using letters, numbers, underscores, dots or hyphens.".to_string(),
+        );
+    }
+    let size = value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|size| *size > 0 && *size <= i32::MAX as u32)
+        .ok_or_else(|| "Stack size must be a whole number between 1 and 2147483647.".to_string())?;
+    if parse_key_value_config_entries(content)
+        .iter()
+        .any(|entry| entry.key.eq_ignore_ascii_case(key))
+    {
+        return update_key_value_config_content(content, None, key, &size.to_string());
+    }
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut output = content.to_string();
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push_str(newline);
+    }
+    output.push_str(&format!("{key}={size}{newline}"));
+    Ok(output)
+}
+
 fn update_key_value_config_content(
     content: &str,
     target_section: Option<&str>,
@@ -27759,7 +28247,10 @@ fn config_files_from_paths(paths: &[String]) -> Vec<String> {
                 || lower_path.ends_with(".toml")
                 || lower_path.ends_with(".yaml")
                 || lower_path.ends_with(".yml")
+                || lower_path.ends_with("/config.txt")
+                || lower_path.ends_with("/items.txt")
         })
+        .filter(|path| is_user_editable_config_file(Path::new(path)))
         .cloned()
         .collect()
 }
@@ -28923,6 +29414,9 @@ fn scanned_generated_mod_folder_name(scanned: &ScannedArchive) -> String {
 }
 
 fn normalize_generated_package_directories(plan: &mut InstallPlan, scanned: &ScannedArchive) {
+    if plan.adapter_id == "enshrouded" {
+        return;
+    }
     let normalized_archive_name = normalize_archive_path(&scanned.archive_name);
     let archive_file_name = basename(&normalized_archive_name);
     let raw_stem = archive_stem(&archive_file_name);
@@ -29858,6 +30352,9 @@ fn confidence_for(score: i32) -> f64 {
 
 fn format_loader(loader: &str) -> &str {
     match loader {
+        "enshrouded-eml" => "Enshrouded Mod Loader",
+        "enshrouded-shroudtopia" => "Shroudweave",
+        "enshrouded-proxy" => "Enshrouded ModLoader Proxy",
         "bepinex" => "BepInEx",
         "bepinex-il2cpp" => "BepInEx IL2CPP",
         "ue4ss" => "UE4SS",
@@ -29917,27 +30414,59 @@ fn commit_installed_mod_records(
             store.items.push(record.clone());
         }
     }
-
-    let mut writes = vec![StoreBatchWrite {
-        target: store_path,
-        content: serialize_json_line(&store)?,
-    }];
-    for record in records {
-        writes.push(StoreBatchWrite {
-            target: installed_mod_receipt_path(store_root, profile, &record.id),
-            content: serialize_json_line(record)?,
-        });
+    let shared_update =
+        enshrouded_integration::prepare_shared_update(store_root, profile, &mut store.items)?;
+    let committed = (|| -> Result<(), String> {
+        let mut writes = vec![StoreBatchWrite {
+            target: store_path,
+            content: serialize_json_line(&store)?,
+        }];
+        for record in store.items.iter().filter(|candidate| {
+            candidate.profile_id == profile.id
+                && (records.iter().any(|record| record.id == candidate.id)
+                    || candidate.runtime_id.as_deref() == Some("enshrouded-proxy"))
+        }) {
+            writes.push(StoreBatchWrite {
+                target: installed_mod_receipt_path(store_root, profile, &record.id),
+                content: serialize_json_line(record)?,
+            });
+        }
+        for deployment in deployments {
+            let mut journal = deployment.journal.clone();
+            journal.phase = DeploymentJournalPhase::StateCommitted;
+            writes.push(StoreBatchWrite {
+                target: deployment_journal_path(&deployment.transaction_root),
+                content: serialize_json_line(&journal)?,
+            });
+        }
+        if let Some(deployment) = shared_update.as_ref() {
+            let mut journal = deployment.journal.clone();
+            journal.phase = DeploymentJournalPhase::StateCommitted;
+            writes.push(StoreBatchWrite {
+                target: deployment_journal_path(&deployment.transaction_root),
+                content: serialize_json_line(&journal)?,
+            });
+        }
+        commit_store_batch(store_root, writes).map_err(|error| {
+            format!("Could not persist the installed mod store and receipts: {error}")
+        })
+    })();
+    match committed {
+        Ok(()) => {
+            if let Some(update) = shared_update {
+                let _ = update.commit();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(update) = shared_update {
+                if let Err(rollback) = update.rollback() {
+                    return Err(format!("{error} {rollback}"));
+                }
+            }
+            Err(error)
+        }
     }
-    for deployment in deployments {
-        let mut journal = deployment.journal.clone();
-        journal.phase = DeploymentJournalPhase::StateCommitted;
-        writes.push(StoreBatchWrite {
-            target: deployment_journal_path(&deployment.transaction_root),
-            content: serialize_json_line(&journal)?,
-        });
-    }
-    commit_store_batch(store_root, writes)
-        .map_err(|error| format!("Could not persist the installed mod store and receipts: {error}"))
 }
 
 fn commit_refreshed_profile_state(
@@ -30042,12 +30571,21 @@ fn serialize_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
 }
 
 fn get_profile(store_root: &Path, profile_id: &str) -> Result<GameProfile, String> {
-    read_store::<GameProfile>(&profiles_path(store_root))
+    let mut profile = read_store::<GameProfile>(&profiles_path(store_root))
         .map_err(error_to_string)?
         .items
         .into_iter()
         .find(|profile| profile.id == profile_id)
-        .ok_or_else(|| format!("Profile not found: {}", profile_id))
+        .ok_or_else(|| format!("Profile not found: {}", profile_id))?;
+    // Upgrade profiles made before Enshrouded had a bundled game definition.
+    // A verified Steam binding is still required before changing its identity.
+    if matches!(profile.steam_app_id.as_deref(), Some("1203620" | "2278520"))
+        && (profile.game_id.as_deref() != Some("enshrouded") || profile.engine != "enshrouded")
+    {
+        ensure_verified_steam_profile(&profile)?;
+        repair_profile_identity_from_steam_app_id(store_root, &mut profile)?;
+    }
+    Ok(profile)
 }
 
 fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -34323,6 +34861,121 @@ mod tests {
         assert!(!journal.exists());
         assert!(!journal.with_extension("files").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_launch_rebases_persistent_eml_patches_and_restores_enabled_mod_files() {
+        let store_root = temp_game_dir("enshrouded-clean-launch-patches");
+        let game = store_root.join("game");
+        fs::create_dir_all(game.join("mods/max-stack")).unwrap();
+        for (name, bytes) in [
+            ("enshrouded.exe", b"inert executable".as_slice()),
+            ("enshrouded.kfc", b"vanilla kfc"),
+            ("enshrouded.kfc_resources", b"vanilla resources"),
+            ("enshrouded_000.dat", b"vanilla container"),
+        ] {
+            fs::write(game.join(name), bytes).unwrap();
+        }
+        let mut profile = test_profile(
+            "eml-clean-launch",
+            "Enshrouded",
+            "enshrouded",
+            "enshrouded-eml",
+        );
+        profile.game_id = Some("enshrouded".to_string());
+        profile.game_path = game.to_string_lossy().to_string();
+        enshrouded_patch_state::capture(&store_root, &profile).unwrap();
+        fs::copy(game.join("enshrouded.kfc"), game.join("enshrouded.kfc.bak")).unwrap();
+        fs::write(game.join("enshrouded.kfc"), b"patched max stack data").unwrap();
+        fs::write(
+            game.join("enshrouded.kfc_resources"),
+            b"patched resource bytes",
+        )
+        .unwrap();
+        fs::write(game.join("enshrouded_001.dat"), b"generated patch output").unwrap();
+        fs::write(game.join("dbghelp.dll"), b"inert runtime fixture").unwrap();
+        fs::write(game.join("mods/max-stack/mod.lua"), b"inert Lua fixture").unwrap();
+        let mut runtime = test_installed_record(
+            &profile.id,
+            "eml-runtime",
+            Some("runtime:enshrouded-eml"),
+            true,
+        );
+        runtime.runtime_id = Some("enshrouded-eml".to_string());
+        let mut gameplay = test_installed_record(&profile.id, "max-stack", None, true);
+        gameplay
+            .dependencies
+            .push(known_runtime_dependency(&profile, "enshrouded-eml"));
+        for (record, relative) in [
+            (&mut runtime, "dbghelp.dll"),
+            (&mut gameplay, "mods/max-stack/mod.lua"),
+        ] {
+            let path = game.join(relative);
+            record
+                .files_written
+                .push(path.to_string_lossy().to_string());
+            record.written_file_hashes.insert(
+                path.to_string_lossy().to_string(),
+                sha256_file(&path).unwrap(),
+            );
+        }
+        write_store(
+            &installed_mods_path(&store_root),
+            &StoreFile {
+                version: 1,
+                items: vec![runtime.clone(), gameplay],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_profile_mod_launch(&store_root, &profile, false).unwrap(),
+            2
+        );
+        assert!(!game.join("dbghelp.dll").exists());
+        assert!(!game.join("mods/max-stack/mod.lua").exists());
+        assert_eq!(
+            fs::read(game.join("enshrouded.kfc")).unwrap(),
+            b"vanilla kfc"
+        );
+        assert_eq!(
+            fs::read(game.join("enshrouded.kfc_resources")).unwrap(),
+            b"vanilla resources"
+        );
+        assert_eq!(
+            fs::read(game.join(".cache/files.json")).unwrap(),
+            b"{\"build_id\":\"\",\"files\":{}}"
+        );
+        assert!(
+            read_store::<InstalledModRecord>(&installed_mods_path(&store_root))
+                .unwrap()
+                .items
+                .iter()
+                .all(|record| record.enabled)
+        );
+        let expanded =
+            enshrouded_patch_state::augment_removal_record(&store_root, &profile, &runtime)
+                .unwrap();
+        assert!(expanded
+            .files_written
+            .iter()
+            .any(|path| path.ends_with("enshrouded_001.dat")));
+        assert_eq!(
+            prepare_profile_mod_launch(&store_root, &profile, true).unwrap(),
+            2
+        );
+        assert_eq!(
+            fs::read(game.join("dbghelp.dll")).unwrap(),
+            b"inert runtime fixture"
+        );
+        assert_eq!(
+            fs::read(game.join("mods/max-stack/mod.lua")).unwrap(),
+            b"inert Lua fixture"
+        );
+        assert!(profile_dir(&store_root, &profile.id)
+            .join("enshrouded-baseline/baseline.json")
+            .exists());
+        assert!(!profile_launch_suspension_dir(&store_root, &profile.id).exists());
+        let _ = fs::remove_dir_all(store_root);
     }
 
     #[test]

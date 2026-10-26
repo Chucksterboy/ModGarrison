@@ -221,5 +221,80 @@
         "all": ["file-name:dinput8.dll", "file-name:reframework_revision.txt"]
       }
     ]
+  },
+  {
+    "id": "enshrouded-eml",
+    "dependency": {
+      "id": "runtime:enshrouded-eml",
+      "name": "Enshrouded Mod Loader (EML)",
+      "provider": "github-release",
+      "source": "github-release:Brabb3l/kfc-parser#dbghelp.dll",
+      "notes": "Official Windows x64 EML runtime, v0.2.0 or newer for Enshrouded 1.0. Provisioned only from the official release asset with a provider SHA-256 digest."
+    },
+    "profileEngines": ["enshrouded"],
+    "profileLoaders": ["enshrouded-eml"],
+    "providerPackages": [
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["Enshrouded Mod Loader", "Enshrouded Mod Loader (EML)", "EML"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file:dbghelp.dll", "file:.mod-garrison/enshrouded-eml.json"]
+      }
+    ]
+  },
+  {
+    "id": "enshrouded-shroudtopia",
+    "dependency": {
+      "id": "runtime:enshrouded-shroudtopia",
+      "name": "Shroudtopia (Shroudweave compatibility build)",
+      "provider": "github-release",
+      "source": "github-release:Aerox912/shroudtopia@v0.2.1-shroudweave.1#Shroudweave-Shroudtopia-*.zip",
+      "notes": "Maintained Shroudweave companion runtime for Enshrouded 1.0 and Minimap. Uses its specific tested release rather than an unrelated repository latest release."
+    },
+    "profileEngines": ["enshrouded"],
+    "profileLoaders": ["enshrouded-shroudtopia"],
+    "providerPackages": [
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["Shroudtopia", "Shroudweave Shroudtopia", "Shroudtopia Mod Loader"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file:shroudtopia.dll", "file:winmm.dll"]
+      }
+    ]
+  },
+  {
+    "id": "enshrouded-proxy",
+    "dependency": {
+      "id": "runtime:enshrouded-proxy",
+      "name": "Enshrouded ModLoader Proxy x64",
+      "provider": "github-release",
+      "source": "github-release:Entrodor/modloader-proxy@1.1.0#modloader-proxy-*-x64.zip",
+      "notes": "Official x64 ModLoader Proxy for shared Enshrouded DLL loading; configuration and ownership are managed transactionally."
+    },
+    "profileEngines": ["enshrouded"],
+    "profileLoaders": ["enshrouded-proxy"],
+    "providerPackages": [
+      {
+        "provider": "nexus",
+        "namespacePatterns": [],
+        "packagePatterns": ["ModLoader Proxy", "Modloader Proxy X64"]
+      }
+    ],
+    "detectionRules": [
+      {
+        "all": ["file:dinput8.dll", "file:chainloader.ini"]
+      },
+      {
+        "all": ["file:powrprof.dll", "file:chainloader.ini"]
+      }
+    ]
   }
 ]

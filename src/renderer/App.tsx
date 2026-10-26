@@ -6975,12 +6975,51 @@ interface ConfigFilePanelProps {
   showRawPreview?: boolean;
 }
 
-function ConfigFilePanel({
+export function ConfigFilePanel({
   entries,
   file,
   onSaveValue,
   showRawPreview = false
 }: ConfigFilePanelProps) {
+  const [itemId, setItemId] = useState("");
+  const [stackSize, setStackSize] = useState("");
+  const [isAdding, setIsAdding] = useState(false);
+  const [addError, setAddError] = useState("");
+  const canAddItemOverride = file.path.replace(/\\/g, "/").toLowerCase().endsWith("/mods/max-stack/items.txt") && !file.warning;
+
+  async function addItemOverride() {
+    if (isAdding) {
+      return;
+    }
+    const key = itemId.trim();
+    const count = stackSize.trim();
+    const numericCount = Number(count);
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(key)) {
+      setAddError("Enter an item ID of up to 128 letters, numbers, underscores, hyphens, or dots.");
+      return;
+    }
+    if (file.entries.some((entry) => entry.key.toLowerCase() === key.toLowerCase())) {
+      setAddError("This item already has an override. Edit its existing stack size above.");
+      return;
+    }
+    if (!/^\d+$/.test(count) || !Number.isInteger(numericCount) || numericCount < 1 || numericCount > 2147483647) {
+      setAddError("Enter a whole stack size between 1 and 2147483647.");
+      return;
+    }
+
+    setIsAdding(true);
+    setAddError("");
+    try {
+      await onSaveValue(file, { key, value: "" }, String(numericCount));
+      setItemId("");
+      setStackSize("");
+    } catch (caughtError) {
+      setAddError(String(caughtError));
+    } finally {
+      setIsAdding(false);
+    }
+  }
+
   return (
     <article className="config-file-panel">
       <div className="config-file-heading">
@@ -7001,8 +7040,52 @@ function ConfigFilePanel({
             />
           ))}
         </div>
-      ) : showRawPreview && file.rawPreview ? (
+      ) : (showRawPreview || file.entries.length === 0) && file.rawPreview ? (
         <pre className="config-raw-preview">{file.rawPreview}</pre>
+      ) : null}
+      {canAddItemOverride ? (
+        <div className="config-entry">
+          <strong>Add item override</strong>
+          <div className="config-editor">
+            <label>
+              <span>Item ID</span>
+              <input
+                className="config-input"
+                disabled={isAdding}
+                maxLength={128}
+                onChange={(event) => { setItemId(event.target.value); setAddError(""); }}
+                placeholder="Material_Wood"
+                type="text"
+                value={itemId}
+              />
+            </label>
+            <label>
+              <span>Stack size</span>
+              <input
+                className="config-input"
+                disabled={isAdding}
+                max={2147483647}
+                min={1}
+                onChange={(event) => { setStackSize(event.target.value); setAddError(""); }}
+                placeholder="999"
+                step={1}
+                type="number"
+                value={stackSize}
+              />
+            </label>
+            <div className="config-save-row">
+              <button
+                className="secondary-button compact-button"
+                disabled={isAdding}
+                onClick={() => void addItemOverride()}
+                type="button"
+              >
+                {isAdding ? "Adding" : "Add override"}
+              </button>
+            </div>
+            {addError ? <div className="config-inline-error" role="alert">{addError}</div> : null}
+          </div>
+        </div>
       ) : null}
     </article>
   );
@@ -7190,7 +7273,9 @@ function ModCard({
               {isRuntime
                 ? mod.externallyManaged ? "Detected runtime" : "Managed runtime"
                 : dependencies.length > 0
-                  ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
+                  ? dependencies.every((dependency) => dependency.status === "already-installed")
+                    ? `${dependencies.length} dependenc${dependencies.length === 1 ? "y" : "ies"} satisfied`
+                    : `${dependencies.filter((dependency) => dependency.required && dependency.status !== "already-installed").length} required component(s) missing`
                   : `${mod.filesWritten.length} managed file${mod.filesWritten.length === 1 ? "" : "s"}`}
             </small>
           )}

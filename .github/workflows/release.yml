@@ -59,17 +59,16 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Hardens archive and install-path recognition against traversal, Windows path aliases, separator collisions, ambiguous wrapper folders, and unsafe variant layouts.
-            - Presents only verified, real install targets and moves a mod atomically between client and local-server locations when the selected target changes.
-            - Improves route inference from archives, game folders, and provider documentation while excluding runtime packages and loader/tooling directories from mod targets.
-            - Serializes profile and mod mutations and recovers interrupted enable, disable, target-switch, and store transactions without leaving partial deployments.
-            - Tracks configuration ownership per installed mod and rejects cross-mod configuration edits or ambiguous generated config matches.
-            - Binds provider installs to the exact game and selected artifact, verifies declared size and SHA-256 data when available, and cleans up failed or one-shot downloads safely.
-            - Restricts provider downloads to validated HTTPS/public destinations and fails closed for unsafe GameBanana scans or unsupported mod.io dependencies.
-            - Keeps Discover providers visible during filtered zero-result searches, reports background indexing accurately, and shows feedback consistently across every workspace.
-            - Refreshes newly created profiles after runtime bootstrap so the Library and health status immediately reflect the persisted Ready state.
+            - Adds Enshrouded support for recognized EML mod folders, Shroudtopia native plugins, and native root packages, preserving complete companion folders and Windows-style archive paths.
+            - Automatically provisions supported EML, maintained Shroudtopia, and ModLoader Proxy dependencies from verified official release assets.
+            - Manages shared native loaders without moving their companion files, reuses identical bundled loader DLLs, and preserves unrelated chainloader settings.
+            - Captures original Enshrouded patch data and restores it during managed disable, clean launch, and removal operations. Automatically installed dependencies are removed when no managed mod needs them.
+            - Adds Max Stack configuration through the cogwheel, including its four main settings and editable or new per-item stack overrides. Saving EML settings triggers repatching on the next game startup.
+            - Journals Enshrouded installs, loader configuration, ownership, and cleanup so failed changes can roll back without discarding user settings or another mod's files.
+            - Documents 25 author installation workflows and the supported layouts. Archive and regression checks do not establish that every researched mod or mod combination works in-game.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
-            - Existing profiles, settings, provider credentials, portable profile bundles, and installation upgrades remain compatible.
+
+            Validation: 345 backend tests and 86 frontend tests passed. See the Enshrouded support document in the repository for requirements and compatibility limits.
           releaseDraft: true
           prerelease: false
 

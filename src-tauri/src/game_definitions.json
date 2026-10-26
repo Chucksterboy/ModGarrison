@@ -1,5 +1,16 @@
 [
   {
+    "id": "enshrouded",
+    "displayName": "Enshrouded",
+    "engine": "enshrouded",
+    "steamAppIds": ["1203620", "2278520"],
+    "executableNames": ["enshrouded.exe", "enshrouded_server.exe"],
+    "pathMarkers": ["enshrouded.kfc", "enshrouded_server.kfc"],
+    "supportedAdapters": ["enshrouded"],
+    "configRoots": ["mods", "greeneye", "aldrich-modmenu", "shroudtopia.json", "chainloader.ini"],
+    "nexusGameDomain": "enshrouded"
+  },
+  {
     "id": "valheim",
     "displayName": "Valheim",
     "engine": "unity-mono",
