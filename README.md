@@ -110,8 +110,8 @@ the [GitHub Releases page](https://github.com/Chucksterboy/ModGarrison/releases)
 To publish an installer build, push a version tag:
 
 ```powershell
-git tag v0.13.0
-git push origin v0.13.0
+git tag v0.13.1
+git push origin v0.13.1
 ```
 
 The GitHub Actions release workflow validates the project, builds the single

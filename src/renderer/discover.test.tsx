@@ -244,20 +244,61 @@ describe("Discovery result presentation", () => {
       totalIsExact: false
     });
 
+    expect(notice.kind).toBe("success");
+    expect(notice.title).toBe("Discovery updated");
     expect(notice.detail).toContain("checking online providers");
     expect(notice.detail).not.toContain("approximately 0");
   });
 
-  it("announces the terminal result after background indexing completes", () => {
-    const notice = buildDiscoveryNotice(profile.name, {
+  it("announces completed Nexus results as success when optional providers have no warnings", () => {
+    const nexusResult = {
+      items: [onlineMod],
+      availableProviders: [availableProviders[1]],
+      complete: true,
+      indexed: 1,
+      providerWarnings: [],
+      total: 1,
+      totalIsExact: true
+    };
+    const notice = buildDiscoveryNotice(secondProfile.name, nexusResult);
+
+    expect(notice).toEqual({
+      kind: "success",
+      title: "Discovery updated",
+      detail: `${secondProfile.name}: found 1 online mod(s).`
+    });
+  });
+
+  it("keeps genuine provider failures visible even when Nexus returned usable results", () => {
+    const warning = "mod.io: HTTP 503 Service Unavailable";
+    const notice = buildDiscoveryNotice(secondProfile.name, {
       complete: true,
       indexed: 6,
-      providerWarnings: [],
+      providerWarnings: [warning],
       total: 6,
-      totalIsExact: true
+      totalIsExact: false
     });
 
-    expect(notice.detail).toBe(`${profile.name}: found 6 online mod(s).`);
+    expect(notice.kind).toBe("warning");
+    expect(notice.title).toBe("Discovery partially updated");
+    expect(notice.detail).toContain("indexed 6 mod(s)");
+    expect(notice.detail).toContain(warning);
+  });
+
+  it("reports an incomplete index as progress without inventing a provider failure", () => {
+    const notice = buildDiscoveryNotice(profile.name, {
+      complete: false,
+      indexed: 20,
+      providerWarnings: [],
+      total: 2600,
+      totalIsExact: false
+    });
+
+    expect(notice.kind).toBe("success");
+    expect(notice.title).toBe("Discovery updated");
+    expect(notice.detail).toContain("indexed 20 mod(s)");
+    expect(notice.detail).toContain("approximately 2600");
+    expect(notice.detail).not.toContain("found 2600");
   });
 
   it("shows a search-specific empty state for server-filtered results", async () => {

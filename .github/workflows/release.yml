@@ -59,16 +59,14 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Adds Enshrouded support for recognized EML mod folders, Shroudtopia native plugins, and native root packages, preserving complete companion folders and Windows-style archive paths.
-            - Automatically provisions supported EML, maintained Shroudtopia, and ModLoader Proxy dependencies from verified official release assets.
-            - Manages shared native loaders without moving their companion files, reuses identical bundled loader DLLs, and preserves unrelated chainloader settings.
-            - Captures original Enshrouded patch data and restores it during managed disable, clean launch, and removal operations. Automatically installed dependencies are removed when no managed mod needs them.
-            - Adds Max Stack configuration through the cogwheel, including its four main settings and editable or new per-item stack overrides. Saving EML settings triggers repatching on the next game startup.
-            - Journals Enshrouded installs, loader configuration, ownership, and cleanup so failed changes can roll back without discarding user settings or another mod's files.
-            - Documents 25 author installation workflows and the supported layouts. Archive and regression checks do not establish that every researched mod or mod combination works in-game.
+            - Fixes misleading Refresh and Discover warnings when mod.io has no matching catalogue for a game. Successful Nexus searches and healthy mod installations no longer appear incomplete because an optional provider has no catalogue.
+            - Keeps actual provider connection, authentication, ambiguous-match, and saved-mapping errors visible. Selecting mod.io explicitly still explains when no verified catalogue is available.
+            - Stops caching failed provider lookups as empty results, so repeated failures remain visible and retries can recover immediately.
+            - Relearns older cached route metadata to clear obsolete catalogue warnings while preserving package-verified install routes.
+            - Preserves existing profiles, settings, installed mods, and Enshrouded configuration support.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
 
-            Validation: 345 backend tests and 86 frontend tests passed. See the Enshrouded support document in the repository for requirements and compatibility limits.
+            Validation: 355 backend tests and 88 frontend tests passed, covering optional catalogue misses, real provider failures, saved mappings, retry caching, and discovery status messages.
           releaseDraft: true
           prerelease: false
 

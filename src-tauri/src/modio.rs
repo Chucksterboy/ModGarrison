@@ -168,24 +168,11 @@ pub(super) fn resolve_mapping(
         })?
         .to_string();
     let candidates = provider_name_candidates(profile);
-    let mut resolution_error = None;
-    let game_id = cached_provider_mapping("modio", profile, force_refresh, || {
-        let client = match provider_client() {
-            Ok(client) => client,
-            Err(error) => {
-                resolution_error = Some(error);
-                return None;
-            }
-        };
+    let game_id = cached_modio_game_id(profile, force_refresh, || {
+        let client = provider_client()?;
         let mut matches = HashMap::new();
         for candidate in &candidates {
-            let games = match fetch_games_by_name(&client, api_key, candidate) {
-                Ok(games) => games,
-                Err(error) => {
-                    resolution_error = Some(error);
-                    return None;
-                }
-            };
+            let games = fetch_games_by_name(&client, api_key, candidate)?;
             for game in games
                 .into_iter()
                 .filter(|game| modio_game_matches_profile(game, &candidates, &steam_app_id))
@@ -194,22 +181,16 @@ pub(super) fn resolve_mapping(
             }
         }
         match matches.len() {
-            0 => None,
-            1 => matches.into_keys().next().map(|id| id.to_string()),
-            _ => {
-                resolution_error = Some(format!(
+            0 => Ok(None),
+            1 => Ok(matches.into_keys().next().map(|id| id.to_string())),
+            _ => Err(format!(
                     "mod.io returned multiple exact catalogue matches for '{}', so Mod Garrison refused to guess.",
                     canonical_name
-                ));
-                None
-            }
+                )),
         }
-    });
+    })?;
 
     let Some(game_id) = game_id else {
-        if let Some(error) = resolution_error {
-            return Err(error);
-        }
         return Ok(None);
     };
     let client = provider_client()?;
@@ -231,6 +212,20 @@ pub(super) fn resolve_mapping(
         resolution: resolution.to_string(),
         verified_at: now_string(),
     }))
+}
+
+/// A successful catalogue miss is cacheable; a failed lookup is not a miss.
+/// Keep errors out of the shared cache so a later request can retry immediately
+/// and cannot mistake an authentication/network/ambiguity failure for absence.
+fn cached_modio_game_id<F>(
+    profile: &GameProfile,
+    force_refresh: bool,
+    resolve: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<Option<String>, String>,
+{
+    cached_provider_mapping_result("modio", profile, force_refresh, resolve)
 }
 
 pub(super) fn discover_mods(
@@ -1174,6 +1169,83 @@ fn unix_timestamp(timestamp: i64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_test_profile() -> GameProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("modio-cache-{}", Uuid::new_v4()),
+            "name": "Offline catalogue cache fixture",
+            "gamePath": std::env::temp_dir().join(format!("modio-cache-game-{}", Uuid::new_v4())),
+            "engine": "enshrouded", "loader": "none", "createdAt": "", "updatedAt": ""
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mapping_cache_retains_successful_catalogue_absence() {
+        let profile = cache_test_profile();
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || Ok(None)).unwrap(),
+            None
+        );
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || panic!(
+                "a successful absence should be cached"
+            ))
+            .unwrap(),
+            None
+        );
+        clear_cached_provider_mapping("modio", &profile);
+    }
+
+    #[test]
+    fn mapping_errors_stay_visible_and_recover_without_waiting_for_negative_cache_expiry() {
+        let profile = cache_test_profile();
+        for error in [
+            "mod.io authentication failed",
+            "mod.io network unavailable",
+            "mod.io returned multiple exact catalogue matches",
+        ] {
+            assert_eq!(
+                cached_modio_game_id(&profile, false, || Err(error.to_string())).unwrap_err(),
+                error
+            );
+        }
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || Ok(Some("123".to_string()))).unwrap(),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || panic!(
+                "the recovered verified ID should be cached"
+            ))
+            .unwrap(),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            cached_modio_game_id(&profile, true, || Ok(Some("456".to_string()))).unwrap(),
+            Some("456".to_string())
+        );
+        clear_cached_provider_mapping("modio", &profile);
+    }
+
+    #[test]
+    fn failed_forced_mapping_refresh_cannot_leave_an_old_negative_result_masking_retries() {
+        let profile = cache_test_profile();
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || Ok(None)).unwrap(),
+            None
+        );
+        assert_eq!(
+            cached_modio_game_id(&profile, true, || Err("mod.io refresh failed".to_string()))
+                .unwrap_err(),
+            "mod.io refresh failed"
+        );
+        assert_eq!(
+            cached_modio_game_id(&profile, false, || Ok(Some("789".to_string()))).unwrap(),
+            Some("789".to_string())
+        );
+        clear_cached_provider_mapping("modio", &profile);
+    }
 
     fn clean_modio_file(id: u64, mod_id: u64, timestamp: i64) -> ModioFile {
         ModioFile {

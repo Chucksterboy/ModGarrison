@@ -87,7 +87,8 @@ const PROFILE_LAUNCH_SUSPENSION_VERSION: u32 = 1;
 const PROFILE_RUNTIME_SAMPLE_SIZE: usize = 40;
 const PROFILE_RUNTIME_MAX_DEPENDENCY_DEPTH: usize = 5;
 const PROFILE_RUNTIME_MIN_SUPPORT: usize = 2;
-const PROFILE_ROUTE_KNOWLEDGE_VERSION: u32 = 2;
+// Relearn cached route metadata that classified optional catalogue misses as warnings.
+const PROFILE_ROUTE_KNOWLEDGE_VERSION: u32 = 3;
 const PROFILE_ROUTE_SAMPLE_SIZE: usize = 32;
 const PROFILE_ROUTE_FULL_TEXT_SAMPLE_SIZE: usize = 18;
 const PROFILE_ROUTE_FETCH_CONCURRENCY: usize = 6;
@@ -14791,7 +14792,11 @@ fn discover_online_mods_for_profile(
         if modio_resolution.mapping.is_none() && modio_resolution.warning.is_some() {
             total_is_exact = false;
         }
-        if let Some(warning) = modio_resolution.warning {
+        if let Some(warning) = modio_discovery_warning(
+            profile,
+            &modio_resolution,
+            api_key.is_some() && selected_provider == Some("modio"),
+        ) {
             provider_warnings.push(warning);
         }
         if let (Some(api_key), Some(mapping)) = (api_key, modio_resolution.mapping) {
@@ -15712,8 +15717,23 @@ fn cached_provider_mapping<F>(
 where
     F: FnOnce() -> Option<String>,
 {
+    cached_provider_mapping_result(provider, profile, force_refresh, || Ok(resolve()))
+        .unwrap_or_default()
+}
+
+fn cached_provider_mapping_result<F>(
+    provider: &str,
+    profile: &GameProfile,
+    force_refresh: bool,
+    resolve: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<Option<String>, String>,
+{
     let cache_key = provider_mapping_cache_key(provider, profile);
-    if !force_refresh {
+    if force_refresh {
+        clear_cached_provider_mapping(provider, profile);
+    } else {
         if let Ok(cache) = PROVIDER_MAPPING_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -15725,13 +15745,14 @@ where
                     Duration::from_secs(PROVIDER_MAPPING_NEGATIVE_CACHE_MINUTES * 60)
                 };
                 if entry.fetched_at.elapsed() < ttl {
-                    return entry.value.clone();
+                    return Ok(entry.value.clone());
                 }
             }
         }
     }
 
-    let value = resolve();
+    // A failed request is not evidence that this game has no catalogue.
+    let value = resolve()?;
     if let Ok(mut cache) = PROVIDER_MAPPING_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -15758,7 +15779,7 @@ where
             },
         );
     }
-    value
+    Ok(value)
 }
 
 fn provider_mapping_cache_key(provider: &str, profile: &GameProfile) -> String {
@@ -15927,6 +15948,20 @@ fn resolve_modio_mapping_for_discovery(
     api_key: &str,
     force_refresh: bool,
 ) -> ProviderGameResolution {
+    resolve_modio_mapping_for_discovery_with(store_root, profile, force_refresh, || {
+        modio::resolve_mapping(profile, api_key, force_refresh)
+    })
+}
+
+fn resolve_modio_mapping_for_discovery_with<F>(
+    store_root: &Path,
+    profile: &GameProfile,
+    force_refresh: bool,
+    resolve: F,
+) -> ProviderGameResolution
+where
+    F: FnOnce() -> Result<Option<ProviderGameMapping>, String>,
+{
     let saved = persisted_provider_game_mapping(store_root, "modio", profile);
     if !force_refresh {
         if let Ok(Some(mapping)) = saved.as_ref() {
@@ -15942,7 +15977,7 @@ fn resolve_modio_mapping_for_discovery(
     if force_refresh {
         clear_cached_provider_mapping("modio", profile);
     }
-    match modio::resolve_mapping(profile, api_key, force_refresh) {
+    match resolve() {
         Ok(Some(mapping)) => {
             let remember_warning = remember_provider_game_mapping(store_root, mapping.clone())
                 .err()
@@ -15959,15 +15994,18 @@ fn resolve_modio_mapping_for_discovery(
         Ok(None) => {
             let forget_warning = forget_provider_game_mapping(store_root, "modio", profile)
                 .err()
-                .map(|error| format!(" The obsolete saved mapping could not be removed: {error}"))
-                .unwrap_or_default();
+                .map(|error| {
+                    format!("The obsolete saved mod.io mapping could not be removed: {error}")
+                });
+            let warnings = persisted_mapping_warning
+                .into_iter()
+                .chain(forget_warning)
+                .collect::<Vec<_>>();
             ProviderGameResolution {
                 mapping: None,
-                warning: Some(format!(
-                    "mod.io could not be linked automatically for {}.{}",
-                    profile_game_label(profile),
-                    forget_warning
-                )),
+                // An optional provider with no matching catalogue is a normal
+                // result. Storage and actual request failures remain visible.
+                warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
             }
         }
         Err(error) => ProviderGameResolution {
@@ -15978,6 +16016,21 @@ fn resolve_modio_mapping_for_discovery(
             )),
         },
     }
+}
+
+fn modio_discovery_warning(
+    profile: &GameProfile,
+    resolution: &ProviderGameResolution,
+    explicitly_selected: bool,
+) -> Option<String> {
+    resolution.warning.clone().or_else(|| {
+        (explicitly_selected && resolution.mapping.is_none()).then(|| {
+            format!(
+                "mod.io has no verified catalogue for {}.",
+                profile_game_label(profile)
+            )
+        })
+    })
 }
 
 fn unlinked_nexus_catalogue_message(profile: &GameProfile) -> String {
@@ -35687,6 +35740,145 @@ mod tests {
         assert!(!valid_provider_game_id(""));
         assert!(!valid_provider_game_id("game/domain"));
         assert!(!valid_provider_game_id("game domain"));
+    }
+
+    fn modio_resolution_fixture(name: &str) -> (PathBuf, GameProfile) {
+        let root = temp_game_dir(name);
+        fs::create_dir_all(&root).unwrap();
+        let mut profile = test_profile("enshrouded", "Enshrouded", "enshrouded", "none");
+        profile.steam_app_id = Some("9999999951".to_string());
+        (root, profile)
+    }
+
+    fn modio_resolution_mapping(profile: &GameProfile, provider: &str) -> ProviderGameMapping {
+        ProviderGameMapping {
+            provider: provider.to_string(),
+            steam_app_id: profile.steam_app_id.clone().unwrap(),
+            canonical_game_name: "Enshrouded".to_string(),
+            provider_game_id: "123".to_string(),
+            provider_catalogue_id: Some("123".to_string()),
+            resolution: "catalog-exact-name".to_string(),
+            verified_at: now_string(),
+        }
+    }
+
+    #[test]
+    fn optional_modio_catalogue_miss_is_not_a_profile_or_discovery_warning() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-no-match");
+        let result = resolve_modio_mapping_for_discovery_with(&root, &profile, false, || Ok(None));
+        assert!(result.mapping.is_none());
+        assert!(result.warning.is_none());
+        assert!(modio_discovery_warning(&profile, &result, false).is_none());
+        assert!(modio_discovery_warning(&profile, &result, true)
+            .unwrap()
+            .contains("no verified catalogue"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_modio_miss_retires_only_its_obsolete_mapping() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-obsolete");
+        remember_provider_game_mapping(&root, modio_resolution_mapping(&profile, "modio")).unwrap();
+        let nexus = modio_resolution_mapping(&profile, "nexus");
+        remember_provider_game_mapping(&root, nexus.clone()).unwrap();
+        let result = resolve_modio_mapping_for_discovery_with(&root, &profile, true, || Ok(None));
+        assert!(result.mapping.is_none());
+        assert!(result.warning.is_none());
+        assert!(persisted_provider_game_mapping(&root, "modio", &profile)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            persisted_provider_game_mapping(&root, "nexus", &profile).unwrap(),
+            Some(nexus)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modio_mapping_request_failures_remain_visible_with_other_provider_results() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-real-errors");
+        for error in [
+            "HTTP 401: invalid account key",
+            "HTTP 503: service unavailable",
+            "multiple exact catalogue matches",
+        ] {
+            let result = resolve_modio_mapping_for_discovery_with(&root, &profile, true, || {
+                Err(error.to_string())
+            });
+            assert!(result.mapping.is_none());
+            assert!(result.warning.as_deref().unwrap().contains(error));
+            assert_eq!(
+                modio_discovery_warning(&profile, &result, false),
+                result.warning
+            );
+            assert_eq!(
+                modio_discovery_warning(&profile, &result, true),
+                result.warning
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_modio_miss_keeps_mapping_store_errors_visible() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-store-error");
+        let mapping_path = provider_game_mappings_path(&root);
+        fs::write(&mapping_path, b"invalid JSON fixture").unwrap();
+        let result = resolve_modio_mapping_for_discovery_with(&root, &profile, true, || Ok(None));
+        let warning = result.warning.unwrap();
+        assert!(warning.contains("could not read its saved mod.io"));
+        assert!(warning.contains("obsolete saved mod.io mapping could not be removed"));
+        assert_eq!(fs::read(&mapping_path).unwrap(), b"invalid JSON fixture");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_modio_mapping_is_saved_and_reused_without_a_lookup() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-positive");
+        let mapping = modio_resolution_mapping(&profile, "modio");
+        let result = resolve_modio_mapping_for_discovery_with(&root, &profile, true, || {
+            Ok(Some(mapping.clone()))
+        });
+        assert_eq!(result.mapping, Some(mapping.clone()));
+        assert!(result.warning.is_none());
+        let cached = resolve_modio_mapping_for_discovery_with(&root, &profile, false, || {
+            panic!("verified saved mapping should be reused")
+        });
+        assert_eq!(cached.mapping, Some(mapping));
+        assert!(cached.warning.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_modio_mapping_reports_a_persistence_failure() {
+        let (root, profile) = modio_resolution_fixture("optional-modio-write-error");
+        fs::create_dir_all(provider_game_mappings_path(&root)).unwrap();
+        let mapping = modio_resolution_mapping(&profile, "modio");
+        let result = resolve_modio_mapping_for_discovery_with(&root, &profile, true, || {
+            Ok(Some(mapping.clone()))
+        });
+        assert_eq!(result.mapping, Some(mapping));
+        assert!(result
+            .warning
+            .unwrap()
+            .contains("could not remember the verified mapping"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn route_cache_from_before_optional_catalogue_fix_is_relearned() {
+        let mut knowledge = ProfileRouteKnowledge {
+            version: 2,
+            profile_id: "optional-modio-route-cache".to_string(),
+            learned_at: now_string(),
+            sampled_mods: 3,
+            providers: vec!["Nexus Mods".to_string()],
+            routes: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(!profile_route_knowledge_is_fresh(&knowledge));
+        knowledge.version = PROFILE_ROUTE_KNOWLEDGE_VERSION;
+        assert!(profile_route_knowledge_is_fresh(&knowledge));
     }
 
     #[test]
