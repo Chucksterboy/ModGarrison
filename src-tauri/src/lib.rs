@@ -7,9 +7,12 @@ mod enshrouded_patch_state;
 mod enshrouded_regression_tests;
 mod enshrouded_runtime;
 mod gamebanana;
+#[cfg(test)]
+mod lethal_company_regression_tests;
 mod modio;
 mod operation;
 mod steam_workshop;
+mod thunderstore;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -17182,11 +17185,8 @@ fn fetch_thunderstore_package_readme_with_client(
     version: &str,
 ) -> Result<String, String> {
     let url = format!(
-        "{}/{}/{}/{}/readme/",
-        THUNDERSTORE_API_BASE,
-        sanitize_url_path_segment(&package_ref.namespace),
-        sanitize_url_path_segment(&package_ref.name),
-        sanitize_url_path_segment(version)
+        "{}readme/",
+        thunderstore_package_version_url(package_ref, version)
     );
     client
         .get(url)
@@ -17964,30 +17964,33 @@ fn provider_plan_install_target_options(
         return derived;
     }
 
-    let verified_route_ids = verified_install_target_routes(profile, &plan.adapter_id)
-        .into_iter()
-        .map(|route| install_route_key(&plan.adapter_id, &route))
-        .collect::<HashSet<_>>();
+    let verified_routes = verified_install_target_routes(profile, &plan.adapter_id);
     let mut described = described
         .into_iter()
-        .filter(|target| {
-            target.id == install_route_key(&plan.adapter_id, &target.relative_path)
-                && verified_route_ids.contains(&target.id)
-                && install_target_has_mappings(plan, target)
+        .filter(|target| target.id == install_route_key(&plan.adapter_id, &target.relative_path))
+        .flat_map(|target| {
+            // Provider instructions often name a payload directory such as
+            // BepInEx/plugins. The executable's verified loader root remains
+            // authoritative, including when there is only one destination.
+            verified_routes
+                .iter()
+                .filter(move |route| install_target_routes_overlap(route, &target.relative_path))
+                .map(move |route| {
+                    let scope = install_target_scope_from_path(route);
+                    InstallTargetOption {
+                        id: install_route_key(&plan.adapter_id, route),
+                        label: format!(
+                            "{} ({})",
+                            install_target_scope_label(&scope),
+                            route.replace('/', "\\")
+                        ),
+                        relative_path: route.clone(),
+                        recommended: matches!(scope.as_str(), "client" | "general"),
+                        scope,
+                    }
+                })
         })
-        .map(|mut target| {
-            let canonical_scope = install_target_scope_from_path(&target.relative_path);
-            if target.scope != canonical_scope {
-                target.scope = canonical_scope;
-                target.label = format!(
-                    "{} ({})",
-                    install_target_scope_label(&target.scope),
-                    target.relative_path.replace('/', "\\")
-                );
-                target.recommended = matches!(target.scope.as_str(), "client" | "general");
-            }
-            target
-        })
+        .filter(|target| install_target_has_mappings(plan, target))
         .collect::<Vec<_>>();
     described.sort_by(|first, second| first.id.cmp(&second.id));
     described.dedup_by(|first, second| first.id == second.id);
@@ -23604,44 +23607,11 @@ fn looks_like_version(value: &str) -> bool {
 fn fetch_thunderstore_package_version(
     package_ref: &ThunderstorePackageRef,
 ) -> Result<ThunderstoreVersion, String> {
-    let client = thunderstore_client()?;
-    if let Some(requested_version) = &package_ref.version {
-        let version_url = thunderstore_package_version_url(package_ref, requested_version);
-        return client
-            .get(version_url)
-            .send()
-            .map_err(error_to_string)?
-            .error_for_status()
-            .map_err(|error| {
-                format!(
-                    "Thunderstore package {}/{} does not have version {}: {}",
-                    package_ref.namespace, package_ref.name, requested_version, error
-                )
-            })?
-            .json::<ThunderstoreVersion>()
-            .map_err(error_to_string);
-    }
-
-    let url = format!(
-        "{}/{}/{}",
-        THUNDERSTORE_API_BASE, package_ref.namespace, package_ref.name
-    );
-    client
-        .get(url)
-        .send()
-        .map_err(error_to_string)?
-        .error_for_status()
-        .map_err(error_to_string)?
-        .json::<ThunderstorePackageResponse>()
-        .map(|response| response.latest)
-        .map_err(error_to_string)
+    thunderstore::fetch_package_version(package_ref)
 }
 
 fn thunderstore_package_version_url(package_ref: &ThunderstorePackageRef, version: &str) -> String {
-    format!(
-        "{}/{}/{}/{}",
-        THUNDERSTORE_API_BASE, package_ref.namespace, package_ref.name, version
-    )
+    thunderstore::package_metadata_url(package_ref, Some(version))
 }
 
 fn download_thunderstore_package(
@@ -33936,7 +33906,7 @@ mod tests {
 
         assert_eq!(
             thunderstore_package_version_url(&package_ref, "3.0.0"),
-            "https://thunderstore.io/api/experimental/package/Zehs/REPOLib/3.0.0"
+            "https://thunderstore.io/api/experimental/package/Zehs/REPOLib/3.0.0/"
         );
     }
 

@@ -59,14 +59,14 @@ jobs:
           releaseBody: |
             Mod Garrison ${{ github.ref_name }} for Windows.
 
-            - Fixes misleading Refresh and Discover warnings when mod.io has no matching catalogue for a game. Successful Nexus searches and healthy mod installations no longer appear incomplete because an optional provider has no catalogue.
-            - Keeps actual provider connection, authentication, ambiguous-match, and saved-mapping errors visible. Selecting mod.io explicitly still explains when no verified catalogue is available.
-            - Stops caching failed provider lookups as empty results, so repeated failures remain visible and retries can recover immediately.
-            - Relearns older cached route metadata to clear obsolete catalogue warnings while preserving package-verified install routes.
-            - Preserves existing profiles, settings, installed mods, and Enshrouded configuration support.
+            - Fixes Lethal Company Nexus installs, including MoreCompany, failing when author instructions name BepInEx/plugins instead of the verified BepInEx root. Plugin files, configuration companions, and loader bootstrap files stay together.
+            - Reuses fresh official Thunderstore catalogue metadata for the exact requested version, avoiding redundant metadata requests after discovery.
+            - Uses canonical Thunderstore API URLs and retries temporary connection, rate-limit, and server errors. HTTP 502 outages are no longer reported as missing mod versions.
+            - Keeps package identity, version pinning, client/server boundaries, and ownership-based mod removal checks intact.
+            - Preserves existing profiles, settings, installed mods, and Enshrouded support.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
 
-            Validation: 355 backend tests and 88 frontend tests passed, covering optional catalogue misses, real provider failures, saved mappings, retry caching, and discovery status messages.
+            Validation: 368 backend tests and 88 frontend tests passed, covering Nexus target handoffs, plugin and runtime companion files, install receipts and removal, Thunderstore metadata retries and cooldowns, and exact-version catalogue reuse.
           releaseDraft: true
           prerelease: false
 
