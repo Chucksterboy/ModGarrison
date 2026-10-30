@@ -62,6 +62,13 @@ Mod Garrison can automatically resolve these loader/runtime dependencies:
 - Enshrouded Mod Loader (EML) from its official GitHub release.
 - Maintained Shroudtopia (Shroudweave) and ModLoader Proxy from specific verified GitHub releases.
 
+BepInEx routing is shared across Unity Mono and IL2CPP profiles, including games
+without a built-in game definition. Archives may include the `BepInEx` folder or
+start directly with `plugins`, `core`, `patchers`, `monomod`, or `config`; their
+subdirectories and companion files are preserved. The default automatic BepInEx
+runtime downloads currently support Windows x64. Individual mods still need to
+match their game's architecture and loader version.
+
 Source platforms are handled according to their documented capabilities:
 
 - Thunderstore supports direct discovery, download, installation, and package dependency metadata.
@@ -110,8 +117,8 @@ the [GitHub Releases page](https://github.com/Chucksterboy/ModGarrison/releases)
 To publish an installer build, push a version tag:
 
 ```powershell
-git tag v0.13.2
-git push origin v0.13.2
+git tag v0.13.3
+git push origin v0.13.3
 ```
 
 The GitHub Actions release workflow validates the project, builds the single

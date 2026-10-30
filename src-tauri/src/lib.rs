@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod bepinex_regression_tests;
 mod enshrouded;
 mod enshrouded_cleanup;
 mod enshrouded_integration;
@@ -11,6 +13,7 @@ mod gamebanana;
 mod lethal_company_regression_tests;
 mod modio;
 mod operation;
+mod runtime_dependencies;
 mod steam_workshop;
 mod thunderstore;
 
@@ -11972,6 +11975,14 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
         .iter()
         .map(source_payload_path_for_install_target)
         .collect::<Vec<_>>();
+    let is_canonical_bepinex_path = |path: &str| {
+        path.split_once('/').is_some_and(|(directory, _)| {
+            matches!(
+                directory.to_ascii_lowercase().as_str(),
+                "plugins" | "core" | "patchers" | "monomod" | "config"
+            )
+        })
+    };
     let has_scoped_payload = files
         .iter()
         .any(|file| source_install_target_scope(&file.path).is_some());
@@ -12079,7 +12090,7 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                     "BepInEx bootstrap file.",
                 ));
             }
-        } else if lower_path.starts_with("plugins/") {
+        } else if is_canonical_bepinex_path(routed_payload_path) {
             for target_root in &target_roots {
                 if !source_scope_matches_target_route(source_scope, target_root) {
                     continue;
@@ -12088,7 +12099,7 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
                     &file.path,
                     "game",
                     &join_install_route(target_root, routed_payload_path),
-                    "Plugin folder maps into BepInEx/plugins.",
+                    "Canonical loader directory maps into BepInEx with its contents preserved.",
                 ));
             }
         } else if lower_path.starts_with("config/") || lower_path.ends_with(".cfg") {
@@ -12127,9 +12138,8 @@ fn bepinex_plan(scanned: &ScannedArchive, profile: &GameProfile) -> Option<Insta
     }
 
     let has_signal = routed_payload_paths.iter().any(|path| {
-        let lower_path = path.to_lowercase();
         path_after_named_segment(path, "bepinex").is_some()
-            || lower_path.starts_with("plugins/")
+            || is_canonical_bepinex_path(path)
             || is_probable_bepinex_plugin_dll(path, profile)
             || is_bepinex_root_runtime_file(path)
     });
@@ -14375,11 +14385,22 @@ fn runtime_id_for_dependency(profile: &GameProfile, dependency: &DependencySpec)
     if let Some(runtime) = runtime_from_dependency(dependency) {
         return Some(runtime.to_string());
     }
-
-    profile_runtime_ids(profile).into_iter().find(|runtime| {
+    if let Some(runtime) = profile_runtime_ids(profile).into_iter().find(|runtime| {
         dependency_key(&known_runtime_dependency(profile, runtime.as_str()))
             == dependency_key(dependency)
-    })
+    }) {
+        return Some(runtime);
+    }
+    if dependency.provider.eq_ignore_ascii_case("thunderstore") {
+        let package_ref = parse_thunderstore_ref(dependency).ok()?;
+        return runtime_id_for_provider_package(
+            profile,
+            "thunderstore",
+            Some(&package_ref.namespace),
+            &package_ref.name,
+        );
+    }
+    None
 }
 
 fn parse_thunderstore_dependency(dependency: &str) -> DependencySpec {
@@ -22305,50 +22326,17 @@ fn dependency_availability(
     dependency: &DependencySpec,
 ) -> DependencyAvailability {
     let installed_store = read_store::<InstalledModRecord>(&installed_mods_path(store_root)).ok();
-    if let Some(runtime) = runtime_from_dependency(dependency) {
-        let records = installed_store
-            .as_ref()
-            .map(|store| {
-                store
-                    .items
-                    .iter()
-                    .filter(|record| {
-                        record.profile_id == profile.id
-                            && record.enabled
-                            && record.last_status != "removed"
-                            && runtime_record_matches(record, runtime)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if let Some(required) = dependency.version.as_deref() {
-            if records.iter().any(|record| {
-                record
-                    .package_version
-                    .as_deref()
-                    .is_some_and(|installed| version_requirement_matches(required, installed))
-            }) {
-                return DependencyAvailability {
-                    available: true,
-                    version_verified: true,
-                };
-            }
-            if records
-                .iter()
-                .any(|record| record.package_version.is_some())
-            {
-                return DependencyAvailability {
-                    available: false,
-                    version_verified: true,
-                };
-            }
-        }
-        if !records.is_empty() || runtime_installed(profile, runtime) {
-            return DependencyAvailability {
-                available: true,
-                version_verified: dependency.version.is_none(),
-            };
-        }
+    if let Some(runtime) = runtime_id_for_dependency(profile, dependency) {
+        return runtime_dependencies::availability(
+            profile,
+            dependency,
+            &runtime,
+            installed_store
+                .as_ref()
+                .map(|store| store.items.as_slice())
+                .unwrap_or_default(),
+            None,
+        );
     }
 
     if dependency.provider == "nexus" {
@@ -22393,13 +22381,6 @@ fn dependency_availability(
         return DependencyAvailability::default();
     };
 
-    if thunderstore_runtime_available(profile, &package_ref) {
-        return DependencyAvailability {
-            available: true,
-            version_verified: dependency.version.is_none(),
-        };
-    }
-
     let package_id = thunderstore_package_id(&package_ref);
     let dependency_string = package_ref
         .version
@@ -22437,49 +22418,16 @@ fn dependency_availability_for_target(
 ) -> DependencyAvailability {
     let installed_store = read_store::<InstalledModRecord>(&installed_mods_path(store_root)).ok();
     if let Some(runtime) = runtime_id_for_dependency(profile, dependency) {
-        let records = installed_store
-            .as_ref()
-            .map(|store| {
-                store
-                    .items
-                    .iter()
-                    .filter(|record| {
-                        record.profile_id == profile.id
-                            && record.enabled
-                            && record.last_status != "removed"
-                            && runtime_record_matches(record, &runtime)
-                            && record_payload_covers_install_target(record, target)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if let Some(required) = dependency.version.as_deref() {
-            if records.iter().any(|record| {
-                record
-                    .package_version
-                    .as_deref()
-                    .is_some_and(|installed| version_requirement_matches(required, installed))
-            }) {
-                return DependencyAvailability {
-                    available: true,
-                    version_verified: true,
-                };
-            }
-            if records
-                .iter()
-                .any(|record| record.package_version.is_some())
-            {
-                return DependencyAvailability {
-                    available: false,
-                    version_verified: true,
-                };
-            }
-        }
-        return DependencyAvailability {
-            available: !records.is_empty()
-                || runtime_installed_for_target(profile, &runtime, target),
-            version_verified: dependency.version.is_none(),
-        };
+        return runtime_dependencies::availability(
+            profile,
+            dependency,
+            &runtime,
+            installed_store
+                .as_ref()
+                .map(|store| store.items.as_slice())
+                .unwrap_or_default(),
+            Some(target),
+        );
     }
 
     let Some(store) = installed_store.as_ref() else {
@@ -23385,34 +23333,13 @@ fn thunderstore_runtime_available(
     profile: &GameProfile,
     package_ref: &ThunderstorePackageRef,
 ) -> bool {
-    runtime_definitions().iter().any(|definition| {
-        runtime_definition_applies_to_profile(definition, profile)
-            && runtime_provider_package_matches(
-                definition,
-                "thunderstore",
-                Some(&package_ref.namespace),
-                &package_ref.name,
-            )
-            && runtime_installed(profile, &definition.id)
-    })
-}
-
-fn runtime_definition_applies_to_profile(
-    definition: &RuntimeDefinition,
-    profile: &GameProfile,
-) -> bool {
-    if definition.profile_engines.is_empty() && definition.profile_loaders.is_empty() {
-        return true;
-    }
-
-    definition
-        .profile_engines
-        .iter()
-        .any(|engine| engine.eq_ignore_ascii_case(&profile.engine))
-        || definition
-            .profile_loaders
-            .iter()
-            .any(|loader| loader.eq_ignore_ascii_case(&profile.loader))
+    runtime_id_for_provider_package(
+        profile,
+        "thunderstore",
+        Some(&package_ref.namespace),
+        &package_ref.name,
+    )
+    .is_some_and(|runtime| runtime_installed(profile, &runtime))
 }
 
 fn runtime_provider_package_matches(
@@ -28981,9 +28908,12 @@ fn is_semantic_archive_root(value: &str) -> bool {
             | "client"
             | "config"
             | "content"
+            | "core"
             | "dedicatedserver"
+            | "monomod"
             | "mods"
             | "natives"
+            | "patchers"
             | "plugins"
             | "r5"
             | "reframework"

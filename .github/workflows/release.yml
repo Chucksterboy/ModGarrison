@@ -63,10 +63,13 @@ jobs:
             - Reuses fresh official Thunderstore catalogue metadata for the exact requested version, avoiding redundant metadata requests after discovery.
             - Uses canonical Thunderstore API URLs and retries temporary connection, rate-limit, and server errors. HTTP 502 outages are no longer reported as missing mod versions.
             - Keeps package identity, version pinning, client/server boundaries, and ownership-based mod removal checks intact.
+            - Extends shared Unity Mono and IL2CPP routing to archives starting with core, patchers, monomod, plugins, or config, preserving their subfolders and companion assets for games without built-in definitions.
+            - Recognizes compatible installed runtime aliases across providers in the correct executable root, avoiding duplicate BepInEx installation. Missing, disabled, conflicting, or known wrong-version runtimes do not satisfy dependencies.
+            - Keeps Thunderstore pack versions separate from native loader versions when checking requirements.
             - Preserves existing profiles, settings, installed mods, and Enshrouded support.
             - Publishes one Windows NSIS `.exe` installer and its SHA-256 checksum.
 
-            Validation: 368 backend tests and 88 frontend tests passed, covering Nexus target handoffs, plugin and runtime companion files, install receipts and removal, Thunderstore metadata retries and cooldowns, and exact-version catalogue reuse.
+            Validation: 383 backend tests and 88 frontend tests passed, covering shared Mono and IL2CPP layouts, runtime aliases, version provenance, target-aware dependencies, Nexus handoffs, install receipts and removal, and Thunderstore retries and cooldowns.
           releaseDraft: true
           prerelease: false
 
